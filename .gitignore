@@ -1,0 +1,13 @@
+# Local datasets and training/eval artifacts
+data/
+outputs/
+cache/
+
+# Python runtime/build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Local environments
+.venv/

@@ -1,0 +1,103 @@
+experiment_name: deconver_2d_consensus_local
+epochs: 100
+batch_size: 1
+val_batch_size: 1
+learning_rate: 2e-4
+weight_decay: 1e-5
+num_workers: 2
+device: cuda
+base_output_dir: ./outputs/runs
+random_seed: 42
+deterministic: false
+
+# Consensus dataset roots
+# data_root contains Train_imgs/ and Test_imgs/
+# consensus_root contains per-image consensus outputs
+data_root: ./data
+consensus_root: ./data/consensus
+image_subdirs: [Train_imgs, Test_imgs]
+supervised_image_subdirs: [Train_imgs]
+
+# Split logic
+split_mode: iter_80_20 # iter_80_20 | final_80_10_10
+# split_manifest_path: ./outputs/splits/gleason_consensus_split.json
+
+# Loader robustness and tissue/background handling
+renormalize_probs: true
+enforce_background_ignore: true
+# Downscale very large whole-slide style inputs before batching to avoid OOM on small GPUs.
+max_long_side: 768
+otsu_close_radius: 3
+otsu_min_object_size: 4096
+otsu_min_hole_size: 4096
+probs_eps: 1e-8
+
+# Model
+model: deconver
+spatial_dims: 2
+input_channels: 3
+out_channels: 4
+deep_supervision: false
+deconver_encoder_depth: [1, 1, 1, 1]
+deconver_encoder_width: [48, 96, 192, 384]
+deconver_strides: [1, 2, 2, 2]
+deconver_kernel_size: [3, 3]
+deconver_groups: -1
+deconver_ndc_ratio: 2
+deconver_fp32_islands: true # keep Deconver update math in FP32 (safer on pre-BF16 GPUs)
+deconver_fp32_scope: iterative_block # update_only | iterative_block
+
+# Loss: soft-label CE/KL + hard Dice
+soft_label_loss: ce
+lambda_soft: 1.0
+lambda_dice: 1.0
+use_confidence_mask: true
+confidence_threshold: 0.60
+include_background_in_dice: false
+grade5_boost: 2.0
+
+# QC usage
+qc_policy: warn_downweight
+qc_fail_keys: [hard_fail, failed, qc_failed]
+qc_suspicious_keys: [suspicious, needs_review]
+qc_downweight_factor: 0.7
+qc_per_rater_penalty: 0.1
+qc_min_weight: 0.2
+
+# Validation
+val_every: 1
+val_start_epoch: 1
+
+# Performance
+use_amp: true
+amp_dtype: fp16
+use_compile: false
+
+# Checkpointing
+keep_last_checkpoints: 3
+
+# Best checkpoint selection
+best_ckpt_w_macro_dice: 0.6
+best_ckpt_w_sensitivity: 0.4
+
+# Early stopping
+early_stopping_patience: 0
+early_stopping_min_delta: 0.001
+
+# Weights & Biases
+wandb_enabled: true
+wandb_mode: online # online | offline | disabled
+wandb_project: prostate-lesion-segmentation
+wandb_entity: ""
+wandb_run_name: ""
+wandb_group: deconver-2d-local
+wandb_tags: [deconver, consensus, 2d, local]
+wandb_log_config: true
+wandb_strict: false
+
+# Validation visualization
+viz_enabled: true
+viz_every_n_epochs: 5
+viz_num_cases: 8
+viz_output_subdir: val_viz
+viz_log_wandb: true

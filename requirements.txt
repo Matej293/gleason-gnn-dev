@@ -1,0 +1,13 @@
+torch
+torchvision
+torchaudio
+einops
+wandb
+setuptools<80
+numpy
+scipy
+scikit-image
+pyyaml
+Pillow
+tqdm
+SimpleITK
