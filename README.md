@@ -36,8 +36,16 @@ PYTHONPATH=. python scripts/build_consensus_2d.py \
   --dataset-root data \
   --output-root data/consensus \
   --consensus-fusion-mode weighted \
-  --ignore-threshold-loose 0.30 \
-  --ignore-threshold-strict 0.50 \
+  --target-ignore-tissue-frac 0.05 \
+  --target-ignore-total-frac 0.12 \
+  --ignore-threshold-min 0.05 \
+  --ignore-threshold-max 0.35 \
+  --auto-calibrate-ignore-threshold \
+  --boundary-dilate-px 1 \
+  --edge-smooth-open-px 0 \
+  --edge-smooth-close-px 1 \
+  --remove-small-islands-px 64 \
+  --fill-small-holes-px 64 \
   --single-rater-ignore-policy confidence_mask \
   --disable-gpu \
   --workers 8
@@ -47,6 +55,18 @@ Make target:
 
 ```bash
 make consensus-weighted
+```
+
+Background-ignore audit:
+
+```bash
+make audit-background-ignore
+```
+
+This writes:
+
+```text
+outputs/background_ignore_audit.json
 ```
 
 This runs the vendored STAPLE consensus builder and writes outputs to:
@@ -108,6 +128,10 @@ Notes:
 
 - `consensus_fusion_mode`: `staple_unweighted` (baseline) or `weighted` (uses `weights_per_pathologist`)
 - `ignore_threshold_loose`, `ignore_threshold_strict`: confidence threshold used to build `ignore_mask.png`
+- `target_ignore_tissue_frac`, `target_ignore_total_frac`: per-image ignore targets for auto-calibration
+- `ignore_threshold_min`, `ignore_threshold_max`: calibration bounds
+- `auto_calibrate_ignore_threshold`: lower threshold per image to reduce excessive ignore
+- `boundary_dilate_px`, `edge_smooth_open_px`, `edge_smooth_close_px`, `remove_small_islands_px`, `fill_small_holes_px`: edge/refinement controls
 - `single_rater_ignore_policy`: `confidence_mask` (default) or `all_ignore`
 
 `qc_report.json` now includes:
@@ -115,6 +139,12 @@ Notes:
 - `consensus_fusion.effective_fusion_mode`
 - `consensus_fusion.used_weights_per_pathologist`
 - `consensus_fusion.ignore_threshold_used` (when applicable)
+- `consensus_fusion.ignored_total_fraction`
+- `consensus_fusion.ignored_tissue_fraction`
+- `consensus_fusion.ignored_boundary_fraction`
+- `consensus_fusion.boundary_length_before_refine` / `boundary_length_after_refine`
+- `consensus_fusion.small_component_count_before_refine` / `small_component_count_after_refine`
+- `consensus_fusion.excessive_tissue_ignore`
 - `final_thresholds_used.ignore_confidence_threshold`
 
 ### Training/evaluation config
@@ -123,6 +153,19 @@ Notes:
   (`class_weights` is still supported for backward compatibility)
 - `loss_variant`: `soft_dice` (default), `focal_dice`, or `tversky_dice`
 - `eval_leave_one_rater_out`: when `true`, logs/reports LOO-consensus diagnostics
+- `enforce_background_ignore`: defaults to `true`; forces non-tissue pixels to ignore during dataset loading
+
+### Tissue/background handling in training
+
+The model is trained on 4 tissue classes (`benign`, `G3`, `G4`, `G5`). Background is not a fifth class.
+
+During dataset loading, tissue/background is estimated from RGB via Otsu + morphology. With
+`enforce_background_ignore: true` (default), all detected non-tissue pixels are forced to `ignore=1`
+before loss computation. This prevents accidental supervision on whitespace/background even if stored
+`ignore_mask.png` does not fully cover it.
+
+Important: this safety check validates consistency with loader-derived tissue/background, not pathology
+ground-truth background labels.
 
 ## How To Run The New Changes
 
@@ -137,14 +180,33 @@ PYTHONPATH=. python scripts/build_consensus_2d.py \
   --dataset-root data \
   --output-root data/consensus \
   --consensus-fusion-mode weighted \
-  --ignore-threshold-loose 0.30 \
-  --ignore-threshold-strict 0.50 \
+  --target-ignore-tissue-frac 0.05 \
+  --target-ignore-total-frac 0.12 \
+  --ignore-threshold-min 0.05 \
+  --ignore-threshold-max 0.35 \
+  --auto-calibrate-ignore-threshold \
+  --boundary-dilate-px 1 \
+  --edge-smooth-open-px 0 \
+  --edge-smooth-close-px 1 \
+  --remove-small-islands-px 64 \
+  --fill-small-holes-px 64 \
   --single-rater-ignore-policy confidence_mask \
   --disable-gpu \
   --workers 8
 ```
 
-2. Train with upgraded loss controls (edit config first).
+2. Audit background-ignore safety (recommended before training).
+
+```bash
+make audit-background-ignore
+```
+
+Read `outputs/background_ignore_audit.json`:
+
+- `bg_not_ignored_*`: background leakage after `enforce_background_ignore` cleanup (should be near zero)
+- `tissue_ignored_*`: how much tissue is ignored after cleanup
+
+3. Train with upgraded loss controls (edit config first).
 ```yaml
 # configs/deconver_2d_local.yaml
 loss_variant: focal_dice
@@ -156,7 +218,7 @@ eval_leave_one_rater_out: true
 PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
 ```
 
-3. Evaluate checkpoint (includes LOO summary when enabled in run config).
+4. Evaluate checkpoint (includes LOO summary when enabled in run config).
 ```bash
 PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run outputs/runs/<run_name>
 ```

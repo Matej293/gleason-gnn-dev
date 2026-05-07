@@ -1,4 +1,4 @@
-.PHONY: help train eval smoke test consensus consensus-weighted viz-consensus-gt
+.PHONY: help train eval smoke test consensus consensus-weighted viz-consensus-gt audit-background-ignore
 .DEFAULT_GOAL := help
 
 MAX_CASES ?= 64
@@ -12,6 +12,7 @@ help:
 	@echo "  make consensus"
 	@echo "  make consensus-weighted"
 	@echo "  make viz-consensus-gt [MAX_CASES=64]"
+	@echo "  make audit-background-ignore"
 
 train:
 	PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
@@ -50,3 +51,6 @@ consensus-weighted:
 
 viz-consensus-gt:
 	PYTHONPATH=. python scripts/generate_consensus_gt_viz.py --max-cases $(MAX_CASES)
+
+audit-background-ignore:
+	PYTHONPATH=. python scripts/audit_background_ignore.py
