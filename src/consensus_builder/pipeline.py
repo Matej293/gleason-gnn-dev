@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.ndimage import binary_dilation
 from tqdm import tqdm
 
 from . import metrics
@@ -24,12 +25,15 @@ from .labels import NUM_CLASSES, remap_raw_mask, validate_raw_labels
 from .postprocess import (
     PostConfig,
     apply_grade5_safeguard,
+    boundary_length_4conn,
     boundary_disagreement_penalty,
     choose_hard_mask,
+    count_small_components_by_class,
     confidence_uncertainty_maps,
     gpu_info,
     make_ignore_mask_with_threshold,
     normalize_probs,
+    refine_hard_mask_classes,
 )
 from .qc import QCConfig, class_stats, decide_rater_status, fragmentation_stats, qc_flags_for_rater
 from .staple import (
@@ -48,9 +52,15 @@ class ConsensusConfig:
     enable_gpu: bool = True
     strict_ignore: bool = False
     workers: int = 1
-    consensus_fusion_mode: str = "staple_unweighted"
+    consensus_fusion_mode: str = "weighted"
     ignore_threshold_loose: float = 0.30
     ignore_threshold_strict: float = 0.50
+    target_ignore_tissue_frac: float = 0.05
+    target_ignore_total_frac: float = 0.12
+    ignore_threshold_min: float = 0.05
+    ignore_threshold_max: float = 0.35
+    auto_calibrate_ignore_threshold: bool = True
+    disable_boundary_penalty: bool = False
     single_rater_ignore_policy: str = "confidence_mask"
 
     qc: QCConfig = field(default_factory=QCConfig)
@@ -138,6 +148,61 @@ class ConsensusMaskBuilder:
         }
         return qc_block, statuses, weights
 
+    @staticmethod
+    def _boundary_band_from_masks(masks: list[np.ndarray], dilate_px: int) -> np.ndarray:
+        if not masks:
+            return np.zeros((0, 0), dtype=bool)
+        boundary_union = np.zeros_like(masks[0], dtype=bool)
+        for m in masks:
+            b = np.zeros_like(m, dtype=bool)
+            b[:, 1:] |= m[:, 1:] != m[:, :-1]
+            b[1:, :] |= m[1:, :] != m[:-1, :]
+            if dilate_px > 0:
+                b = binary_dilation(b, iterations=dilate_px)
+            boundary_union |= b
+        return boundary_union
+
+    @staticmethod
+    def _tissue_mask_from_maps(masks: list[np.ndarray], hard: np.ndarray) -> np.ndarray:
+        tissue = np.zeros_like(hard, dtype=bool)
+        for m in masks:
+            tissue |= m > 0
+        if not np.any(tissue):
+            tissue = hard > 0
+        if not np.any(tissue):
+            tissue = np.ones_like(hard, dtype=bool)
+        return tissue
+
+    def _calibrate_ignore_threshold(
+        self,
+        conf: np.ndarray,
+        base_threshold: float,
+        tissue_mask: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        th_min = float(self.config.ignore_threshold_min)
+        th_max = float(self.config.ignore_threshold_max)
+        threshold = float(np.clip(base_threshold, th_min, th_max))
+        ignore = make_ignore_mask_with_threshold(conf, threshold=threshold)
+        if not self.config.auto_calibrate_ignore_threshold:
+            return ignore, float(threshold)
+
+        target_tissue = float(self.config.target_ignore_tissue_frac)
+        target_total = float(self.config.target_ignore_total_frac)
+        tissue_denom = float(max(1, int(tissue_mask.sum())))
+        total_denom = float(ignore.size)
+
+        while threshold > th_min:
+            ignored_tissue = float(np.logical_and(ignore > 0, tissue_mask).sum()) / tissue_denom
+            ignored_total = float((ignore > 0).sum()) / total_denom
+            if ignored_tissue <= target_tissue and ignored_total <= target_total:
+                break
+            next_threshold = max(th_min, threshold - 0.01)
+            if abs(next_threshold - threshold) < 1e-8:
+                break
+            threshold = next_threshold
+            ignore = make_ignore_mask_with_threshold(conf, threshold=threshold)
+        return ignore, float(threshold)
+
     def _run_consensus(
         self, sem_maps: dict[str, np.ndarray], statuses: dict[str, str], weights: dict[str, float]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
@@ -163,9 +228,12 @@ class ConsensusMaskBuilder:
                 ignore = np.ones_like(hard, dtype=np.uint8)
             else:
                 threshold = self.config.ignore_threshold_strict if self.config.strict_ignore else self.config.ignore_threshold_loose
+                threshold = float(np.clip(threshold, self.config.ignore_threshold_min, self.config.ignore_threshold_max))
                 ignore = make_ignore_mask_with_threshold(conf, threshold=threshold)
                 if np.all(ignore > 0):
-                    # Guarantee trainable supervision under single-rater fallback.
+                    min_threshold = float(self.config.ignore_threshold_min)
+                    ignore = make_ignore_mask_with_threshold(conf, threshold=min_threshold)
+                    # Guarantee trainable supervision under single-rater fallback, unless explicitly all-ignore policy is requested.
                     keep = conf >= float(np.max(conf))
                     ignore = (~keep).astype(np.uint8)
             return hard, probs, ignore, {
@@ -186,16 +254,55 @@ class ConsensusMaskBuilder:
 
         hard = choose_hard_mask(probs)
         conf, unc = confidence_uncertainty_maps(probs, use_gpu=self.config.enable_gpu)
-        if self.config.post.apply_boundary_penalty:
-            conf = boundary_disagreement_penalty(hard, masks, conf, self.config.post.boundary_dilate_px)
+        apply_boundary_penalty = self.config.post.apply_boundary_penalty and (not self.config.disable_boundary_penalty)
+        if apply_boundary_penalty:
+            conf = boundary_disagreement_penalty(
+                hard,
+                masks,
+                conf,
+                self.config.post.boundary_dilate_px,
+                agreement_clip_min=0.75,
+            )
 
         threshold = self.config.ignore_threshold_strict if self.config.strict_ignore else self.config.ignore_threshold_loose
-        ignore = make_ignore_mask_with_threshold(conf, threshold=threshold)
+        tissue_mask = self._tissue_mask_from_maps(masks, hard)
+        ignore, threshold = self._calibrate_ignore_threshold(conf, threshold, tissue_mask)
+        hard_before_refine = hard
+        hard = refine_hard_mask_classes(
+            hard,
+            num_classes=self.config.num_classes,
+            edge_smooth_open_px=self.config.post.edge_smooth_open_px,
+            edge_smooth_close_px=self.config.post.edge_smooth_close_px,
+            remove_small_islands_px=self.config.post.remove_small_islands_px,
+            fill_small_holes_px=self.config.post.fill_small_holes_px,
+        )
+        boundary_band = self._boundary_band_from_masks(masks, self.config.post.boundary_dilate_px)
+        ignored_total_fraction = float((ignore > 0).mean())
+        tissue_denom = float(max(1, int(tissue_mask.sum())))
+        ignored_tissue_fraction = float(np.logical_and(ignore > 0, tissue_mask).sum()) / tissue_denom
+        boundary_denom = float(max(1, int(boundary_band.sum())))
+        ignored_boundary_fraction = float(np.logical_and(ignore > 0, boundary_band).sum()) / boundary_denom
         return hard, probs, ignore, {
             "effective_fusion_mode": fusion_mode,
             "n_kept_raters": len(kept),
             "used_weights_per_pathologist": {r: float(weights.get(r, 0.0)) for r in kept},
             "ignore_threshold_used": float(threshold),
+            "ignored_total_fraction": ignored_total_fraction,
+            "ignored_tissue_fraction": ignored_tissue_fraction,
+            "ignored_boundary_fraction": ignored_boundary_fraction,
+            "boundary_length_before_refine": boundary_length_4conn(hard_before_refine),
+            "boundary_length_after_refine": boundary_length_4conn(hard),
+            "small_component_count_before_refine": count_small_components_by_class(
+                hard_before_refine,
+                self.config.num_classes,
+                self.config.post.remove_small_islands_px,
+            ),
+            "small_component_count_after_refine": count_small_components_by_class(
+                hard,
+                self.config.num_classes,
+                self.config.post.remove_small_islands_px,
+            ),
+            "excessive_tissue_ignore": bool(ignored_tissue_fraction > 0.20),
         }
 
     def process_image(self, image_id: str, by_rater_paths: dict[str, Path]) -> dict[str, Any]:
@@ -246,6 +353,14 @@ class ConsensusMaskBuilder:
                         "grade5_floor": self.config.post.grade5_floor,
                     },
                     "consensus_fusion": fusion_summary,
+                    "ignored_total_fraction": fusion_summary.get("ignored_total_fraction"),
+                    "ignored_tissue_fraction": fusion_summary.get("ignored_tissue_fraction"),
+                    "ignored_boundary_fraction": fusion_summary.get("ignored_boundary_fraction"),
+                    "boundary_length_before_refine": fusion_summary.get("boundary_length_before_refine"),
+                    "boundary_length_after_refine": fusion_summary.get("boundary_length_after_refine"),
+                    "small_component_count_before_refine": fusion_summary.get("small_component_count_before_refine"),
+                    "small_component_count_after_refine": fusion_summary.get("small_component_count_after_refine"),
+                    "excessive_tissue_ignore": fusion_summary.get("excessive_tissue_ignore", False),
                     "storage_mode": "compact_float16_npz",
                 }
             )

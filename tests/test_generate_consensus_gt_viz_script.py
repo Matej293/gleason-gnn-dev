@@ -45,8 +45,8 @@ def test_generate_consensus_gt_viz_script_smoke(tmp_path: Path) -> None:
     ]
     subprocess.run(cmd, check=True)
 
-    overlay = out_dir / "overlay" / "0001_case001.png"
-    panel = out_dir / "panel" / "0001_case001.png"
+    overlay = out_dir / "overlay" / "0001_case001.webp"
+    panel = out_dir / "panel" / "0001_case001.jpg"
     summary = out_dir / "summary.json"
 
     assert overlay.exists()

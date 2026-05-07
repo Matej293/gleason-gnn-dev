@@ -34,8 +34,16 @@ consensus-weighted:
 		--dataset-root data \
 		--output-root data/consensus \
 		--consensus-fusion-mode weighted \
-		--ignore-threshold-loose 0.30 \
-		--ignore-threshold-strict 0.50 \
+		--target-ignore-tissue-frac 0.05 \
+		--target-ignore-total-frac 0.12 \
+		--ignore-threshold-min 0.05 \
+		--ignore-threshold-max 0.35 \
+		--auto-calibrate-ignore-threshold \
+		--boundary-dilate-px 1 \
+		--edge-smooth-open-px 0 \
+		--edge-smooth-close-px 1 \
+		--remove-small-islands-px 64 \
+		--fill-small-holes-px 64 \
 		--single-rater-ignore-policy confidence_mask \
 		--disable-gpu \
 		--workers 8

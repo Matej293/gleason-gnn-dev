@@ -2,13 +2,20 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import random
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
 from src.consensus_overlay_viz import save_gt_overlay_png, save_gt_panel_png
 from src.gleason_consensus_dataset import GleasonConsensusDataset
+
+_PIL_RESAMPLING = getattr(Image, "Resampling", Image)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -30,6 +37,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--image-ids", type=str, nargs="*", default=None, help="Optional explicit image IDs.")
     p.add_argument("--train-only", action="store_true", help="Restrict to Train_imgs samples.")
     p.add_argument("--test-only", action="store_true", help="Restrict to Test_imgs samples.")
+    p.add_argument("--workers", type=int, default=8, help="Parallel workers for rendering/writing.")
+    p.add_argument(
+        "--max-long-side",
+        type=int,
+        default=1536,
+        help="Downscale input before rendering (0 disables).",
+    )
+    p.add_argument("--overlay-format", type=str, default="webp", choices=["png", "jpg", "webp"])
+    p.add_argument("--panel-format", type=str, default="jpg", choices=["png", "jpg", "webp"])
+    p.add_argument("--png-compress-level", type=int, default=3, help="PNG compression level [0..9].")
+    p.add_argument("--jpeg-quality", type=int, default=85, help="JPEG quality [1..95].")
+    p.add_argument("--webp-quality", type=int, default=80, help="WEBP quality [1..100].")
     return p.parse_args()
 
 
@@ -59,6 +78,83 @@ def _select_items(ds: GleasonConsensusDataset, args: argparse.Namespace) -> list
     return items
 
 
+def _maybe_resize(
+    image: np.ndarray,
+    hard: np.ndarray,
+    ignore: np.ndarray,
+    max_long_side: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if max_long_side <= 0:
+        return image, hard, ignore
+    h, w = image.shape[:2]
+    longest = max(h, w)
+    if longest <= max_long_side:
+        return image, hard, ignore
+    scale = float(max_long_side) / float(longest)
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+    image_rs = np.asarray(Image.fromarray(image).resize((new_w, new_h), resample=_PIL_RESAMPLING.BILINEAR))
+    hard_rs = np.asarray(Image.fromarray(hard).resize((new_w, new_h), resample=_PIL_RESAMPLING.NEAREST))
+    ignore_rs = np.asarray(Image.fromarray(ignore).resize((new_w, new_h), resample=_PIL_RESAMPLING.NEAREST))
+    return image_rs, hard_rs, ignore_rs
+
+
+def _write_one_case(task: tuple[int, dict, str, str, float, int, bool, str, str, int, int, int]) -> int:
+    (
+        i,
+        item,
+        overlay_dir_s,
+        panel_dir_s,
+        alpha,
+        compress_level,
+        optimize,
+        overlay_format,
+        panel_format,
+        jpeg_quality,
+        webp_quality,
+        max_long_side,
+    ) = task
+    image_id = str(item["image_id"])
+    stem = f"{i:04d}_{image_id}"
+
+    image = np.array(Image.open(item["image_path"]).convert("RGB"), dtype=np.uint8)
+    hard = np.array(Image.open(item["hard_path"]), dtype=np.uint8)
+    ignore = np.array(Image.open(item["ignore_path"]), dtype=np.uint8)
+    image, hard, ignore = _maybe_resize(image=image, hard=hard, ignore=ignore, max_long_side=max_long_side)
+
+    overlay_dir = Path(overlay_dir_s)
+    panel_dir = Path(panel_dir_s)
+    overlay_ext = "jpg" if overlay_format == "jpg" else overlay_format
+    panel_ext = "jpg" if panel_format == "jpg" else panel_format
+    overlay_quality = jpeg_quality if overlay_format == "jpg" else webp_quality
+    panel_quality = jpeg_quality if panel_format == "jpg" else webp_quality
+
+    save_gt_overlay_png(
+        output_path=overlay_dir / f"{stem}.{overlay_ext}",
+        image=image,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        alpha=alpha,
+        image_format=overlay_format,
+        compress_level=compress_level,
+        optimize=optimize,
+        quality=overlay_quality,
+    )
+    save_gt_panel_png(
+        output_path=panel_dir / f"{stem}.{panel_ext}",
+        image=image,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        image_id=image_id,
+        alpha=alpha,
+        image_format=panel_format,
+        compress_level=compress_level,
+        optimize=optimize,
+        quality=panel_quality,
+    )
+    return 1
+
+
 def main() -> int:
     args = _parse_args()
 
@@ -78,30 +174,37 @@ def main() -> int:
     overlay_dir.mkdir(parents=True, exist_ok=True)
     panel_dir.mkdir(parents=True, exist_ok=True)
 
-    id_to_idx = {str(item["image_id"]): i for i, item in enumerate(ds.items)}
+    workers = max(1, int(args.workers))
+    png_compress_level = min(9, max(0, int(args.png_compress_level)))
+    png_optimize = False
+    jpeg_quality = min(95, max(1, int(args.jpeg_quality)))
+    webp_quality = min(100, max(1, int(args.webp_quality)))
+    max_long_side = max(0, int(args.max_long_side))
+    overlay_format = str(args.overlay_format).lower()
+    panel_format = str(args.panel_format).lower()
+    tasks = [
+        (
+            i,
+            item,
+            str(overlay_dir),
+            str(panel_dir),
+            float(args.alpha),
+            png_compress_level,
+            png_optimize,
+            overlay_format,
+            panel_format,
+            jpeg_quality,
+            webp_quality,
+            max_long_side,
+        )
+        for i, item in enumerate(selected, start=1)
+    ]
 
     written = 0
-    for i, item in enumerate(selected, start=1):
-        image_id = str(item["image_id"])
-        sample = ds[id_to_idx[image_id]]
-
-        stem = f"{i:04d}_{image_id}"
-        save_gt_overlay_png(
-            output_path=overlay_dir / f"{stem}.png",
-            image=sample["image"],
-            hard_mask=sample["hard_mask"],
-            ignore_mask=sample["ignore_mask"],
-            alpha=float(args.alpha),
-        )
-        save_gt_panel_png(
-            output_path=panel_dir / f"{stem}.png",
-            image=sample["image"],
-            hard_mask=sample["hard_mask"],
-            ignore_mask=sample["ignore_mask"],
-            image_id=image_id,
-            alpha=float(args.alpha),
-        )
-        written += 1
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_write_one_case, task) for task in tasks]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Generating GT visualizations"):
+            written += fut.result()
 
     summary = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -118,6 +221,16 @@ def main() -> int:
             "max_cases": int(args.max_cases),
             "random_sample": bool(args.random_sample),
             "seed": int(args.seed),
+        },
+        "performance": {
+            "workers": workers,
+            "max_long_side": max_long_side,
+            "overlay_format": overlay_format,
+            "panel_format": panel_format,
+            "png_compress_level": png_compress_level,
+            "png_optimize": png_optimize,
+            "jpeg_quality": jpeg_quality,
+            "webp_quality": webp_quality,
         },
     }
 

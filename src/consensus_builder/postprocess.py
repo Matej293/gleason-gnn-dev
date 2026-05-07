@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_closing, binary_dilation, binary_fill_holes, binary_opening, label
 
 
 @dataclass
@@ -15,8 +15,12 @@ class PostConfig:
     ignore_conf_threshold_loose: float = 0.30
     ignore_conf_threshold_strict: float = 0.50
     grade5_floor: float = 0.08
-    boundary_dilate_px: int = 3
+    boundary_dilate_px: int = 1
     apply_boundary_penalty: bool = True
+    edge_smooth_open_px: int = 0
+    edge_smooth_close_px: int = 1
+    remove_small_islands_px: int = 64
+    fill_small_holes_px: int = 64
 
 
 def _torch_available() -> bool:
@@ -121,6 +125,7 @@ def boundary_disagreement_penalty(
     masks: list[np.ndarray],
     confidence: np.ndarray,
     dilate_px: int,
+    agreement_clip_min: float = 0.75,
 ) -> np.ndarray:
     if len(masks) <= 1:
         return confidence
@@ -135,8 +140,67 @@ def boundary_disagreement_penalty(
     stack = np.stack(masks, axis=0)
     agreement = (stack == hard_mask[None, ...]).mean(axis=0)
     penalized = confidence.copy()
-    penalized[boundary_union] *= np.clip(agreement[boundary_union], 0.5, 1.0)
+    penalized[boundary_union] *= np.clip(agreement[boundary_union], float(agreement_clip_min), 1.0)
     return penalized.astype(np.float32)
+
+
+def _remove_small_components(mask: np.ndarray, min_size: int, keep_large: bool) -> np.ndarray:
+    if min_size <= 0:
+        return mask
+    comp, n_comp = label(mask)
+    if n_comp <= 0:
+        return mask
+    counts = np.bincount(comp.ravel())
+    out = mask.copy()
+    for comp_id in range(1, len(counts)):
+        if counts[comp_id] < min_size:
+            out[comp == comp_id] = keep_large
+    return out
+
+
+def refine_hard_mask_classes(
+    hard: np.ndarray,
+    num_classes: int,
+    edge_smooth_open_px: int = 0,
+    edge_smooth_close_px: int = 1,
+    remove_small_islands_px: int = 64,
+    fill_small_holes_px: int = 64,
+) -> np.ndarray:
+    out = hard.copy().astype(np.uint8, copy=False)
+    for cls in range(1, num_classes):
+        cls_mask = hard == cls
+        if edge_smooth_open_px > 0:
+            cls_mask = binary_opening(cls_mask, iterations=edge_smooth_open_px)
+        if edge_smooth_close_px > 0:
+            cls_mask = binary_closing(cls_mask, iterations=edge_smooth_close_px)
+        cls_mask = _remove_small_components(cls_mask, int(remove_small_islands_px), keep_large=False)
+        if fill_small_holes_px > 0:
+            holes = np.logical_and(binary_fill_holes(cls_mask), ~cls_mask)
+            holes = _remove_small_components(holes, int(fill_small_holes_px), keep_large=False)
+            cls_mask = np.logical_or(cls_mask, holes)
+        out[out == cls] = 0
+        out[cls_mask] = np.uint8(cls)
+    return out
+
+
+def boundary_length_4conn(mask: np.ndarray) -> int:
+    b = np.zeros_like(mask, dtype=bool)
+    b[:, 1:] |= mask[:, 1:] != mask[:, :-1]
+    b[1:, :] |= mask[1:, :] != mask[:-1, :]
+    return int(b.sum())
+
+
+def count_small_components_by_class(mask: np.ndarray, num_classes: int, max_size: int) -> int:
+    if max_size <= 0:
+        return 0
+    total = 0
+    for cls in range(1, num_classes):
+        comp, n_comp = label(mask == cls)
+        if n_comp <= 0:
+            continue
+        counts = np.bincount(comp.ravel())
+        total += int(np.sum((counts[1:] > 0) & (counts[1:] < int(max_size))))
+    return total
 
 
 def choose_hard_mask(probs: np.ndarray) -> np.ndarray:

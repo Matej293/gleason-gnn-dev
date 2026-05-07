@@ -134,6 +134,10 @@ def save_gt_overlay_png(
     hard_mask: torch.Tensor | np.ndarray,
     ignore_mask: torch.Tensor | np.ndarray | None = None,
     alpha: float = 0.45,
+    image_format: str = "PNG",
+    compress_level: int = 1,
+    optimize: bool = False,
+    quality: int = 85,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     img = render_gt_overlay(
@@ -142,7 +146,15 @@ def save_gt_overlay_png(
         ignore_mask=ignore_mask,
         alpha=alpha,
     )
-    img.save(output_path, format="PNG")
+    fmt = str(image_format).upper()
+    if fmt == "PNG":
+        img.save(output_path, format="PNG", compress_level=int(compress_level), optimize=bool(optimize))
+    elif fmt in ("JPG", "JPEG"):
+        img.save(output_path, format="JPEG", quality=int(quality), optimize=bool(optimize))
+    elif fmt == "WEBP":
+        img.save(output_path, format="WEBP", quality=int(quality), method=4)
+    else:
+        raise ValueError(f"Unsupported image_format for overlay: {image_format}")
     return output_path
 
 
@@ -153,6 +165,10 @@ def save_gt_panel_png(
     ignore_mask: torch.Tensor | np.ndarray | None,
     image_id: str,
     alpha: float = 0.45,
+    image_format: str = "PNG",
+    compress_level: int = 1,
+    optimize: bool = False,
+    quality: int = 85,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     panel = render_gt_panel(
@@ -162,7 +178,15 @@ def save_gt_panel_png(
         image_id=image_id,
         alpha=alpha,
     )
-    panel.save(output_path, format="PNG")
+    fmt = str(image_format).upper()
+    if fmt == "PNG":
+        panel.save(output_path, format="PNG", compress_level=int(compress_level), optimize=bool(optimize))
+    elif fmt in ("JPG", "JPEG"):
+        panel.save(output_path, format="JPEG", quality=int(quality), optimize=bool(optimize))
+    elif fmt == "WEBP":
+        panel.save(output_path, format="WEBP", quality=int(quality), method=4)
+    else:
+        raise ValueError(f"Unsupported image_format for panel: {image_format}")
     return output_path
 
 
