@@ -28,11 +28,15 @@ from .postprocess import (
     choose_hard_mask,
     confidence_uncertainty_maps,
     gpu_info,
-    make_ignore_mask,
+    make_ignore_mask_with_threshold,
     normalize_probs,
 )
 from .qc import QCConfig, class_stats, decide_rater_status, fragmentation_stats, qc_flags_for_rater
-from .staple import StapleConfig, run_multiclass_one_vs_rest_staple
+from .staple import (
+    StapleConfig,
+    run_multiclass_one_vs_rest_staple,
+    run_multiclass_weighted_vote,
+)
 
 
 @dataclass
@@ -44,6 +48,10 @@ class ConsensusConfig:
     enable_gpu: bool = True
     strict_ignore: bool = False
     workers: int = 1
+    consensus_fusion_mode: str = "staple_unweighted"
+    ignore_threshold_loose: float = 0.30
+    ignore_threshold_strict: float = 0.50
+    single_rater_ignore_policy: str = "confidence_mask"
 
     qc: QCConfig = field(default_factory=QCConfig)
     staple: StapleConfig = field(default_factory=StapleConfig)
@@ -130,23 +138,47 @@ class ConsensusMaskBuilder:
         }
         return qc_block, statuses, weights
 
-    def _run_consensus(self, sem_maps: dict[str, np.ndarray], statuses: dict[str, str], weights: dict[str, float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _run_consensus(
+        self, sem_maps: dict[str, np.ndarray], statuses: dict[str, str], weights: dict[str, float]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
         kept = [r for r, s in statuses.items() if s != "exclude"]
         if not kept:
             raise RuntimeError("No valid raters after QC")
 
         masks = [sem_maps[r] for r in kept]
+        used_weights = [float(weights.get(r, 1.0)) for r in kept]
         reliable_flags = [weights[r] >= 0.7 for r in kept]
+        fusion_mode = str(self.config.consensus_fusion_mode).strip().lower()
+        if fusion_mode not in {"staple_unweighted", "weighted"}:
+            raise ValueError(f"Unsupported consensus_fusion_mode: {self.config.consensus_fusion_mode!r}")
 
         if len(masks) == 1:
             hard = masks[0].astype(np.uint8)
             probs = np.full((self.config.num_classes, *hard.shape), 0.05 / (self.config.num_classes - 1), dtype=np.float32)
             for c in range(self.config.num_classes):
                 probs[c][hard == c] = 0.95
-            ignore = np.ones_like(hard, dtype=np.uint8)
-            return hard, probs, ignore
+            conf = probs.max(axis=0)
+            policy = str(self.config.single_rater_ignore_policy).strip().lower()
+            if policy == "all_ignore":
+                ignore = np.ones_like(hard, dtype=np.uint8)
+            else:
+                threshold = self.config.ignore_threshold_strict if self.config.strict_ignore else self.config.ignore_threshold_loose
+                ignore = make_ignore_mask_with_threshold(conf, threshold=threshold)
+                if np.all(ignore > 0):
+                    # Guarantee trainable supervision under single-rater fallback.
+                    keep = conf >= float(np.max(conf))
+                    ignore = (~keep).astype(np.uint8)
+            return hard, probs, ignore, {
+                "effective_fusion_mode": "single_rater_fallback",
+                "single_rater_ignore_policy": policy,
+                "n_kept_raters": 1,
+                "used_weights_per_pathologist": {kept[0]: float(used_weights[0])},
+            }
 
-        probs_raw = run_multiclass_one_vs_rest_staple(masks, self.config.num_classes, self.config.staple)
+        if fusion_mode == "weighted":
+            probs_raw = run_multiclass_weighted_vote(masks, used_weights, self.config.num_classes)
+        else:
+            probs_raw = run_multiclass_one_vs_rest_staple(masks, self.config.num_classes, self.config.staple)
         probs = normalize_probs(probs_raw, epsilon=self.config.post.epsilon, use_gpu=self.config.enable_gpu)
         probs = apply_grade5_safeguard(probs, masks, reliable_flags, self.config.post.grade5_floor)
         if not np.isfinite(probs).all():
@@ -157,8 +189,14 @@ class ConsensusMaskBuilder:
         if self.config.post.apply_boundary_penalty:
             conf = boundary_disagreement_penalty(hard, masks, conf, self.config.post.boundary_dilate_px)
 
-        ignore = make_ignore_mask(conf, n_raters=len(masks), strict=self.config.strict_ignore)
-        return hard, probs, ignore
+        threshold = self.config.ignore_threshold_strict if self.config.strict_ignore else self.config.ignore_threshold_loose
+        ignore = make_ignore_mask_with_threshold(conf, threshold=threshold)
+        return hard, probs, ignore, {
+            "effective_fusion_mode": fusion_mode,
+            "n_kept_raters": len(kept),
+            "used_weights_per_pathologist": {r: float(weights.get(r, 0.0)) for r in kept},
+            "ignore_threshold_used": float(threshold),
+        }
 
     def process_image(self, image_id: str, by_rater_paths: dict[str, Path]) -> dict[str, Any]:
         out_dir = self.output_root / image_id
@@ -171,7 +209,7 @@ class ConsensusMaskBuilder:
             qc, statuses, weights = self._qc_and_status(
                 sem_maps, invalids, report.get("available_pathologist_ids", sorted(by_rater_paths))
             )
-            hard, probs, ignore = self._run_consensus(sem_maps, statuses, weights)
+            hard, probs, ignore, fusion_summary = self._run_consensus(sem_maps, statuses, weights)
 
             save_png_mask(out_dir / "consensus_hard_mask.png", hard.astype(np.uint8))
             save_npz_compressed(
@@ -201,12 +239,13 @@ class ConsensusMaskBuilder:
                         "high_fragment_count": self.config.qc.high_fragment_count,
                         "ignore_mode": "strict" if self.config.strict_ignore else "loose",
                         "ignore_confidence_threshold": (
-                            self.config.post.ignore_conf_threshold_strict
+                            self.config.ignore_threshold_strict
                             if self.config.strict_ignore
-                            else self.config.post.ignore_conf_threshold_loose
+                            else self.config.ignore_threshold_loose
                         ),
                         "grade5_floor": self.config.post.grade5_floor,
                     },
+                    "consensus_fusion": fusion_summary,
                     "storage_mode": "compact_float16_npz",
                 }
             )

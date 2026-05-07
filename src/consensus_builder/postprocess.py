@@ -112,6 +112,10 @@ def make_ignore_mask(confidence: np.ndarray, n_raters: int, strict: bool = False
     return (confidence < th).astype(np.uint8)
 
 
+def make_ignore_mask_with_threshold(confidence: np.ndarray, threshold: float) -> np.ndarray:
+    return (confidence < float(threshold)).astype(np.uint8)
+
+
 def boundary_disagreement_penalty(
     hard_mask: np.ndarray,
     masks: list[np.ndarray],

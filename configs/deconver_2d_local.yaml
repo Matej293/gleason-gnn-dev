@@ -49,11 +49,13 @@ deconver_fp32_scope: iterative_block # update_only | iterative_block
 
 # Loss: soft-label CE/KL + hard Dice
 soft_label_loss: ce
+loss_variant: soft_dice # soft_dice | focal_dice | tversky_dice
 lambda_soft: 1.0
 lambda_dice: 1.0
 use_confidence_mask: true
 confidence_threshold: 0.60
 include_background_in_dice: false
+# class_loss_weights: [1.0, 1.0, 1.0, 2.0]
 grade5_boost: 2.0
 
 # QC usage
@@ -67,6 +69,7 @@ qc_min_weight: 0.2
 # Validation
 val_every: 1
 val_start_epoch: 1
+eval_leave_one_rater_out: false
 
 # Performance
 use_amp: true
@@ -77,8 +80,9 @@ use_compile: false
 keep_last_checkpoints: 3
 
 # Best checkpoint selection
-best_ckpt_w_macro_dice: 0.6
-best_ckpt_w_sensitivity: 0.4
+best_ckpt_w_macro_dice: 0.4
+best_ckpt_w_sensitivity: 0.6
+nan_recovery_log_every: 1
 
 # Early stopping
 early_stopping_patience: 0

@@ -17,6 +17,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -46,6 +47,38 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def _aggregate_loo_from_qc_reports(
+    dataset: GleasonConsensusDataset,
+    subset_indices: list[int],
+) -> dict[str, float]:
+    vals: list[float] = []
+    for idx in subset_indices:
+        item = dataset.items[int(idx)]
+        qc_path = Path(str(item.get("qc_path", "")))
+        if not qc_path.exists():
+            continue
+        try:
+            with qc_path.open("r", encoding="utf-8") as f:
+                qc = json.load(f)
+        except Exception:
+            continue
+        loo = qc.get("leave_one_out_agreement_per_pathologist", {})
+        if not isinstance(loo, dict):
+            continue
+        for v in loo.values():
+            if not isinstance(v, dict):
+                continue
+            d = v.get("dice_multiclass", None)
+            if isinstance(d, (int, float)) and math.isfinite(float(d)):
+                vals.append(float(d))
+    if not vals:
+        return {"mean_loo_dice_multiclass": float("nan"), "num_loo_entries": 0.0}
+    return {
+        "mean_loo_dice_multiclass": float(np.mean(vals)),
+        "num_loo_entries": float(len(vals)),
+    }
 
 
 def _resolve_checkpoint(run_dir: Path, ckpt_arg: str | None) -> Path:
@@ -183,8 +216,21 @@ def main() -> None:
     sums = {
         "macro_dice": 0.0,
         "grade5_dice": 0.0,
+        "miou": 0.0,
+        "grade5_iou": 0.0,
+        "dice_benign": 0.0,
+        "dice_g3": 0.0,
+        "dice_g4": 0.0,
+        "dice_g5": 0.0,
+        "iou_benign": 0.0,
+        "iou_g3": 0.0,
+        "iou_g4": 0.0,
+        "iou_g5": 0.0,
+        "iou_tumor_vs_benign": 0.0,
         "sensitivity": 0.0,
         "precision": 0.0,
+        "ignored_pixel_fraction": 0.0,
+        "tumor_pixels_ignored_fraction": 0.0,
     }
     counts = {k: 0 for k in sums}
     per_case: list[dict[str, object]] = []
@@ -228,8 +274,21 @@ def main() -> None:
                         "image_id": image_id,
                         "macro_dice": json_float(sample_metrics["macro_dice"]),
                         "grade5_dice": json_float(sample_metrics["grade5_dice"]),
+                        "miou": json_float(sample_metrics["miou"]),
+                        "grade5_iou": json_float(sample_metrics["grade5_iou"]),
+                        "dice_benign": json_float(sample_metrics["dice_benign"]),
+                        "dice_g3": json_float(sample_metrics["dice_g3"]),
+                        "dice_g4": json_float(sample_metrics["dice_g4"]),
+                        "dice_g5": json_float(sample_metrics["dice_g5"]),
+                        "iou_benign": json_float(sample_metrics["iou_benign"]),
+                        "iou_g3": json_float(sample_metrics["iou_g3"]),
+                        "iou_g4": json_float(sample_metrics["iou_g4"]),
+                        "iou_g5": json_float(sample_metrics["iou_g5"]),
+                        "iou_tumor_vs_benign": json_float(sample_metrics["iou_tumor_vs_benign"]),
                         "sensitivity": json_float(sample_metrics["sensitivity"]),
                         "precision": json_float(sample_metrics["precision"]),
+                        "ignored_pixel_fraction": json_float(sample_metrics["ignored_pixel_fraction"]),
+                        "tumor_pixels_ignored_fraction": json_float(sample_metrics["tumor_pixels_ignored_fraction"]),
                         "valid_pixels": valid_pixels,
                         "pred_positive_pixels": pred_pos,
                         "gt_positive_pixels": gt_pos,
@@ -252,11 +311,15 @@ def main() -> None:
         for k in sums
     }
     aggregate["num_test_samples"] = float(len(test_indices))
+    if bool(cfg.get("eval_leave_one_rater_out", False)):
+        aggregate.update(_aggregate_loo_from_qc_reports(dataset, test_indices))
 
     logger.info(
-        "Aggregate | macro_dice=%s grade5_dice=%s sens=%s prec=%s | test_samples=%d",
+        "Aggregate | macro_dice=%s miou=%s grade5_dice=%s grade5_iou=%s sens=%s prec=%s | test_samples=%d",
         fmt_metric(aggregate["macro_dice"]),
+        fmt_metric(aggregate["miou"]),
         fmt_metric(aggregate["grade5_dice"]),
+        fmt_metric(aggregate["grade5_iou"]),
         fmt_metric(aggregate["sensitivity"]),
         fmt_metric(aggregate["precision"]),
         len(test_indices),

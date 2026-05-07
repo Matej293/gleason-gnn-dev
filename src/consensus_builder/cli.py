@@ -14,6 +14,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=1, help="Parallel workers across images (CPU mode)")
     p.add_argument("--low-loo-dice", type=float, default=0.35, help="QC threshold for low leave-one-out dice")
     p.add_argument("--grade5-floor", type=float, default=0.08, help="Minimum grade-5 prob floor when safeguarded")
+    p.add_argument(
+        "--consensus-fusion-mode",
+        type=str,
+        default="staple_unweighted",
+        choices=["staple_unweighted", "weighted"],
+        help="Consensus fusion mode.",
+    )
+    p.add_argument("--ignore-threshold-loose", type=float, default=0.30, help="Loose ignore confidence threshold")
+    p.add_argument("--ignore-threshold-strict", type=float, default=0.50, help="Strict ignore confidence threshold")
+    p.add_argument(
+        "--single-rater-ignore-policy",
+        type=str,
+        default="confidence_mask",
+        choices=["all_ignore", "confidence_mask"],
+        help="Single-rater ignore behavior.",
+    )
     return p
 
 
@@ -25,6 +41,10 @@ def main() -> None:
         enable_gpu=not args.disable_gpu,
         strict_ignore=args.strict_ignore,
         workers=max(1, args.workers),
+        consensus_fusion_mode=args.consensus_fusion_mode,
+        ignore_threshold_loose=float(args.ignore_threshold_loose),
+        ignore_threshold_strict=float(args.ignore_threshold_strict),
+        single_rater_ignore_policy=args.single_rater_ignore_policy,
     )
     cfg.qc.low_loo_dice = args.low_loo_dice
     cfg.post.grade5_floor = args.grade5_floor

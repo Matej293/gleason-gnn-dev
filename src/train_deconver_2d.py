@@ -322,6 +322,25 @@ def _build_split_rows(
     return train_rows, val_rows, test_rows
 
 
+def _loo_consensus_mean_from_rows(dataset: GleasonConsensusDataset, rows: list[dict]) -> float:
+    vals: list[float] = []
+    for r in rows:
+        item = dataset.items[int(r["dataset_index"])]
+        qc = safe_read_json(Path(item["qc_path"]))
+        loo = qc.get("leave_one_out_agreement_per_pathologist", {})
+        if not isinstance(loo, dict):
+            continue
+        for v in loo.values():
+            if not isinstance(v, dict):
+                continue
+            d = v.get("dice_multiclass", None)
+            if isinstance(d, (int, float)) and math.isfinite(float(d)):
+                vals.append(float(d))
+    if not vals:
+        return float("nan")
+    return float(np.mean(vals))
+
+
 def _write_split_manifest(
     path: Path,
     split_mode: str,
@@ -457,16 +476,25 @@ def _single_scale_loss(
     use_confidence_mask: bool,
     confidence_threshold: float,
     soft_loss_type: str,
+    loss_variant: str,
     lambda_soft: float,
     lambda_dice: float,
     include_background_in_dice: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    if not torch.isfinite(logits).all():
+        raise FloatingPointError("Non-finite logits passed to loss.")
     hard_rs, soft_rs, ignore_rs = _resize_targets_for_logits(
         logits=logits,
         hard_mask=hard_mask,
         soft_probs=soft_probs,
         ignore_mask=ignore_mask,
     )
+    if not torch.isfinite(soft_rs).all():
+        raise FloatingPointError("Non-finite soft targets after resize.")
+    if not torch.isfinite(hard_rs.float()).all():
+        raise FloatingPointError("Non-finite hard targets after resize.")
+    if not torch.isfinite(ignore_rs.float()).all():
+        raise FloatingPointError("Non-finite ignore mask after resize.")
 
     valid_mask = _make_valid_mask(
         ignore_mask=ignore_rs,
@@ -486,6 +514,18 @@ def _single_scale_loss(
     soft_loss = soft_num / soft_den
 
     probs = F.softmax(logits.float(), dim=1)
+    if loss_variant == "focal_dice":
+        target = F.one_hot(
+            hard_rs.long().clamp(0, logits.shape[1] - 1), num_classes=logits.shape[1]
+        ).permute(0, 3, 1, 2).float()
+        ce = F.cross_entropy(logits.float(), hard_rs.long(), reduction="none")
+        pt = (probs * target).sum(dim=1).clamp(1e-6, 1.0)
+        focal_gamma = 2.0
+        focal_map = ((1.0 - pt) ** focal_gamma) * ce
+        hard_cls_weight = class_weights[hard_rs.long()].float()
+        focal_num = (focal_map * hard_cls_weight * valid_float * pixel_weight).sum()
+        focal_den = (hard_cls_weight * valid_float * pixel_weight).sum().clamp_min(1e-8)
+        soft_loss = focal_num / focal_den
     dice_c = _hard_dice_per_class(
         probs=probs,
         hard_mask=hard_rs,
@@ -498,7 +538,23 @@ def _single_scale_loss(
     else:
         dice_used = dice_c[1:]
 
-    hard_dice_loss = 1.0 - dice_used.mean()
+    if loss_variant == "tversky_dice":
+        target = F.one_hot(
+            hard_rs.long().clamp(0, logits.shape[1] - 1), num_classes=logits.shape[1]
+        ).permute(0, 3, 1, 2).float()
+        valid = valid_mask.unsqueeze(1).float()
+        p = probs * valid
+        t = target * valid
+        fp = (p * (1.0 - t)).sum(dim=(0, 2, 3))
+        fn = ((1.0 - p) * t).sum(dim=(0, 2, 3))
+        tp = (p * t).sum(dim=(0, 2, 3))
+        alpha = 0.3
+        beta = 0.7
+        tversky = (tp + 1e-5) / (tp + (alpha * fp) + (beta * fn) + 1e-5)
+        tversky_used = tversky if include_background_in_dice else tversky[1:]
+        hard_dice_loss = 1.0 - tversky_used.mean()
+    else:
+        hard_dice_loss = 1.0 - dice_used.mean()
     total = (lambda_soft * soft_loss) + (lambda_dice * hard_dice_loss)
 
     with torch.no_grad():
@@ -520,6 +576,7 @@ def _consensus_loss(
     use_confidence_mask: bool,
     confidence_threshold: float,
     soft_loss_type: str,
+    loss_variant: str,
     lambda_soft: float,
     lambda_dice: float,
     include_background_in_dice: bool,
@@ -535,6 +592,7 @@ def _consensus_loss(
             use_confidence_mask=use_confidence_mask,
             confidence_threshold=confidence_threshold,
             soft_loss_type=soft_loss_type,
+            loss_variant=loss_variant,
             lambda_soft=lambda_soft,
             lambda_dice=lambda_dice,
             include_background_in_dice=include_background_in_dice,
@@ -560,6 +618,7 @@ def _consensus_loss(
             use_confidence_mask=use_confidence_mask,
             confidence_threshold=confidence_threshold,
             soft_loss_type=soft_loss_type,
+            loss_variant=loss_variant,
             lambda_soft=lambda_soft,
             lambda_dice=lambda_dice,
             include_background_in_dice=include_background_in_dice,
@@ -585,6 +644,7 @@ def validate(
     use_confidence_mask: bool,
     confidence_threshold: float,
     soft_loss_type: str,
+    loss_variant: str,
     lambda_soft: float,
     lambda_dice: float,
     include_background_in_dice: bool,
@@ -599,8 +659,21 @@ def validate(
     sums = {
         "macro_dice": 0.0,
         "grade5_dice": 0.0,
+        "miou": 0.0,
+        "grade5_iou": 0.0,
+        "dice_benign": 0.0,
+        "dice_g3": 0.0,
+        "dice_g4": 0.0,
+        "dice_g5": 0.0,
+        "iou_benign": 0.0,
+        "iou_g3": 0.0,
+        "iou_g4": 0.0,
+        "iou_g5": 0.0,
+        "iou_tumor_vs_benign": 0.0,
         "sensitivity": 0.0,
         "precision": 0.0,
+        "ignored_pixel_fraction": 0.0,
+        "tumor_pixels_ignored_fraction": 0.0,
     }
     counts = {k: 0 for k in sums}
 
@@ -633,6 +706,7 @@ def validate(
                     use_confidence_mask=use_confidence_mask,
                     confidence_threshold=confidence_threshold,
                     soft_loss_type=soft_loss_type,
+                    loss_variant=loss_variant,
                     lambda_soft=lambda_soft,
                     lambda_dice=lambda_dice,
                     include_background_in_dice=include_background_in_dice,
@@ -676,6 +750,7 @@ def validate_with_oom_retry(
     use_confidence_mask: bool,
     confidence_threshold: float,
     soft_loss_type: str,
+    loss_variant: str,
     lambda_soft: float,
     lambda_dice: float,
     include_background_in_dice: bool,
@@ -692,6 +767,7 @@ def validate_with_oom_retry(
             use_confidence_mask=use_confidence_mask,
             confidence_threshold=confidence_threshold,
             soft_loss_type=soft_loss_type,
+            loss_variant=loss_variant,
             lambda_soft=lambda_soft,
             lambda_dice=lambda_dice,
             include_background_in_dice=include_background_in_dice,
@@ -714,6 +790,7 @@ def validate_with_oom_retry(
                 use_confidence_mask=use_confidence_mask,
                 confidence_threshold=confidence_threshold,
                 soft_loss_type=soft_loss_type,
+                loss_variant=loss_variant,
                 lambda_soft=lambda_soft,
                 lambda_dice=lambda_dice,
                 include_background_in_dice=include_background_in_dice,
@@ -1053,6 +1130,16 @@ def main() -> None:
         len(val_ds),
         len(test_ds) if test_ds is not None else 0,
     )
+    if bool(cfg.get("eval_leave_one_rater_out", False)):
+        loo_train = _loo_consensus_mean_from_rows(dataset, train_rows)
+        loo_val = _loo_consensus_mean_from_rows(dataset, val_rows)
+        loo_test = _loo_consensus_mean_from_rows(dataset, test_rows) if test_rows else float("nan")
+        logger.info(
+            "LOO-consensus diagnostics | train=%s val=%s test=%s",
+            _fmt(loo_train),
+            _fmt(loo_val),
+            _fmt(loo_test),
+        )
 
     model = build_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1109,7 +1196,7 @@ def main() -> None:
             eta_min=float(cfg.get("learning_rate", 2e-4)) * 1e-2,
         )
 
-    class_weights_cfg = cfg.get("class_weights", None)
+    class_weights_cfg = cfg.get("class_loss_weights", cfg.get("class_weights", None))
     if class_weights_cfg is not None:
         if not isinstance(class_weights_cfg, list) or len(class_weights_cfg) != 4:
             raise ValueError("class_weights must be a list of 4 floats [w0,w1,w2,w3].")
@@ -1128,6 +1215,12 @@ def main() -> None:
     if soft_loss_type not in {"ce", "kl"}:
         raise ValueError(
             f"soft_label_loss must be 'ce' or 'kl', got {soft_loss_type!r}"
+        )
+    loss_variant = str(cfg.get("loss_variant", "soft_dice")).strip().lower()
+    if loss_variant not in {"soft_dice", "focal_dice", "tversky_dice"}:
+        raise ValueError(
+            "loss_variant must be one of {'soft_dice','focal_dice','tversky_dice'}, "
+            f"got {loss_variant!r}"
         )
 
     use_confidence_mask = bool(cfg.get("use_confidence_mask", False))
@@ -1195,7 +1288,8 @@ def main() -> None:
     logger.info("Experiment: %s", cfg["experiment_name"])
     logger.info("Run directory: %s", run_dir)
     logger.info(
-        "Loss setup: soft=%s (lambda=%.3f), hard_dice(lambda=%.3f), confidence_mask=%s(th=%.2f)",
+        "Loss setup: variant=%s soft=%s (lambda=%.3f), hard_dice(lambda=%.3f), confidence_mask=%s(th=%.2f)",
+        loss_variant,
         soft_loss_type,
         lambda_soft,
         lambda_dice,
@@ -1213,8 +1307,9 @@ def main() -> None:
     val_start_epoch = max(1, int(cfg.get("val_start_epoch", 1)))
     keep_last_n = int(cfg.get("keep_last_checkpoints", 3))
 
-    w_macro = float(cfg.get("best_ckpt_w_macro_dice", 0.6))
-    w_sens = float(cfg.get("best_ckpt_w_sensitivity", 0.4))
+    w_macro = float(cfg.get("best_ckpt_w_macro_dice", 0.4))
+    w_sens = float(cfg.get("best_ckpt_w_sensitivity", 0.6))
+    nan_recovery_log_every = max(1, int(cfg.get("nan_recovery_log_every", 1)))
     viz_enabled = bool(cfg.get("viz_enabled", True))
     viz_every_n_epochs = max(1, int(cfg.get("viz_every_n_epochs", 5)))
     viz_num_cases = max(0, int(cfg.get("viz_num_cases", 8)))
@@ -1231,6 +1326,11 @@ def main() -> None:
         viz_every_n_epochs,
         len(fixed_val_viz_ids),
         viz_log_wandb,
+    )
+    logger.info(
+        "Best-checkpoint composite weights: macro_dice=%.3f sensitivity=%.3f",
+        w_macro,
+        w_sens,
     )
 
     for epoch in tqdm(range(start_epoch, epochs + 1), desc="Epochs", unit="epoch"):
@@ -1256,54 +1356,111 @@ def main() -> None:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            with amp_ctx:
-                out = model(images)
-                if isinstance(out, list):
-                    out = [o.clamp(-15.0, 15.0) for o in out]
-                else:
-                    out = out.clamp(-15.0, 15.0)
 
-                loss, stats = _consensus_loss(
-                    outputs=out,
-                    hard_mask=hard_mask,
-                    soft_probs=soft_probs,
-                    ignore_mask=ignore_mask,
-                    sample_weights=sample_w,
-                    class_weights=class_weights,
-                    use_confidence_mask=use_confidence_mask,
-                    confidence_threshold=confidence_threshold,
-                    soft_loss_type=soft_loss_type,
-                    lambda_soft=lambda_soft,
-                    lambda_dice=lambda_dice,
-                    include_background_in_dice=include_background_in_dice,
-                )
+            recovered_with_fp32 = False
+            try:
+                with amp_ctx:
+                    out = model(images)
+                    if isinstance(out, list):
+                        out = [o.clamp(-15.0, 15.0) for o in out]
+                    else:
+                        out = out.clamp(-15.0, 15.0)
+
+                    loss, stats = _consensus_loss(
+                        outputs=out,
+                        hard_mask=hard_mask,
+                        soft_probs=soft_probs,
+                        ignore_mask=ignore_mask,
+                        sample_weights=sample_w,
+                        class_weights=class_weights,
+                        use_confidence_mask=use_confidence_mask,
+                        confidence_threshold=confidence_threshold,
+                        soft_loss_type=soft_loss_type,
+                        loss_variant=loss_variant,
+                        lambda_soft=lambda_soft,
+                        lambda_dice=lambda_dice,
+                        include_background_in_dice=include_background_in_dice,
+                    )
+            except FloatingPointError:
+                loss = torch.tensor(float("nan"), device=device)
+                stats = {"soft_loss": float("nan"), "hard_dice_loss": float("nan"), "valid_fraction": float("nan")}
 
             if not torch.isfinite(loss):
                 loss_value = float(loss.detach().cpu().item())
-                nan_batch_count += 1
-                logger.warning(
-                    "Non-finite loss at epoch %d, batch %d: %s (consecutive=%d/%d).",
-                    epoch,
-                    step,
-                    loss_value,
-                    nan_batch_count,
-                    max_nan_batches,
-                )
-                optimizer.zero_grad(set_to_none=True)
-                del out, images, soft_probs, hard_mask, ignore_mask, sample_w, loss
-                if nan_batch_count >= max_nan_batches:
-                    raise FloatingPointError(
-                        f"Non-finite loss for {max_nan_batches} consecutive batches "
-                        f"(epoch={epoch}, batch={step})."
+                if (nan_batch_count % nan_recovery_log_every) == 0:
+                    logger.warning(
+                        "Non-finite loss at epoch %d, batch %d under AMP: %s. Retrying in FP32.",
+                        epoch,
+                        step,
+                        loss_value,
                     )
-                continue
+                optimizer.zero_grad(set_to_none=True)
+                del out, loss, stats
+
+                try:
+                    with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", enabled=False):
+                        out = model(images.float())
+                        if isinstance(out, list):
+                            out = [o.float().clamp(-15.0, 15.0) for o in out]
+                        else:
+                            out = out.float().clamp(-15.0, 15.0)
+                        loss, stats = _consensus_loss(
+                            outputs=out,
+                            hard_mask=hard_mask,
+                            soft_probs=soft_probs,
+                            ignore_mask=ignore_mask,
+                            sample_weights=sample_w,
+                            class_weights=class_weights,
+                            use_confidence_mask=use_confidence_mask,
+                            confidence_threshold=confidence_threshold,
+                            soft_loss_type=soft_loss_type,
+                            loss_variant=loss_variant,
+                            lambda_soft=lambda_soft,
+                            lambda_dice=lambda_dice,
+                            include_background_in_dice=include_background_in_dice,
+                        )
+                except FloatingPointError:
+                    loss = torch.tensor(float("nan"), device=device)
+                    stats = {"soft_loss": float("nan"), "hard_dice_loss": float("nan"), "valid_fraction": float("nan")}
+
+                if not torch.isfinite(loss):
+                    nan_batch_count += 1
+                    logger.warning(
+                        "Non-finite loss persisted in FP32 at epoch %d, batch %d (consecutive=%d/%d). Skipping batch.",
+                        epoch,
+                        step,
+                        nan_batch_count,
+                        max_nan_batches,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    del out, images, soft_probs, hard_mask, ignore_mask, sample_w, loss
+                    if nan_batch_count >= max_nan_batches:
+                        raise FloatingPointError(
+                            f"Non-finite loss for {max_nan_batches} consecutive batches "
+                            f"(epoch={epoch}, batch={step})."
+                        )
+                    continue
+
+                recovered_with_fp32 = True
+                if (nan_batch_count % nan_recovery_log_every) == 0:
+                    logger.warning(
+                        "Recovered non-finite batch using FP32 at epoch %d, batch %d.",
+                        epoch,
+                        step,
+                    )
+
             nan_batch_count = 0
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            if recovered_with_fp32:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            else:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
 
             loss_item = float(loss.detach().cpu().item())
             epoch_loss += loss_item
@@ -1390,6 +1547,7 @@ def main() -> None:
             use_confidence_mask=use_confidence_mask,
             confidence_threshold=confidence_threshold,
             soft_loss_type=soft_loss_type,
+            loss_variant=loss_variant,
             lambda_soft=lambda_soft,
             lambda_dice=lambda_dice,
             include_background_in_dice=include_background_in_dice,
@@ -1402,8 +1560,21 @@ def main() -> None:
                 "val/loss": val_metrics["val_loss"],
                 "val/macro_dice": val_metrics["macro_dice"],
                 "val/grade5_dice": val_metrics["grade5_dice"],
+                "val/miou": val_metrics["miou"],
+                "val/grade5_iou": val_metrics["grade5_iou"],
+                "val/dice_benign": val_metrics["dice_benign"],
+                "val/dice_g3": val_metrics["dice_g3"],
+                "val/dice_g4": val_metrics["dice_g4"],
+                "val/dice_g5": val_metrics["dice_g5"],
+                "val/iou_benign": val_metrics["iou_benign"],
+                "val/iou_g3": val_metrics["iou_g3"],
+                "val/iou_g4": val_metrics["iou_g4"],
+                "val/iou_g5": val_metrics["iou_g5"],
+                "val/iou_tumor_vs_benign": val_metrics["iou_tumor_vs_benign"],
                 "val/sensitivity": val_metrics["sensitivity"],
                 "val/precision": val_metrics["precision"],
+                "val/ignored_pixel_fraction": val_metrics["ignored_pixel_fraction"],
+                "val/tumor_pixels_ignored_fraction": val_metrics["tumor_pixels_ignored_fraction"],
             },
             step=epoch,
         )

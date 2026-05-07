@@ -96,20 +96,30 @@ def compute_multiclass_metrics(
 
     num_classes = logits.shape[1]
     dice_values: list[float] = []
+    iou_values: list[float] = []
     for c in range(num_classes):
         p = (pred == c) & valid
         t = (hard_mask == c) & valid
         denom = p.sum().item() + t.sum().item()
+        union = (p | t).sum().item()
         if denom == 0:
             dice_values.append(float("nan"))
         else:
             inter = (p & t).sum().item()
             dice_values.append((2.0 * inter + 1e-5) / (denom + 1e-5))
+        if union == 0:
+            iou_values.append(float("nan"))
+        else:
+            inter = (p & t).sum().item()
+            iou_values.append((inter + 1e-5) / (union + 1e-5))
 
     start = 0 if include_background_in_dice else 1
     used = [d for d in dice_values[start:] if not math.isnan(d)]
+    used_iou = [x for x in iou_values[start:] if not math.isnan(x)]
     macro_dice = float(sum(used) / len(used)) if used else float("nan")
+    miou = float(sum(used_iou) / len(used_iou)) if used_iou else float("nan")
     grade5_dice = dice_values[3] if len(dice_values) > 3 else float("nan")
+    grade5_iou = iou_values[3] if len(iou_values) > 3 else float("nan")
 
     p_pos = (pred > 0) & valid
     t_pos = (hard_mask > 0) & valid
@@ -119,12 +129,34 @@ def compute_multiclass_metrics(
 
     sens = (tp + 1e-6) / (tp + fn + 1e-6) if (tp + fn) > 0 else float("nan")
     prec = (tp + 1e-6) / (tp + fp + 1e-6) if (tp + fp) > 0 else float("nan")
+    iou_tumor = (tp + 1e-6) / (tp + fp + fn + 1e-6) if (tp + fp + fn) > 0 else float("nan")
+
+    ignored_fraction = float((~valid).float().mean().item())
+    tumor_pixels = (hard_mask > 0)
+    tumor_ignored_den = float(tumor_pixels.sum().item())
+    tumor_ignored_num = float((tumor_pixels & (~valid)).sum().item())
+    tumor_ignored_fraction = (
+        (tumor_ignored_num / tumor_ignored_den) if tumor_ignored_den > 0 else float("nan")
+    )
 
     return {
         "macro_dice": macro_dice,
         "grade5_dice": grade5_dice,
+        "miou": miou,
+        "grade5_iou": grade5_iou,
+        "dice_benign": dice_values[0] if len(dice_values) > 0 else float("nan"),
+        "dice_g3": dice_values[1] if len(dice_values) > 1 else float("nan"),
+        "dice_g4": dice_values[2] if len(dice_values) > 2 else float("nan"),
+        "dice_g5": dice_values[3] if len(dice_values) > 3 else float("nan"),
+        "iou_benign": iou_values[0] if len(iou_values) > 0 else float("nan"),
+        "iou_g3": iou_values[1] if len(iou_values) > 1 else float("nan"),
+        "iou_g4": iou_values[2] if len(iou_values) > 2 else float("nan"),
+        "iou_g5": iou_values[3] if len(iou_values) > 3 else float("nan"),
+        "iou_tumor_vs_benign": iou_tumor,
         "sensitivity": sens,
         "precision": prec,
+        "ignored_pixel_fraction": ignored_fraction,
+        "tumor_pixels_ignored_fraction": tumor_ignored_fraction,
     }
 
 

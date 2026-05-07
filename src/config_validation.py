@@ -48,6 +48,12 @@ def validate_2d_deconver_config(
     soft_label_loss = str(cfg.get("soft_label_loss", "ce")).strip().lower()
     if soft_label_loss not in {"ce", "kl"}:
         raise ValueError(f"soft_label_loss must be 'ce' or 'kl', got {soft_label_loss!r}")
+    loss_variant = str(cfg.get("loss_variant", "soft_dice")).strip().lower()
+    if loss_variant not in {"soft_dice", "focal_dice", "tversky_dice"}:
+        raise ValueError(
+            "loss_variant must be one of ['soft_dice','focal_dice','tversky_dice'], "
+            f"got {loss_variant!r}"
+        )
 
     confidence_threshold = float(cfg.get("confidence_threshold", 0.6))
     if not 0.0 <= confidence_threshold <= 1.0:
