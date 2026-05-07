@@ -11,3 +11,6 @@ __pycache__/
 
 # Local environments
 .venv/
+
+# Agents
+AGENTS.md

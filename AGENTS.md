@@ -1,43 +1,54 @@
-# AGENTS.md - ProstateLesionSegmentation (Simplified)
+# Repository Guidelines
 
-## Scope
+## Project Structure & Module Organization
+Core training logic lives in `src/train_deconver_2d.py`, with model construction in `src/models/__init__.py` and evaluation helpers in `src/eval_utils.py`. The 2D checkpoint evaluator is `scripts/evaluate_checkpoint_2d.py`; quick pipeline validation is `scripts/smoke_test_2d.py`.
 
-This repository is intentionally reduced to:
+Data assumptions are fixed:
+- training/test images: `data/Train_imgs`, `data/Test_imgs`
+- consensus labels per image: `data/consensus/<image_id>/`
 
-- 2D Gleason consensus training: `src/train_deconver_2d.py`
-- 2D checkpoint evaluation: `scripts/evaluate_checkpoint_2d.py`
-- Deconver model factory: `src/models/__init__.py`
+Tests are under `tests/`. Configs are in `configs/` (`deconver_2d.yaml`, `deconver_2d_local.yaml`). Run artifacts are written to `outputs/runs/<timestamp>_<experiment_name>/`.
 
-No Docker, no 3D pipeline, and no SSL pretraining remain.
+## Build, Test, and Development Commands
+- `PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml`  
+  Start local 2D Gleason consensus training.
+- `PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run outputs/runs/<run_name>`  
+  Evaluate a saved run and write `evaluation_2d_summary.json`.
+- `PYTHONPATH=. python scripts/smoke_test_2d.py`  
+  Run a fast end-to-end sanity check.
+- `PYTHONPATH=. pytest -q tests`  
+  Run the repository test suite.
 
-## Primary commands
+## Coding Style & Naming Conventions
+Use Python with 4-space indentation and PEP 8 defaults. Keep modules focused and small; prefer explicit function names (`load_consensus_targets`, `evaluate_checkpoint_2d`) over abbreviations.
 
-- Train: `PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml`
-- Evaluate: `PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run outputs/runs/<run_name>`
-- Smoke test: `PYTHONPATH=. python scripts/smoke_test_2d.py`
-- Tests: `PYTHONPATH=. pytest -q tests`
+Naming patterns:
+- files/modules: `snake_case.py`
+- functions/variables: `snake_case`
+- classes: `PascalCase`
+- constants: `UPPER_SNAKE_CASE`
 
-## Configs kept
+Keep config keys consistent with existing YAML files (`use_amp`, `amp_dtype`, `use_compile`).
 
-- `configs/deconver_2d.yaml`
-- `configs/deconver_2d_local.yaml`
+## Testing Guidelines
+Use `pytest` with tests named `test_*.py` and functions named `test_*`. Add or update tests when changing data loading, metric computation, checkpoint I/O, or visualization outputs.
 
-For TITAN V / Volta:
+Target practical coverage of changed code paths rather than broad, unfocused tests. For model/config changes, run both:
+1. `PYTHONPATH=. pytest -q tests`
+2. `PYTHONPATH=. python scripts/smoke_test_2d.py`
 
+## Commit & Pull Request Guidelines
+Recent commits use concise, lowercase, imperative-style summaries (for example: `improving masks and consensus`). Follow that style and keep subject lines specific.
+
+For PRs:
+- describe what changed and why
+- list affected commands/configs
+- include before/after metric snippets when behavior changes
+- link related issue(s)
+- note any data-path or runtime assumptions
+
+## Configuration & Hardware Notes
+For TITAN V / Volta GPUs, keep:
 - `use_amp: true`
 - `amp_dtype: fp16`
 - `use_compile: false`
-
-## Dataset assumptions
-
-- Images are discovered from `data/Train_imgs` and `data/Test_imgs` by image id.
-- Consensus labels live in `data/consensus/<image_id>/` with:
-  - `consensus_probs_compact.npz`
-  - `consensus_hard_mask.png`
-  - `ignore_mask.png`
-  - optional `qc_report.json`
-
-## Outputs
-
-- Training artifacts: `outputs/runs/<timestamp>_<experiment_name>/`
-- Evaluation summary: `outputs/runs/<run_name>/evaluation_2d_summary.json`
