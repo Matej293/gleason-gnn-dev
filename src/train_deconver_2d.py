@@ -832,22 +832,68 @@ def validate(
                 device_type=autocast_device, dtype=amp_dtype, enabled=use_amp
             ):
                 out = model(images)
-                loss, _ = _consensus_loss(
-                    outputs=out,
-                    hard_mask=hard_mask,
-                    soft_probs=soft_probs,
-                    ignore_mask=ignore_mask,
-                    sample_weights=sample_w,
-                    class_weights=class_weights,
-                    use_confidence_mask=use_confidence_mask,
-                    confidence_threshold=confidence_threshold,
-                    soft_loss_type=soft_loss_type,
-                    loss_variant=loss_variant,
-                    lambda_soft=lambda_soft,
-                    lambda_dice=lambda_dice,
-                    include_background_in_dice=include_background_in_dice,
-                    exclude_absent_classes_in_dice_loss=False,
+                if isinstance(out, list):
+                    out = [o.clamp(-15.0, 15.0) for o in out]
+                else:
+                    out = out.clamp(-15.0, 15.0)
+                try:
+                    loss, _ = _consensus_loss(
+                        outputs=out,
+                        hard_mask=hard_mask,
+                        soft_probs=soft_probs,
+                        ignore_mask=ignore_mask,
+                        sample_weights=sample_w,
+                        class_weights=class_weights,
+                        use_confidence_mask=use_confidence_mask,
+                        confidence_threshold=confidence_threshold,
+                        soft_loss_type=soft_loss_type,
+                        loss_variant=loss_variant,
+                        lambda_soft=lambda_soft,
+                        lambda_dice=lambda_dice,
+                        include_background_in_dice=include_background_in_dice,
+                        exclude_absent_classes_in_dice_loss=False,
+                    )
+                except FloatingPointError:
+                    loss = torch.tensor(float("nan"), device=device)
+
+            if not torch.isfinite(loss):
+                logger.warning(
+                    "Non-finite validation loss under AMP. Retrying batch in FP32."
                 )
+                with torch.autocast(
+                    device_type=autocast_device,
+                    enabled=False,
+                ):
+                    out = model(images.float())
+                    if isinstance(out, list):
+                        out = [o.float().clamp(-15.0, 15.0) for o in out]
+                    else:
+                        out = out.float().clamp(-15.0, 15.0)
+                    try:
+                        loss, _ = _consensus_loss(
+                            outputs=out,
+                            hard_mask=hard_mask,
+                            soft_probs=soft_probs,
+                            ignore_mask=ignore_mask,
+                            sample_weights=sample_w,
+                            class_weights=class_weights,
+                            use_confidence_mask=use_confidence_mask,
+                            confidence_threshold=confidence_threshold,
+                            soft_loss_type=soft_loss_type,
+                            loss_variant=loss_variant,
+                            lambda_soft=lambda_soft,
+                            lambda_dice=lambda_dice,
+                            include_background_in_dice=include_background_in_dice,
+                            exclude_absent_classes_in_dice_loss=False,
+                        )
+                    except FloatingPointError:
+                        loss = torch.tensor(float("nan"), device=device)
+
+                if not torch.isfinite(loss):
+                    logger.warning(
+                        "Validation batch remained non-finite in FP32; skipping batch."
+                    )
+                    continue
 
             logits = out[0] if isinstance(out, list) else out
             hard_rs, _, ignore_rs = _resize_targets_for_logits(
