@@ -69,6 +69,11 @@ def validate_2d_deconver_config(
         v = int(cfg.get(k, 0))
         if v < 0:
             raise ValueError(f"{k} must be >= 0, got {v}")
+    best_ckpt_metric_source = str(cfg.get("best_ckpt_metric_source", "post")).strip().lower()
+    if best_ckpt_metric_source not in {"raw", "post"}:
+        raise ValueError(
+            f"best_ckpt_metric_source must be one of ['raw', 'post'], got {best_ckpt_metric_source!r}"
+        )
 
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).strip().lower()
     if amp_dtype_str not in {"fp16", "bf16"}:

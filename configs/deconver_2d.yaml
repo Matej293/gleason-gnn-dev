@@ -87,6 +87,7 @@ keep_last_checkpoints: 3
 # Best checkpoint selection
 best_ckpt_w_macro_dice: 0.75
 best_ckpt_w_sensitivity: 0.25
+best_ckpt_metric_source: post   # raw | post
 
 # Early stopping
 early_stopping_patience: 60
@@ -121,3 +122,4 @@ viz_every_n_epochs: 5
 viz_num_cases: 8
 viz_output_subdir: val_viz
 viz_log_wandb: true
+viz_prediction_source: post     # raw | post | both

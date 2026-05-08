@@ -29,6 +29,8 @@ from src.config_validation import validate_2d_deconver_config, validate_amp_runt
 from src.eval_utils import (
     collate_consensus_batch,
     compute_multiclass_metrics,
+    compute_multiclass_metrics_from_pred,
+    postprocess_predictions,
     resolve_split_manifest_path,
     safe_read_json,
 )
@@ -54,6 +56,26 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+VAL_METRIC_KEYS = (
+    "macro_dice",
+    "grade5_dice",
+    "miou",
+    "grade5_iou",
+    "dice_benign",
+    "dice_g3",
+    "dice_g4",
+    "dice_g5",
+    "iou_benign",
+    "iou_g3",
+    "iou_g4",
+    "iou_g5",
+    "iou_tumor_vs_benign",
+    "sensitivity",
+    "precision",
+    "ignored_pixel_fraction",
+    "tumor_pixels_ignored_fraction",
+)
 
 
 def _fmt(v: float) -> str:
@@ -554,6 +576,26 @@ def _hard_dice_per_class(
     return dice
 
 
+def _hard_dice_valid_class_mask(
+    hard_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+    num_classes: int,
+) -> torch.Tensor:
+    target = F.one_hot(
+        hard_mask.long().clamp(0, num_classes - 1), num_classes=num_classes
+    ).permute(0, 3, 1, 2).float()
+    valid = valid_mask.unsqueeze(1).float()
+    per_class_target = (target * valid).sum(dim=(0, 2, 3))
+    return per_class_target > 0.0
+
+
+def _nanmean_tensor(values: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    vals = values[valid_mask]
+    if vals.numel() == 0:
+        return values.new_tensor(0.0)
+    return vals.mean()
+
+
 def _single_scale_loss(
     logits: torch.Tensor,
     hard_mask: torch.Tensor,
@@ -568,6 +610,7 @@ def _single_scale_loss(
     lambda_soft: float,
     lambda_dice: float,
     include_background_in_dice: bool,
+    exclude_absent_classes_in_dice_loss: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if not torch.isfinite(logits).all():
         raise FloatingPointError("Non-finite logits passed to loss.")
@@ -620,11 +663,18 @@ def _single_scale_loss(
         valid_mask=valid_mask,
         num_classes=logits.shape[1],
     )
+    dice_valid_mask = _hard_dice_valid_class_mask(
+        hard_mask=hard_rs,
+        valid_mask=valid_mask,
+        num_classes=logits.shape[1],
+    )
 
     if include_background_in_dice:
         dice_used = dice_c
+        dice_valid_used = dice_valid_mask
     else:
         dice_used = dice_c[1:]
+        dice_valid_used = dice_valid_mask[1:]
 
     if loss_variant == "tversky_dice":
         target = F.one_hot(
@@ -640,9 +690,15 @@ def _single_scale_loss(
         beta = 0.7
         tversky = (tp + 1e-5) / (tp + (alpha * fp) + (beta * fn) + 1e-5)
         tversky_used = tversky if include_background_in_dice else tversky[1:]
-        hard_dice_loss = 1.0 - tversky_used.mean()
+        if exclude_absent_classes_in_dice_loss:
+            hard_dice_loss = 1.0 - _nanmean_tensor(tversky_used, dice_valid_used)
+        else:
+            hard_dice_loss = 1.0 - tversky_used.mean()
     else:
-        hard_dice_loss = 1.0 - dice_used.mean()
+        if exclude_absent_classes_in_dice_loss:
+            hard_dice_loss = 1.0 - _nanmean_tensor(dice_used, dice_valid_used)
+        else:
+            hard_dice_loss = 1.0 - dice_used.mean()
     total = (lambda_soft * soft_loss) + (lambda_dice * hard_dice_loss)
 
     with torch.no_grad():
@@ -668,6 +724,7 @@ def _consensus_loss(
     lambda_soft: float,
     lambda_dice: float,
     include_background_in_dice: bool,
+    exclude_absent_classes_in_dice_loss: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if isinstance(outputs, torch.Tensor):
         return _single_scale_loss(
@@ -684,6 +741,7 @@ def _consensus_loss(
             lambda_soft=lambda_soft,
             lambda_dice=lambda_dice,
             include_background_in_dice=include_background_in_dice,
+            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
         )
 
     raw = [1.0 / (2**i) for i in range(len(outputs))]
@@ -710,6 +768,7 @@ def _consensus_loss(
             lambda_soft=lambda_soft,
             lambda_dice=lambda_dice,
             include_background_in_dice=include_background_in_dice,
+            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
         )
         total_loss = total_loss + (w * l)
         soft_acc += w * stats["soft_loss"]
@@ -736,6 +795,7 @@ def validate(
     lambda_soft: float,
     lambda_dice: float,
     include_background_in_dice: bool,
+    min_component_size_by_class: dict[int, int],
     use_amp: bool,
     amp_dtype: torch.dtype,
 ) -> dict[str, float]:
@@ -745,25 +805,13 @@ def validate(
     n_batches = 0
 
     sums = {
-        "macro_dice": 0.0,
-        "grade5_dice": 0.0,
-        "miou": 0.0,
-        "grade5_iou": 0.0,
-        "dice_benign": 0.0,
-        "dice_g3": 0.0,
-        "dice_g4": 0.0,
-        "dice_g5": 0.0,
-        "iou_benign": 0.0,
-        "iou_g3": 0.0,
-        "iou_g4": 0.0,
-        "iou_g5": 0.0,
-        "iou_tumor_vs_benign": 0.0,
-        "sensitivity": 0.0,
-        "precision": 0.0,
-        "ignored_pixel_fraction": 0.0,
-        "tumor_pixels_ignored_fraction": 0.0,
+        "raw": {k: 0.0 for k in VAL_METRIC_KEYS},
+        "post": {k: 0.0 for k in VAL_METRIC_KEYS},
     }
-    counts = {k: 0 for k in sums}
+    counts = {
+        "raw": {k: 0 for k in VAL_METRIC_KEYS},
+        "post": {k: 0 for k in VAL_METRIC_KEYS},
+    }
 
     autocast_device = "cuda" if device.type == "cuda" else "cpu"
 
@@ -798,6 +846,7 @@ def validate(
                     lambda_soft=lambda_soft,
                     lambda_dice=lambda_dice,
                     include_background_in_dice=include_background_in_dice,
+                    exclude_absent_classes_in_dice_loss=False,
                 )
 
             logits = out[0] if isinstance(out, list) else out
@@ -807,8 +856,28 @@ def validate(
                 soft_probs=soft_probs,
                 ignore_mask=ignore_mask,
             )
-            m = compute_multiclass_metrics(
+            m_raw = compute_multiclass_metrics(
                 logits=logits.float(),
+                hard_mask=hard_rs,
+                ignore_mask=ignore_rs,
+                include_background_in_dice=include_background_in_dice,
+            )
+            tissue_rs = None
+            if "tissue_mask" in batch:
+                tissue_mask = batch["tissue_mask"].to(device, non_blocking=True)
+                tissue_rs = F.interpolate(
+                    tissue_mask.unsqueeze(1).float(),
+                    size=(logits.shape[-2], logits.shape[-1]),
+                    mode="nearest",
+                ).squeeze(1).to(dtype=tissue_mask.dtype)
+            pred_post = postprocess_predictions(
+                pred=logits.argmax(dim=1),
+                ignore_mask=ignore_rs,
+                tissue_mask=tissue_rs,
+                min_component_size_by_class=min_component_size_by_class,
+            )
+            m_post = compute_multiclass_metrics_from_pred(
+                pred=pred_post,
                 hard_mask=hard_rs,
                 ignore_mask=ignore_rs,
                 include_background_in_dice=include_background_in_dice,
@@ -816,16 +885,19 @@ def validate(
 
             loss_sum += float(loss.detach().cpu().item())
             n_batches += 1
-            for k in sums:
-                if not math.isnan(m[k]):
-                    sums[k] += m[k]
-                    counts[k] += 1
+            for stream, metrics in (("raw", m_raw), ("post", m_post)):
+                for k in VAL_METRIC_KEYS:
+                    if not math.isnan(metrics[k]):
+                        sums[stream][k] += metrics[k]
+                        counts[stream][k] += 1
 
-    out_metrics = {
-        "val_loss": (loss_sum / max(1, n_batches)),
-    }
-    for k in sums:
-        out_metrics[k] = (sums[k] / counts[k]) if counts[k] > 0 else float("nan")
+    out_metrics = {"val_loss": (loss_sum / max(1, n_batches))}
+    for stream in ("raw", "post"):
+        for k in VAL_METRIC_KEYS:
+            c = counts[stream][k]
+            out_metrics[f"val_{stream}/{k}"] = (
+                sums[stream][k] / c if c > 0 else float("nan")
+            )
     return out_metrics
 
 
@@ -842,6 +914,7 @@ def validate_with_oom_retry(
     lambda_soft: float,
     lambda_dice: float,
     include_background_in_dice: bool,
+    min_component_size_by_class: dict[int, int],
     use_amp: bool,
     amp_dtype: torch.dtype,
 ) -> dict[str, float]:
@@ -859,6 +932,7 @@ def validate_with_oom_retry(
             lambda_soft=lambda_soft,
             lambda_dice=lambda_dice,
             include_background_in_dice=include_background_in_dice,
+            min_component_size_by_class=min_component_size_by_class,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
         )
@@ -882,6 +956,7 @@ def validate_with_oom_retry(
                 lambda_soft=lambda_soft,
                 lambda_dice=lambda_dice,
                 include_background_in_dice=include_background_in_dice,
+                min_component_size_by_class=min_component_size_by_class,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
             )
@@ -899,6 +974,31 @@ def _pick_fixed_val_viz_ids(
     return ids[: max(0, int(num_cases))]
 
 
+def _post_min_component_sizes_from_cfg(cfg: dict) -> dict[int, int]:
+    return {
+        1: int(cfg.get("post_min_component_size_g3", 0)),
+        2: int(cfg.get("post_min_component_size_g4", 0)),
+        3: int(cfg.get("post_min_component_size_g5", 0)),
+    }
+
+
+def _composite_from_metrics(metrics: dict[str, float], w_macro: float, w_sens: float) -> float:
+    macro = metrics["macro_dice"]
+    sens = metrics["sensitivity"]
+    if math.isnan(macro) and math.isnan(sens):
+        return float("nan")
+    macro0 = 0.0 if math.isnan(macro) else macro
+    sens0 = 0.0 if math.isnan(sens) else sens
+    return (w_macro * macro0) + (w_sens * sens0)
+
+
+def _selected_stream_metrics(
+    val_metrics: dict[str, float],
+    source: str,
+) -> dict[str, float]:
+    return {k: val_metrics[f"val_{source}/{k}"] for k in VAL_METRIC_KEYS}
+
+
 def _run_validation_visualizations(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -908,6 +1008,8 @@ def _run_validation_visualizations(
     output_subdir: str,
     epoch: int,
     include_background_in_dice: bool,
+    min_component_size_by_class: dict[int, int],
+    prediction_source: str,
     use_amp: bool,
     amp_dtype: torch.dtype,
     wandb_logger: WandbLogger,
@@ -934,57 +1036,76 @@ def _run_validation_visualizations(
             with torch.autocast(device_type=autocast_device, dtype=amp_dtype, enabled=use_amp):
                 out = model(images)
             logits = out[0] if isinstance(out, list) else out
-            pred = logits.argmax(dim=1)
+            pred_raw = logits.argmax(dim=1)
             hard_rs, _, ignore_rs = _resize_targets_for_logits(
                 logits=logits,
                 hard_mask=hard_mask,
                 soft_probs=batch["soft_probs"].to(device, non_blocking=True),
                 ignore_mask=ignore_mask,
             )
+            tissue_rs = None
+            if "tissue_mask" in batch:
+                tissue_mask = batch["tissue_mask"].to(device, non_blocking=True)
+                tissue_rs = F.interpolate(
+                    tissue_mask.unsqueeze(1).float(),
+                    size=(logits.shape[-2], logits.shape[-1]),
+                    mode="nearest",
+                ).squeeze(1).to(dtype=tissue_mask.dtype)
+            pred_post = postprocess_predictions(
+                pred=pred_raw,
+                ignore_mask=ignore_rs,
+                tissue_mask=tissue_rs,
+                min_component_size_by_class=min_component_size_by_class,
+            )
             for i in keep_idx:
                 image_id = image_ids[i]
-                sample_metrics = compute_multiclass_metrics(
-                    logits=logits[i : i + 1].float(),
-                    hard_mask=hard_rs[i : i + 1],
-                    ignore_mask=ignore_rs[i : i + 1],
-                    include_background_in_dice=include_background_in_dice,
-                )
-                save_path = output_dir / f"{saved + 1:03d}_{image_id}.png"
-                save_case_panel(
-                    output_path=save_path,
-                    image=images[i].detach().cpu(),
-                    gt_mask=hard_rs[i].detach().cpu(),
-                    pred_mask=pred[i].detach().cpu(),
-                    ignore_mask=ignore_rs[i].detach().cpu(),
-                    image_id=image_id,
-                    metrics={
-                        "macro_dice": f"{sample_metrics['macro_dice']:.4f}",
-                        "grade5_dice": f"{sample_metrics['grade5_dice']:.4f}",
-                    },
-                )
-                if wandb_enabled and len(wandb_images) < 8:
-                    panel = render_case_panel(
+                streams = [("post", pred_post)] if prediction_source == "post" else [("raw", pred_raw)]
+                if prediction_source == "both":
+                    streams = [("raw", pred_raw), ("post", pred_post)]
+
+                for suffix, pred_stream in streams:
+                    sample_metrics = compute_multiclass_metrics_from_pred(
+                        pred=pred_stream[i : i + 1],
+                        hard_mask=hard_rs[i : i + 1],
+                        ignore_mask=ignore_rs[i : i + 1],
+                        include_background_in_dice=include_background_in_dice,
+                    )
+                    save_path = output_dir / f"{saved + 1:03d}_{image_id}_{suffix}.png"
+                    save_case_panel(
+                        output_path=save_path,
                         image=images[i].detach().cpu(),
                         gt_mask=hard_rs[i].detach().cpu(),
-                        pred_mask=pred[i].detach().cpu(),
+                        pred_mask=pred_stream[i].detach().cpu(),
                         ignore_mask=ignore_rs[i].detach().cpu(),
-                        image_id=image_id,
+                        image_id=f"{image_id} [{suffix}]",
                         metrics={
                             "macro_dice": f"{sample_metrics['macro_dice']:.4f}",
                             "grade5_dice": f"{sample_metrics['grade5_dice']:.4f}",
                         },
                     )
-                    wb = wandb_logger.make_image(
-                        panel,
-                        caption=(
-                            f"{image_id} | epoch={epoch} | "
-                            f"macro_dice={sample_metrics['macro_dice']:.4f} | "
-                            f"grade5_dice={sample_metrics['grade5_dice']:.4f}"
-                        ),
-                    )
-                    if wb is not None:
-                        wandb_images.append(wb)
-                saved += 1
+                    if wandb_enabled and len(wandb_images) < 8:
+                        panel = render_case_panel(
+                            image=images[i].detach().cpu(),
+                            gt_mask=hard_rs[i].detach().cpu(),
+                            pred_mask=pred_stream[i].detach().cpu(),
+                            ignore_mask=ignore_rs[i].detach().cpu(),
+                            image_id=f"{image_id} [{suffix}]",
+                            metrics={
+                                "macro_dice": f"{sample_metrics['macro_dice']:.4f}",
+                                "grade5_dice": f"{sample_metrics['grade5_dice']:.4f}",
+                            },
+                        )
+                        wb = wandb_logger.make_image(
+                            panel,
+                            caption=(
+                                f"{image_id} [{suffix}] | epoch={epoch} | "
+                                f"macro_dice={sample_metrics['macro_dice']:.4f} | "
+                                f"grade5_dice={sample_metrics['grade5_dice']:.4f}"
+                            ),
+                        )
+                        if wb is not None:
+                            wandb_images.append(wb)
+                    saved += 1
     if wandb_enabled and wandb_images:
         wandb_logger.log_images("val/panels", wandb_images, step=epoch)
     return saved
@@ -1316,6 +1437,10 @@ def main() -> None:
     use_confidence_mask = bool(cfg.get("use_confidence_mask", False))
     confidence_threshold = float(cfg.get("confidence_threshold", 0.6))
     include_background_in_dice = bool(cfg.get("include_background_in_dice", False))
+    exclude_absent_classes_in_dice_loss = bool(
+        cfg.get("exclude_absent_classes_in_dice_loss", False)
+    )
+    post_min_comp = _post_min_component_sizes_from_cfg(cfg)
 
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).lower()
     dtype_map: dict[str, torch.dtype] = {"fp16": torch.float16, "bf16": torch.bfloat16}
@@ -1408,26 +1533,38 @@ def main() -> None:
 
     w_macro = float(cfg.get("best_ckpt_w_macro_dice", 0.4))
     w_sens = float(cfg.get("best_ckpt_w_sensitivity", 0.6))
+    best_ckpt_metric_source = str(cfg.get("best_ckpt_metric_source", "post")).strip().lower()
+    if best_ckpt_metric_source not in {"raw", "post"}:
+        raise ValueError(
+            f"best_ckpt_metric_source must be 'raw' or 'post', got {best_ckpt_metric_source!r}"
+        )
     nan_recovery_log_every = max(1, int(cfg.get("nan_recovery_log_every", 1)))
     viz_enabled = bool(cfg.get("viz_enabled", True))
     viz_every_n_epochs = max(1, int(cfg.get("viz_every_n_epochs", 5)))
     viz_num_cases = max(0, int(cfg.get("viz_num_cases", 8)))
     viz_output_subdir = str(cfg.get("viz_output_subdir", "val_viz")).strip() or "val_viz"
     viz_log_wandb = bool(cfg.get("viz_log_wandb", True))
+    viz_prediction_source = str(cfg.get("viz_prediction_source", "post")).strip().lower()
+    if viz_prediction_source not in {"raw", "post", "both"}:
+        raise ValueError(
+            f"viz_prediction_source must be one of ['raw', 'post', 'both'], got {viz_prediction_source!r}"
+        )
     fixed_val_viz_ids = _pick_fixed_val_viz_ids(
         val_rows=val_rows,
         seed=seed,
         num_cases=viz_num_cases,
     )
     logger.info(
-        "Validation viz: enabled=%s every=%d epochs cases=%d wandb=%s",
+        "Validation viz: enabled=%s every=%d epochs cases=%d wandb=%s pred_source=%s",
         viz_enabled,
         viz_every_n_epochs,
         len(fixed_val_viz_ids),
         viz_log_wandb,
+        viz_prediction_source,
     )
     logger.info(
-        "Best-checkpoint composite weights: macro_dice=%.3f sensitivity=%.3f",
+        "Best-checkpoint source=%s | composite weights: macro_dice=%.3f sensitivity=%.3f",
+        best_ckpt_metric_source,
         w_macro,
         w_sens,
     )
@@ -1485,6 +1622,7 @@ def main() -> None:
                         lambda_soft=epoch_lambda_soft,
                         lambda_dice=epoch_lambda_dice,
                         include_background_in_dice=include_background_in_dice,
+                        exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
                     )
             except FloatingPointError:
                 loss = torch.tensor(float("nan"), device=device)
@@ -1523,6 +1661,7 @@ def main() -> None:
                             lambda_soft=epoch_lambda_soft,
                             lambda_dice=epoch_lambda_dice,
                             include_background_in_dice=include_background_in_dice,
+                            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
                         )
                 except FloatingPointError:
                     loss = torch.tensor(float("nan"), device=device)
@@ -1660,44 +1799,32 @@ def main() -> None:
             lambda_soft=epoch_lambda_soft,
             lambda_dice=epoch_lambda_dice,
             include_background_in_dice=include_background_in_dice,
+            min_component_size_by_class=post_min_comp,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
         )
 
-        wandb_logger.log_epoch(
-            {
-                "val/loss": val_metrics["val_loss"],
-                "val/macro_dice": val_metrics["macro_dice"],
-                "val/grade5_dice": val_metrics["grade5_dice"],
-                "val/miou": val_metrics["miou"],
-                "val/grade5_iou": val_metrics["grade5_iou"],
-                "val/dice_benign": val_metrics["dice_benign"],
-                "val/dice_g3": val_metrics["dice_g3"],
-                "val/dice_g4": val_metrics["dice_g4"],
-                "val/dice_g5": val_metrics["dice_g5"],
-                "val/iou_benign": val_metrics["iou_benign"],
-                "val/iou_g3": val_metrics["iou_g3"],
-                "val/iou_g4": val_metrics["iou_g4"],
-                "val/iou_g5": val_metrics["iou_g5"],
-                "val/iou_tumor_vs_benign": val_metrics["iou_tumor_vs_benign"],
-                "val/sensitivity": val_metrics["sensitivity"],
-                "val/precision": val_metrics["precision"],
-                "val/ignored_pixel_fraction": val_metrics["ignored_pixel_fraction"],
-                "val/tumor_pixels_ignored_fraction": val_metrics["tumor_pixels_ignored_fraction"],
-            },
-            step=epoch,
-        )
+        val_log: dict[str, float] = {"val/loss": val_metrics["val_loss"]}
+        for stream in ("raw", "post"):
+            for k in VAL_METRIC_KEYS:
+                val_log[f"val_{stream}/{k}"] = val_metrics[f"val_{stream}/{k}"]
+        raw_view = _selected_stream_metrics(val_metrics, source="raw")
+        post_view = _selected_stream_metrics(val_metrics, source="post")
+        raw_composite = _composite_from_metrics(raw_view, w_macro=w_macro, w_sens=w_sens)
+        post_composite = _composite_from_metrics(post_view, w_macro=w_macro, w_sens=w_sens)
+        val_log["val_raw/composite_score"] = raw_composite
+        val_log["val_post/composite_score"] = post_composite
+        wandb_logger.log_epoch(val_log, step=epoch)
 
         logger.info(
-            "Epoch %d/%d | val_loss=%s | val_macro_dice=%s | val_grade5_dice=%s | "
-            "val_sens=%s | val_prec=%s",
+            "Epoch %d/%d | val_loss=%s | raw_macro=%s post_macro=%s | raw_sens=%s post_sens=%s",
             epoch,
             epochs,
             _fmt(val_metrics["val_loss"]),
-            _fmt(val_metrics["macro_dice"]),
-            _fmt(val_metrics["grade5_dice"]),
-            _fmt(val_metrics["sensitivity"]),
-            _fmt(val_metrics["precision"]),
+            _fmt(val_metrics["val_raw/macro_dice"]),
+            _fmt(val_metrics["val_post/macro_dice"]),
+            _fmt(val_metrics["val_raw/sensitivity"]),
+            _fmt(val_metrics["val_post/sensitivity"]),
         )
 
         if device.type == "cuda":
@@ -1714,6 +1841,8 @@ def main() -> None:
                 output_subdir=viz_output_subdir,
                 epoch=epoch,
                 include_background_in_dice=include_background_in_dice,
+                min_component_size_by_class=post_min_comp,
+                prediction_source=viz_prediction_source,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
                 wandb_logger=wandb_logger,
@@ -1727,28 +1856,33 @@ def main() -> None:
                 run_dir / viz_output_subdir / f"epoch_{epoch:04d}",
             )
 
-        macro = val_metrics["macro_dice"]
-        sens = val_metrics["sensitivity"]
-        if math.isnan(macro) and math.isnan(sens):
-            composite = float("nan")
-        else:
-            macro0 = 0.0 if math.isnan(macro) else macro
-            sens0 = 0.0 if math.isnan(sens) else sens
-            composite = (w_macro * macro0) + (w_sens * sens0)
+        selected_composite = post_composite if best_ckpt_metric_source == "post" else raw_composite
+        selected_macro = (
+            val_metrics["val_post/macro_dice"]
+            if best_ckpt_metric_source == "post"
+            else val_metrics["val_raw/macro_dice"]
+        )
 
-        if not math.isnan(composite):
-            wandb_logger.log_epoch({"val/composite_score": composite}, step=epoch)
+        if not math.isnan(selected_composite):
+            wandb_logger.log_epoch(
+                {"val/composite_score": selected_composite},
+                step=epoch,
+            )
             logger.info(
-                "Epoch %d/%d | composite_score=%.4f (best=%s)",
+                "Epoch %d/%d | selected_composite(%s)=%.4f (best=%s)",
                 epoch,
                 epochs,
-                composite,
+                best_ckpt_metric_source,
+                selected_composite,
                 _fmt(best_metric),
             )
 
-        if not math.isnan(composite) and composite > best_metric + es_min_delta:
-            best_metric = composite
-            best_val_macro_dice = macro
+        if (
+            not math.isnan(selected_composite)
+            and selected_composite > best_metric + es_min_delta
+        ):
+            best_metric = selected_composite
+            best_val_macro_dice = selected_macro
             save_checkpoint(
                 model,
                 optimizer,
@@ -1761,15 +1895,16 @@ def main() -> None:
                 last_hd95=float("nan"),
             )
             logger.info(
-                "New best model at epoch %d (composite=%.4f, val_macro_dice=%s) -> %s",
+                "New best model at epoch %d (%s composite=%.4f, val_macro_dice=%s) -> %s",
                 epoch,
+                best_ckpt_metric_source,
                 best_metric,
                 _fmt(best_val_macro_dice),
                 checkpoint_dir / "best.pt",
             )
             es_counter = 0
         else:
-            if es_enabled and not math.isnan(composite):
+            if es_enabled and not math.isnan(selected_composite):
                 es_counter += 1
                 logger.info("Early stopping counter: %d / %d", es_counter, es_patience)
 

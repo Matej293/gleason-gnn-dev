@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 
 from src.eval_utils import (
@@ -79,3 +81,52 @@ def test_metrics_from_pred_matches_logits_path():
     m_pred = compute_multiclass_metrics_from_pred(pred, hard, ignore, include_background_in_dice=False)
     assert abs(float(m_logits["macro_dice"]) - float(m_pred["macro_dice"])) < 1e-8
     assert abs(float(m_logits["miou"]) - float(m_pred["miou"])) < 1e-8
+
+
+def test_absent_class_metrics_return_nan_and_are_excluded_from_macro():
+    pred = torch.zeros((1, 8, 8), dtype=torch.long)
+    hard = torch.zeros((1, 8, 8), dtype=torch.long)
+    ignore = torch.zeros((1, 8, 8), dtype=torch.uint8)
+    m = compute_multiclass_metrics_from_pred(
+        pred=pred,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        include_background_in_dice=False,
+    )
+    assert math.isnan(float(m["dice_g3"]))
+    assert math.isnan(float(m["dice_g4"]))
+    assert math.isnan(float(m["dice_g5"]))
+    assert math.isnan(float(m["macro_dice"]))
+
+
+def test_postprocess_improves_metrics_when_raw_predicts_outside_tissue():
+    pred_raw = torch.zeros((1, 8, 8), dtype=torch.long)
+    pred_raw[:, :3, :3] = 1  # false positive region outside tissue
+    pred_raw[:, 5:7, 5:7] = 1  # true positive region
+    hard = torch.zeros((1, 8, 8), dtype=torch.long)
+    hard[:, 5:7, 5:7] = 1
+    ignore = torch.zeros((1, 8, 8), dtype=torch.uint8)
+    tissue = torch.ones((1, 8, 8), dtype=torch.uint8)
+    tissue[:, :3, :3] = 0
+
+    m_raw = compute_multiclass_metrics_from_pred(
+        pred=pred_raw,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        include_background_in_dice=False,
+    )
+    pred_post = postprocess_predictions(
+        pred=pred_raw,
+        ignore_mask=ignore,
+        tissue_mask=tissue,
+        min_component_size_by_class={},
+    )
+    m_post = compute_multiclass_metrics_from_pred(
+        pred=pred_post,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        include_background_in_dice=False,
+    )
+
+    assert float(m_post["dice_benign"]) > float(m_raw["dice_benign"])
+    assert float(m_post["iou_tumor_vs_benign"]) > float(m_raw["iou_tumor_vs_benign"])
