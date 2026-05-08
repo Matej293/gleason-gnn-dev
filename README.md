@@ -23,6 +23,21 @@ PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run outputs/runs/<run_na
 PYTHONPATH=. python scripts/smoke_test_2d.py
 ```
 
+## Fast Class Distribution Count (Train Split)
+
+Use this to count class pixels/images from `consensus_hard_mask.png` for `train_image_ids`
+from your split manifest (fast scan, no dataset transform overhead).
+
+```bash
+PYTHONPATH=. python scripts/count_class_distribution_fast.py --config configs/deconver_2d_local.yaml
+```
+
+Output includes:
+- `Pixel counts`: total pixels per class across the train split
+- `Pixel fractions`: normalized class frequency
+- `Images containing class`: how many train images contain each class
+- `Missing hard masks`: train IDs that did not have a mask file
+
 ## Regenerate Consensus Data
 
 ```bash

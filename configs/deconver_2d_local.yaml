@@ -62,7 +62,7 @@ use_confidence_mask: true
 confidence_threshold: 0.70
 include_background_in_dice: false
 exclude_absent_classes_in_dice_loss: true
-class_loss_weights: [1.0, 1.3, 1.0, 2.0]
+class_loss_weights: [1.0, 1.6, 1.3, 4.5]
 grade5_boost: 2.0
 
 # QC usage
@@ -103,7 +103,7 @@ post_min_component_size_g5: 16
 
 # CPU-side sampler balancing (memory-neutral)
 oversample_tumor_positive_factor: 1.25
-oversample_grade5_factor: 1.50
+oversample_grade5_factor: 2.0
 # hard_case_weights_path: ./outputs/hard_case_weights_local.json
 oversample_hard_case_factor: 1.20
 
