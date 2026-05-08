@@ -4,8 +4,10 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from skimage.measure import label
 
 
 def fmt_metric(v: float) -> str:
@@ -92,9 +94,23 @@ def compute_multiclass_metrics(
     include_background_in_dice: bool,
 ) -> dict[str, float]:
     pred = logits.argmax(dim=1)
+    return compute_multiclass_metrics_from_pred(
+        pred=pred,
+        hard_mask=hard_mask,
+        ignore_mask=ignore_mask,
+        include_background_in_dice=include_background_in_dice,
+    )
+
+
+def compute_multiclass_metrics_from_pred(
+    pred: torch.Tensor,
+    hard_mask: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    include_background_in_dice: bool,
+) -> dict[str, float]:
     valid = ignore_mask == 0
 
-    num_classes = logits.shape[1]
+    num_classes = 4
     dice_values: list[float] = []
     iou_values: list[float] = []
     for c in range(num_classes):
@@ -160,6 +176,56 @@ def compute_multiclass_metrics(
     }
 
 
+def postprocess_predictions(
+    pred: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    tissue_mask: torch.Tensor | None = None,
+    min_component_size_by_class: dict[int, int] | None = None,
+) -> torch.Tensor:
+    """
+    Memory-neutral label-space postprocessing:
+    - Force benign outside valid tissue/ignore.
+    - Remove tiny isolated components for lesion classes.
+    """
+    out = pred.clone().long()
+    if out.ndim != 3:
+        raise ValueError(f"pred must have shape [B,H,W], got {tuple(out.shape)}")
+    if ignore_mask.shape != out.shape:
+        raise ValueError("ignore_mask and pred must have the same shape.")
+    if tissue_mask is not None and tissue_mask.shape != out.shape:
+        raise ValueError("tissue_mask and pred must have the same shape when provided.")
+
+    valid = (ignore_mask == 0)
+    if tissue_mask is not None:
+        valid = valid & (tissue_mask > 0)
+    out[~valid] = 0
+
+    if not min_component_size_by_class:
+        return out
+
+    out_np = out.detach().cpu().numpy()
+    valid_np = valid.detach().cpu().numpy()
+    for b in range(out_np.shape[0]):
+        sample = out_np[b]
+        sample_valid = valid_np[b]
+        for cls, min_size in min_component_size_by_class.items():
+            cls_id = int(cls)
+            min_sz = int(min_size)
+            if cls_id <= 0 or min_sz <= 1:
+                continue
+            mask = (sample == cls_id) & sample_valid
+            if not mask.any():
+                continue
+            comps = label(mask, connectivity=2)
+            ids, counts = np.unique(comps, return_counts=True)
+            keep_ids = {int(i) for i, c in zip(ids, counts) if int(i) != 0 and int(c) >= min_sz}
+            cleaned = np.isin(comps, list(keep_ids))
+            sample[np.logical_and(mask, ~cleaned)] = 0
+        out_np[b] = sample
+
+    return torch.from_numpy(out_np).to(device=out.device, dtype=out.dtype)
+
+
 def load_test_indices_from_manifest(dataset_items: list[dict], split_manifest_path: Path) -> list[int]:
     manifest = safe_read_json(split_manifest_path)
     test_ids = set(str(x) for x in manifest.get("test_image_ids", []))
@@ -178,10 +244,12 @@ def load_test_indices_from_manifest(dataset_items: list[dict], split_manifest_pa
 __all__ = [
     "collate_consensus_batch",
     "compute_multiclass_metrics",
+    "compute_multiclass_metrics_from_pred",
     "fmt_metric",
     "json_float",
     "load_test_indices_from_manifest",
     "pad_to_hw",
+    "postprocess_predictions",
     "resolve_split_manifest_path",
     "safe_read_json",
 ]

@@ -58,6 +58,17 @@ def validate_2d_deconver_config(
     confidence_threshold = float(cfg.get("confidence_threshold", 0.6))
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError(f"confidence_threshold must be in [0, 1], got {confidence_threshold}")
+    class_loss_weights = cfg.get("class_loss_weights", None)
+    if class_loss_weights is not None:
+        if not isinstance(class_loss_weights, list) or len(class_loss_weights) != 4:
+            raise ValueError("class_loss_weights must be a list of 4 floats [w0,w1,w2,w3].")
+        if any(float(x) <= 0.0 for x in class_loss_weights):
+            raise ValueError("class_loss_weights entries must all be > 0.")
+
+    for k in ["post_min_component_size_g3", "post_min_component_size_g4", "post_min_component_size_g5"]:
+        v = int(cfg.get(k, 0))
+        if v < 0:
+            raise ValueError(f"{k} must be >= 0, got {v}")
 
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).strip().lower()
     if amp_dtype_str not in {"fp16", "bf16"}:

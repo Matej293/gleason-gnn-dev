@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from tqdm import tqdm
 
 from src.config import load_config
@@ -375,6 +375,94 @@ def _write_split_manifest(
     with path.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
+
+
+def _load_hard_case_weight_map(path: str | None) -> dict[str, float]:
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        logger.warning("hard_case_weights_path does not exist: %s", p)
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception as exc:
+        logger.warning("Failed to read hard_case_weights_path=%s (%s)", p, exc)
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, float] = {}
+    for k, v in obj.items():
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            out[str(k)] = max(0.0, float(v))
+    return out
+
+
+def _build_train_sampler(
+    train_rows: list[dict],
+    cfg: dict,
+    seed: int,
+) -> WeightedRandomSampler | None:
+    tumor_factor = float(cfg.get("oversample_tumor_positive_factor", 1.0))
+    grade5_factor = float(cfg.get("oversample_grade5_factor", 1.0))
+    hard_factor = float(cfg.get("oversample_hard_case_factor", 1.0))
+    hard_map = _load_hard_case_weight_map(
+        str(cfg.get("hard_case_weights_path", "")).strip() or None
+    )
+    use_sampler = (
+        (tumor_factor != 1.0)
+        or (grade5_factor != 1.0)
+        or (hard_factor != 1.0 and bool(hard_map))
+    )
+    if not use_sampler:
+        return None
+
+    weights: list[float] = []
+    for row in train_rows:
+        w = 1.0
+        if bool(row.get("has_cancer", False)):
+            w *= tumor_factor
+        if bool(row.get("has_grade5", False)):
+            w *= grade5_factor
+        image_id = str(row.get("image_id", ""))
+        hard_w = float(hard_map.get(image_id, 1.0))
+        w *= (hard_factor * hard_w) if image_id in hard_map else 1.0
+        weights.append(max(1e-8, float(w)))
+
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    logger.info(
+        "Using weighted sampler: tumor_factor=%.3f grade5_factor=%.3f hard_factor=%.3f hard_cases=%d",
+        tumor_factor,
+        grade5_factor,
+        hard_factor,
+        len(hard_map),
+    )
+    return WeightedRandomSampler(
+        weights=torch.tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+        generator=gen,
+    )
+
+
+def _resolve_epoch_lambda_weights(
+    cfg: dict,
+    epoch: int,
+    base_lambda_soft: float,
+    base_lambda_dice: float,
+) -> tuple[float, float]:
+    if not bool(cfg.get("loss_schedule_enabled", False)):
+        return base_lambda_soft, base_lambda_dice
+    switch_epoch = max(1, int(cfg.get("loss_schedule_transition_epoch", 15)))
+    warm_soft = float(cfg.get("lambda_soft_warmup", base_lambda_soft))
+    warm_dice = float(cfg.get("lambda_dice_warmup", base_lambda_dice))
+    final_soft = float(cfg.get("lambda_soft_final", base_lambda_soft))
+    final_dice = float(cfg.get("lambda_dice_final", base_lambda_dice))
+    if epoch <= switch_epoch:
+        return warm_soft, warm_dice
+    return final_soft, final_dice
 
 
 def _resize_targets_for_logits(
@@ -1082,10 +1170,12 @@ def main() -> None:
     loader_generator = torch.Generator()
     loader_generator.manual_seed(seed)
 
+    train_sampler = _build_train_sampler(train_rows=train_rows, cfg=cfg, seed=seed)
     train_loader = DataLoader(
         train_ds,
         batch_size=int(cfg.get("batch_size", 8)),
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         persistent_workers=use_persistent,
@@ -1299,6 +1389,15 @@ def main() -> None:
     logger.info(
         "Class weights: %s", [float(x) for x in class_weights.detach().cpu().tolist()]
     )
+    logger.info(
+        "Loss schedule: enabled=%s switch_epoch=%d warmup(soft=%.3f,dice=%.3f) final(soft=%.3f,dice=%.3f)",
+        bool(cfg.get("loss_schedule_enabled", False)),
+        int(cfg.get("loss_schedule_transition_epoch", 15)),
+        float(cfg.get("lambda_soft_warmup", lambda_soft)),
+        float(cfg.get("lambda_dice_warmup", lambda_dice)),
+        float(cfg.get("lambda_soft_final", lambda_soft)),
+        float(cfg.get("lambda_dice_final", lambda_dice)),
+    )
 
     max_nan_batches = 10
     nan_batch_count = 0
@@ -1334,6 +1433,12 @@ def main() -> None:
     )
 
     for epoch in tqdm(range(start_epoch, epochs + 1), desc="Epochs", unit="epoch"):
+        epoch_lambda_soft, epoch_lambda_dice = _resolve_epoch_lambda_weights(
+            cfg=cfg,
+            epoch=epoch,
+            base_lambda_soft=lambda_soft,
+            base_lambda_dice=lambda_dice,
+        )
         model.train()
         epoch_loss = 0.0
         epoch_soft = 0.0
@@ -1377,8 +1482,8 @@ def main() -> None:
                         confidence_threshold=confidence_threshold,
                         soft_loss_type=soft_loss_type,
                         loss_variant=loss_variant,
-                        lambda_soft=lambda_soft,
-                        lambda_dice=lambda_dice,
+                        lambda_soft=epoch_lambda_soft,
+                        lambda_dice=epoch_lambda_dice,
                         include_background_in_dice=include_background_in_dice,
                     )
             except FloatingPointError:
@@ -1415,8 +1520,8 @@ def main() -> None:
                             confidence_threshold=confidence_threshold,
                             soft_loss_type=soft_loss_type,
                             loss_variant=loss_variant,
-                            lambda_soft=lambda_soft,
-                            lambda_dice=lambda_dice,
+                            lambda_soft=epoch_lambda_soft,
+                            lambda_dice=epoch_lambda_dice,
                             include_background_in_dice=include_background_in_dice,
                         )
                 except FloatingPointError:
@@ -1491,11 +1596,13 @@ def main() -> None:
                 "train/hard_dice_loss": avg_hard,
                 "train/valid_pixel_fraction": avg_valid,
                 "train/lr": current_lr,
+                "train/lambda_soft": epoch_lambda_soft,
+                "train/lambda_dice": epoch_lambda_dice,
             },
             step=epoch,
         )
         logger.info(
-            "Epoch %d/%d | loss=%.4f soft=%.4f hard_dice=%.4f valid_px=%.3f lr=%.2e",
+            "Epoch %d/%d | loss=%.4f soft=%.4f hard_dice=%.4f valid_px=%.3f lr=%.2e lambda_soft=%.3f lambda_dice=%.3f",
             epoch,
             epochs,
             avg_loss,
@@ -1503,6 +1610,8 @@ def main() -> None:
             avg_hard,
             avg_valid,
             current_lr,
+            epoch_lambda_soft,
+            epoch_lambda_dice,
         )
 
         save_checkpoint(
@@ -1548,8 +1657,8 @@ def main() -> None:
             confidence_threshold=confidence_threshold,
             soft_loss_type=soft_loss_type,
             loss_variant=loss_variant,
-            lambda_soft=lambda_soft,
-            lambda_dice=lambda_dice,
+            lambda_soft=epoch_lambda_soft,
+            lambda_dice=epoch_lambda_dice,
             include_background_in_dice=include_background_in_dice,
             use_amp=use_amp,
             amp_dtype=amp_dtype,

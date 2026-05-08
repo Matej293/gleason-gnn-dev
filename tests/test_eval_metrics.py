@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from src.eval_utils import compute_multiclass_metrics
+from src.eval_utils import (
+    compute_multiclass_metrics,
+    compute_multiclass_metrics_from_pred,
+    postprocess_predictions,
+)
 
 
 def test_multiclass_metrics_keys_and_ranges():
@@ -41,3 +45,37 @@ def test_multiclass_metrics_keys_and_ranges():
     assert 0.0 <= m["precision"] <= 1.0
     assert 0.0 <= m["iou_tumor_vs_benign"] <= 1.0
     assert 0.0 <= m["ignored_pixel_fraction"] <= 1.0
+
+
+def test_postprocess_predictions_forces_benign_outside_valid_and_removes_tiny_components():
+    pred = torch.zeros((1, 12, 12), dtype=torch.long)
+    pred[:, 0:2, 0:2] = 1
+    pred[:, 4:10, 4:10] = 1
+    ignore = torch.zeros((1, 12, 12), dtype=torch.uint8)
+    ignore[:, :3, :] = 1
+    tissue = torch.ones((1, 12, 12), dtype=torch.uint8)
+    tissue[:, :, :2] = 0
+
+    out = postprocess_predictions(
+        pred=pred,
+        ignore_mask=ignore,
+        tissue_mask=tissue,
+        min_component_size_by_class={1: 8},
+    )
+    assert int(out[:, :3, :].sum().item()) == 0
+    assert int(out[:, :, :2].sum().item()) == 0
+    assert int((out == 1).sum().item()) == 36
+
+
+def test_metrics_from_pred_matches_logits_path():
+    logits = torch.zeros((1, 4, 8, 8), dtype=torch.float32)
+    logits[:, 2, 1:7, 1:7] = 7.0
+    hard = torch.zeros((1, 8, 8), dtype=torch.long)
+    hard[:, 1:7, 1:7] = 2
+    ignore = torch.zeros((1, 8, 8), dtype=torch.uint8)
+
+    m_logits = compute_multiclass_metrics(logits, hard, ignore, include_background_in_dice=False)
+    pred = logits.argmax(dim=1)
+    m_pred = compute_multiclass_metrics_from_pred(pred, hard, ignore, include_background_in_dice=False)
+    assert abs(float(m_logits["macro_dice"]) - float(m_pred["macro_dice"])) < 1e-8
+    assert abs(float(m_logits["miou"]) - float(m_pred["miou"])) < 1e-8

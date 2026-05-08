@@ -30,9 +30,11 @@ from config_validation import validate_2d_deconver_config  # noqa: E402
 from eval_utils import (  # noqa: E402
     collate_consensus_batch,
     compute_multiclass_metrics,
+    compute_multiclass_metrics_from_pred,
     fmt_metric,
     json_float,
     load_test_indices_from_manifest,
+    postprocess_predictions,
     resolve_split_manifest_path,
 )
 from gleason_consensus_dataset import GleasonConsensusDataset  # noqa: E402
@@ -212,6 +214,11 @@ def main() -> None:
     model.eval()
 
     include_background_in_dice = bool(cfg.get("include_background_in_dice", False))
+    post_min_comp = {
+        1: int(cfg.get("post_min_component_size_g3", 0)),
+        2: int(cfg.get("post_min_component_size_g4", 0)),
+        3: int(cfg.get("post_min_component_size_g5", 0)),
+    }
 
     sums = {
         "macro_dice": 0.0,
@@ -245,8 +252,17 @@ def main() -> None:
 
             out = model(images)
             logits = out[0] if isinstance(out, list) else out
-            m = compute_multiclass_metrics(
-                logits=logits.float(),
+            pred = logits.argmax(dim=1)
+            pred_post = postprocess_predictions(
+                pred=pred,
+                ignore_mask=ignore_mask,
+                tissue_mask=batch.get("tissue_mask", None).to(device, non_blocking=True)
+                if "tissue_mask" in batch
+                else None,
+                min_component_size_by_class=post_min_comp,
+            )
+            m = compute_multiclass_metrics_from_pred(
+                pred=pred_post,
                 hard_mask=hard_mask,
                 ignore_mask=ignore_mask,
                 include_background_in_dice=include_background_in_dice,
@@ -257,17 +273,16 @@ def main() -> None:
                     sums[k] += m[k]
                     counts[k] += 1
 
-            pred = logits.argmax(dim=1)
             valid = ignore_mask == 0
             for i, image_id in enumerate(image_ids):
-                sample_metrics = compute_multiclass_metrics(
-                    logits=logits[i : i + 1],
+                sample_metrics = compute_multiclass_metrics_from_pred(
+                    pred=pred_post[i : i + 1],
                     hard_mask=hard_mask[i : i + 1],
                     ignore_mask=ignore_mask[i : i + 1],
                     include_background_in_dice=include_background_in_dice,
                 )
                 valid_pixels = int(valid[i].sum().item())
-                pred_pos = int(((pred[i] > 0) & valid[i]).sum().item())
+                pred_pos = int(((pred_post[i] > 0) & valid[i]).sum().item())
                 gt_pos = int(((hard_mask[i] > 0) & valid[i]).sum().item())
                 per_case.append(
                     {
@@ -301,7 +316,7 @@ def main() -> None:
                         "grade5_dice": float(sample_metrics["grade5_dice"]),
                         "image": images[i].detach().cpu(),
                         "hard_mask": hard_mask[i].detach().cpu(),
-                        "pred_mask": pred[i].detach().cpu(),
+                        "pred_mask": pred_post[i].detach().cpu(),
                         "ignore_mask": ignore_mask[i].detach().cpu(),
                     }
                 )
