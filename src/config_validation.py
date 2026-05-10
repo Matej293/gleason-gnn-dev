@@ -30,8 +30,10 @@ def validate_2d_deconver_config(
     )
 
     model_name = str(cfg.get("model", "")).strip().lower()
-    if model_name != "deconver":
-        raise ValueError(f"Expected model='deconver', got {model_name!r}")
+    if model_name not in {"deconver", "unet_lite"}:
+        raise ValueError(
+            f"Expected model in ['deconver', 'unet_lite'], got {model_name!r}"
+        )
 
     spatial_dims = int(cfg.get("spatial_dims", 2))
     if spatial_dims != 2:
@@ -44,6 +46,12 @@ def validate_2d_deconver_config(
     input_channels = int(cfg.get("input_channels", 3))
     if input_channels <= 0:
         raise ValueError(f"input_channels must be > 0, got {input_channels}")
+    if model_name == "unet_lite":
+        base_channels = int(cfg.get("unet_lite_base_channels", 32))
+        if base_channels <= 0:
+            raise ValueError(
+                f"unet_lite_base_channels must be > 0, got {base_channels}"
+            )
 
     soft_label_loss = str(cfg.get("soft_label_loss", "ce")).strip().lower()
     if soft_label_loss not in {"ce", "kl"}:

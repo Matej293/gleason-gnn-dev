@@ -1,11 +1,21 @@
-# ProstateLesionSegmentation (2D Deconver Only)
+# ProstateLesionSegmentation (2D Gleason Consensus Segmentation + Graph Prep)
 
-This repository is a simplified 2D-only training pipeline for Gleason consensus segmentation using the vendored `deconver` model.
+This repository provides a 2D pipeline for Gleason consensus segmentation and
+region-graph preparation:
+- segmentation models: `deconver` and `unet_lite`
+- consensus-aware training/evaluation with tissue-based background ignore
+- superpixel graph artifact export for downstream GNN experiments
 
 ## Train
 
+`deconver`:
 ```bash
 PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
+```
+
+`unet_lite` (fast baseline):
+```bash
+PYTHONPATH=. python -m src.train_deconver_2d --config configs/unet_lite_2d_local.yaml
 ```
 
 Training logs are written to Weights & Biases (W&B) per epoch.  
@@ -17,10 +27,40 @@ Set `WANDB_API_KEY` for online logging, or set `wandb_mode: offline` in config f
 PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run outputs/runs/<run_name>
 ```
 
+Evaluation JSON includes:
+- `aggregate_raw`: per-case mean metrics from raw argmax predictions
+- `aggregate_post`: per-case mean metrics after postprocessing
+- `aggregate`: alias of `aggregate_post` (backward compatibility)
+- `per_case`: both `raw_*` and `post_*` metrics per image
+
 ## Smoke Test
 
 ```bash
 PYTHONPATH=. python scripts/smoke_test_2d.py
+```
+
+## Build Superpixel Graph Artifacts
+
+Create superpixel-based node/edge/feature artifacts for GNN training from
+model predictions (checkpoint-driven, thesis default):
+
+```bash
+PYTHONPATH=. python scripts/build_superpixel_graphs.py \
+  --run outputs/runs/<run_name> \
+  --split test
+```
+
+Example with a real UNet-lite run:
+```bash
+PYTHONPATH=. python scripts/build_superpixel_graphs.py \
+  --run outputs/runs/20260510_184849_unet_lite_2d_consensus_local \
+  --split test
+```
+
+Outputs are saved to:
+
+```text
+outputs/graphs/<run_name>/<split>/<image_id>/graph_data.npz
 ```
 
 ## Fast Class Distribution Count (Train Split)
@@ -112,29 +152,14 @@ The training and evaluation pipeline now tracks the following metrics.
 | `train/valid_pixel_fraction` | Train | Fraction of non-ignored pixels used for supervision |
 | `train/lr` | Train | Learning rate per epoch |
 | `val/loss` | Validation | Total validation loss |
-| `val/macro_dice` | Validation, Eval summary | Mean Dice across active classes (background inclusion depends on config) |
-| `val/miou` | Validation, Eval summary | Mean IoU across active classes |
-| `val/grade5_dice` | Validation, Eval summary | Dice for Gleason 5 class |
-| `val/grade5_iou` | Validation, Eval summary | IoU for Gleason 5 class |
-| `val/dice_benign` | Validation, Eval summary | Dice for benign class |
-| `val/dice_g3` | Validation, Eval summary | Dice for Gleason 3 class |
-| `val/dice_g4` | Validation, Eval summary | Dice for Gleason 4 class |
-| `val/dice_g5` | Validation, Eval summary | Dice for Gleason 5 class |
-| `val/iou_benign` | Validation, Eval summary | IoU for benign class |
-| `val/iou_g3` | Validation, Eval summary | IoU for Gleason 3 class |
-| `val/iou_g4` | Validation, Eval summary | IoU for Gleason 4 class |
-| `val/iou_g5` | Validation, Eval summary | IoU for Gleason 5 class |
-| `val/sensitivity` | Validation, Eval summary | Tumor-vs-benign recall |
-| `val/precision` | Validation, Eval summary | Tumor-vs-benign precision |
-| `val/iou_tumor_vs_benign` | Validation, Eval summary | Tumor-vs-benign IoU |
-| `val/ignored_pixel_fraction` | Validation, Eval summary | Fraction of pixels ignored by `ignore_mask` |
-| `val/tumor_pixels_ignored_fraction` | Validation, Eval summary | Fraction of tumor GT pixels that were ignored |
-| `val/composite_score` | Validation | Checkpoint ranking score (`best_ckpt_w_macro_dice`, `best_ckpt_w_sensitivity`) |
+| `val_raw/*` | Validation | Metrics on raw argmax predictions |
+| `val_post/*` | Validation | Metrics after postprocessing |
+| `val/composite_score` | Validation | Checkpoint ranking score from selected source (`raw` or `post`) |
 | `mean_loo_dice_multiclass` | Eval summary (when enabled) | Mean leave-one-rater-out Dice from `qc_report.json` |
 | `num_loo_entries` | Eval summary (when enabled) | Number of LOO entries used in that mean |
 
 Notes:
-- Validation metrics are logged during training and written in evaluation output JSON.
+- Validation metrics are logged as per-case means (not batch means) during training and evaluation.
 - LOO aggregate metrics are included when `eval_leave_one_rater_out: true`.
 
 ## New Consensus/Training Options (4-class upgrade)
@@ -169,6 +194,29 @@ Notes:
 - `loss_variant`: `soft_dice` (default), `focal_dice`, or `tversky_dice`
 - `eval_leave_one_rater_out`: when `true`, logs/reports LOO-consensus diagnostics
 - `enforce_background_ignore`: defaults to `true`; forces non-tissue pixels to ignore during dataset loading
+
+### Loss Computation (Important)
+
+The total training loss is:
+
+```text
+total_loss = lambda_soft * soft_term + lambda_dice * hard_overlap_term
+```
+
+Where:
+- `soft_dice`:
+  - `soft_term` = soft-label CE (`soft_label_loss: ce`) or KL (`soft_label_loss: kl`) vs STAPLE probabilities
+  - `hard_overlap_term` = Dice loss
+- `tversky_dice`:
+  - same soft-label term as above
+  - hard term uses Tversky loss (`alpha=0.3`, `beta=0.7`)
+- `focal_dice`:
+  - `soft_term` is replaced by hard-label focal CE (with class weights)
+  - this variant does **not** use soft-label CE/KL
+
+Additional details:
+- `use_confidence_mask` + `confidence_threshold` excludes low-consensus pixels from both terms.
+- `exclude_absent_classes_in_dice_loss` prevents absent classes from contributing to hard overlap loss.
 
 ### Tissue/background handling in training
 
@@ -233,21 +281,29 @@ eval_leave_one_rater_out: true
 PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
 ```
 
-4. Evaluate checkpoint (includes LOO summary when enabled in run config).
+4. Evaluate checkpoint (includes raw/post per-case and aggregate summaries).
 ```bash
 PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run outputs/runs/<run_name>
 ```
 
-## Kept configs
+5. Build superpixel graph artifacts for GNN-stage experiments.
+```bash
+PYTHONPATH=. python scripts/build_superpixel_graphs.py \
+  --run outputs/runs/<run_name> \
+  --split test
+```
+
+## Configs
 
 - `configs/deconver_2d.yaml`
 - `configs/deconver_2d_local.yaml`
+- `configs/unet_lite_2d_local.yaml`
 
-Both configs are set up for TITAN V / Volta compatibility:
+All provided local configs are set up for TITAN V / Volta compatibility:
 
 - `use_amp: true`
 - `amp_dtype: fp16`
-- `use_compile: false`
+- `use_compile`: model/config dependent (`deconver` default false, `unet_lite` fast config true)
 
 ## Expected data layout
 

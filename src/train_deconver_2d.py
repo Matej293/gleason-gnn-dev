@@ -1,5 +1,5 @@
 """
-2D Deconver training for Gleason consensus labels (4-class segmentation).
+2D training for Gleason consensus labels (4-class segmentation).
 
 Usage:
     python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
@@ -28,7 +28,6 @@ from src.config import load_config
 from src.config_validation import validate_2d_deconver_config, validate_amp_runtime
 from src.eval_utils import (
     collate_consensus_batch,
-    compute_multiclass_metrics,
     compute_multiclass_metrics_from_pred,
     postprocess_predictions,
     resolve_split_manifest_path,
@@ -981,12 +980,6 @@ def validate(
                 soft_probs=soft_probs,
                 ignore_mask=ignore_mask,
             )
-            m_raw = compute_multiclass_metrics(
-                logits=logits.float(),
-                hard_mask=hard_rs,
-                ignore_mask=ignore_rs,
-                include_background_in_dice=include_background_in_dice,
-            )
             tissue_rs = None
             if "tissue_mask" in batch:
                 tissue_mask = batch["tissue_mask"].to(device, non_blocking=True)
@@ -1010,11 +1003,25 @@ def validate(
 
             loss_sum += float(loss.detach().cpu().item())
             n_batches += 1
-            for stream, metrics in (("raw", m_raw), ("post", m_post)):
-                for k in VAL_METRIC_KEYS:
-                    if not math.isnan(metrics[k]):
-                        sums[stream][k] += metrics[k]
-                        counts[stream][k] += 1
+            pred_raw = logits.argmax(dim=1)
+            for i in range(pred_raw.shape[0]):
+                m_raw_i = compute_multiclass_metrics_from_pred(
+                    pred=pred_raw[i : i + 1],
+                    hard_mask=hard_rs[i : i + 1],
+                    ignore_mask=ignore_rs[i : i + 1],
+                    include_background_in_dice=include_background_in_dice,
+                )
+                m_post_i = compute_multiclass_metrics_from_pred(
+                    pred=pred_post[i : i + 1],
+                    hard_mask=hard_rs[i : i + 1],
+                    ignore_mask=ignore_rs[i : i + 1],
+                    include_background_in_dice=include_background_in_dice,
+                )
+                for stream, metrics_i in (("raw", m_raw_i), ("post", m_post_i)):
+                    for k in VAL_METRIC_KEYS:
+                        if not math.isnan(metrics_i[k]):
+                            sums[stream][k] += metrics_i[k]
+                            counts[stream][k] += 1
 
     out_metrics = {"val_loss": (loss_sum / max(1, n_batches))}
     for stream in ("raw", "post"):
@@ -1254,9 +1261,17 @@ def _run_validation_visualizations(
     return saved
 
 
+def _resolve_resize_divisor(cfg: dict) -> int:
+    model_name = str(cfg.get("model", "deconver")).strip().lower()
+    if model_name == "deconver":
+        deconver_strides = tuple(int(x) for x in cfg.get("deconver_strides", [1, 2, 2, 2]))
+        return int(math.prod([s for s in deconver_strides if s > 1])) or 1
+    return 8
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train 2D Deconver model on Gleason consensus labels.",
+        description="Train 2D segmentation model on Gleason consensus labels.",
     )
     parser.add_argument(
         "--config", type=str, required=True, help="Path to YAML config file"
@@ -1279,10 +1294,6 @@ def main() -> None:
     validate_2d_deconver_config(cfg, for_eval=False, require_paths=True)
 
     cfg_model = str(cfg.get("model", "deconver")).lower()
-    if cfg_model != "deconver":
-        raise ValueError(
-            f"train_deconver_2d requires model='deconver', got {cfg_model!r}"
-        )
     spatial_dims = int(cfg.get("spatial_dims", 2))
     if spatial_dims != 2:
         raise ValueError(
@@ -1329,8 +1340,7 @@ def main() -> None:
     save_latest_pointer(str(cfg["base_output_dir"]), run_dir)
 
     max_long_side = int(cfg.get("max_long_side", 0))
-    deconver_strides = tuple(int(x) for x in cfg.get("deconver_strides", [1, 2, 2, 2]))
-    resize_divisor = int(math.prod([s for s in deconver_strides if s > 1])) or 1
+    resize_divisor = _resolve_resize_divisor(cfg)
 
     dataset = GleasonConsensusDataset(
         data_root=cfg["data_root"],
@@ -1350,12 +1360,7 @@ def main() -> None:
         resize_divisor=resize_divisor,
     )
     if max_long_side > 0:
-        logger.info(
-            "Consensus loader resize enabled: max_long_side=%d px (divisor=%d from strides=%s)",
-            max_long_side,
-            resize_divisor,
-            list(deconver_strides),
-        )
+        logger.info("Consensus loader resize enabled: max_long_side=%d px (divisor=%d)", max_long_side, resize_divisor)
 
     all_rows = _build_sample_metadata(dataset=dataset, cfg=cfg)
     enforce_val_presence = bool(cfg.get("enforce_val_class_presence", True))
@@ -1516,7 +1521,7 @@ def main() -> None:
 
     model = build_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("deconver_2d_consensus | trainable parameters: %s", f"{n_params:,}")
+    logger.info("%s | trainable parameters: %s", cfg_model, f"{n_params:,}")
 
     compiled_model: torch.nn.Module = model
     if cfg.get("use_compile", False):

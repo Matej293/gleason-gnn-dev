@@ -134,6 +134,23 @@ def test_postprocess_improves_metrics_when_raw_predicts_outside_tissue():
     assert float(m_post["iou_tumor_vs_benign"]) > float(m_raw["iou_tumor_vs_benign"])
 
 
+def test_postprocess_fills_internal_holes_created_by_component_pruning():
+    pred = torch.ones((1, 16, 16), dtype=torch.long)
+    pred[:, 6:8, 6:8] = 2
+    ignore = torch.zeros((1, 16, 16), dtype=torch.uint8)
+
+    out = postprocess_predictions(
+        pred=pred,
+        ignore_mask=ignore,
+        tissue_mask=None,
+        min_component_size_by_class={2: 16},
+    )
+
+    assert int((out == 0).sum().item()) == 0
+    assert int((out == 2).sum().item()) == 0
+    assert int((out == 1).sum().item()) == int(out.numel())
+
+
 def test_weighted_macro_matches_macro_on_balanced_support():
     pred = torch.zeros((1, 4, 4), dtype=torch.long)
     hard = torch.zeros((1, 4, 4), dtype=torch.long)

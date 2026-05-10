@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import binary_dilation, binary_fill_holes
 from skimage.measure import label
 
 
@@ -215,6 +216,29 @@ def postprocess_predictions(
     if not min_component_size_by_class:
         return out
 
+    def _fill_internal_tumor_holes(sample: np.ndarray, sample_valid: np.ndarray) -> np.ndarray:
+        tumor = (sample > 0) & sample_valid
+        holes = np.logical_and(binary_fill_holes(tumor), ~tumor) & sample_valid
+        if not holes.any():
+            return sample
+        hole_comps = label(holes, connectivity=2)
+        hole_ids = np.unique(hole_comps)
+        for hid in hole_ids:
+            hid_int = int(hid)
+            if hid_int == 0:
+                continue
+            hole = hole_comps == hid_int
+            ring = np.logical_and(binary_dilation(hole), ~hole)
+            neighbor_classes = sample[np.logical_and(ring, sample > 0)]
+            if neighbor_classes.size == 0:
+                continue
+            counts = np.bincount(neighbor_classes.astype(np.int64), minlength=4)
+            if counts.shape[0] <= 1:
+                continue
+            fill_cls = int(np.argmax(counts[1:]) + 1)
+            sample[hole] = fill_cls
+        return sample
+
     out_np = out.detach().cpu().numpy()
     valid_np = valid.detach().cpu().numpy()
     for b in range(out_np.shape[0]):
@@ -233,6 +257,7 @@ def postprocess_predictions(
             keep_ids = {int(i) for i, c in zip(ids, counts) if int(i) != 0 and int(c) >= min_sz}
             cleaned = np.isin(comps, list(keep_ids))
             sample[np.logical_and(mask, ~cleaned)] = 0
+        sample = _fill_internal_tumor_holes(sample, sample_valid)
         out_np[b] = sample
 
     return torch.from_numpy(out_np).to(device=out.device, dtype=out.dtype)
