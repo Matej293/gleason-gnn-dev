@@ -74,6 +74,15 @@ def validate_2d_deconver_config(
         raise ValueError(
             f"best_ckpt_metric_source must be one of ['raw', 'post'], got {best_ckpt_metric_source!r}"
         )
+    for k in ["val_min_g3_pos_images", "val_min_g4_pos_images", "val_min_g5_pos_images"]:
+        v = int(cfg.get(k, 0))
+        if v < 0:
+            raise ValueError(f"{k} must be >= 0, got {v}")
+    split_search_max_attempts = int(cfg.get("split_search_max_attempts", 100))
+    if split_search_max_attempts < 1:
+        raise ValueError(
+            f"split_search_max_attempts must be >= 1, got {split_search_max_attempts}"
+        )
 
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).strip().lower()
     if amp_dtype_str not in {"fp16", "bf16"}:

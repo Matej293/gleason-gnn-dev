@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 VAL_METRIC_KEYS = (
     "macro_dice",
+    "weighted_macro_dice",
     "grade5_dice",
     "miou",
     "grade5_iou",
@@ -75,6 +76,13 @@ VAL_METRIC_KEYS = (
     "precision",
     "ignored_pixel_fraction",
     "tumor_pixels_ignored_fraction",
+)
+
+COMPOSITE_WEIGHT_KEYS = (
+    "macro_dice",
+    "weighted_macro_dice",
+    "dice_g5",
+    "sensitivity",
 )
 
 
@@ -175,12 +183,14 @@ def _infer_qc_weight(
     return float(max(min_weight, min(1.0, weight)))
 
 
-def _case_flags_from_hard_mask(mask_path: Path) -> tuple[bool, bool]:
+def _case_flags_from_hard_mask(mask_path: Path) -> tuple[bool, bool, bool, bool]:
     with Image.open(mask_path) as img:
         arr = np.asarray(img, dtype=np.uint8)
     has_cancer = bool((arr > 0).any())
+    has_g3 = bool((arr == 1).any())
+    has_g4 = bool((arr == 2).any())
     has_grade5 = bool((arr == 3).any())
-    return has_cancer, has_grade5
+    return has_cancer, has_g3, has_g4, has_grade5
 
 
 def _build_sample_metadata(dataset: GleasonConsensusDataset, cfg: dict) -> list[dict]:
@@ -209,7 +219,9 @@ def _build_sample_metadata(dataset: GleasonConsensusDataset, cfg: dict) -> list[
             n_out_of_scope += 1
             continue
 
-        has_cancer, has_grade5 = _case_flags_from_hard_mask(Path(item["hard_path"]))
+        has_cancer, has_g3, has_g4, has_grade5 = _case_flags_from_hard_mask(
+            Path(item["hard_path"])
+        )
         qc = safe_read_json(Path(item["qc_path"]))
         qc_fail, qc_suspicious = _infer_qc_flags(
             qc, fail_keys=fail_keys, suspicious_keys=suspicious_keys
@@ -238,6 +250,8 @@ def _build_sample_metadata(dataset: GleasonConsensusDataset, cfg: dict) -> list[
                 "image_id": str(item["image_id"]),
                 "image_subdir": image_subdir,
                 "has_cancer": has_cancer,
+                "has_g3": has_g3,
+                "has_g4": has_g4,
                 "has_grade5": has_grade5,
                 "qc_fail": qc_fail,
                 "qc_suspicious": qc_suspicious,
@@ -260,6 +274,50 @@ def _build_sample_metadata(dataset: GleasonConsensusDataset, cfg: dict) -> list[
         )
 
     return rows
+
+
+def _split_class_presence_summary(rows: list[dict]) -> dict[str, int]:
+    return {
+        "n_images": int(len(rows)),
+        "n_g3_pos_images": int(sum(1 for r in rows if bool(r.get("has_g3", False)))),
+        "n_g4_pos_images": int(sum(1 for r in rows if bool(r.get("has_g4", False)))),
+        "n_g5_pos_images": int(sum(1 for r in rows if bool(r.get("has_grade5", False)))),
+    }
+
+
+def _log_split_class_presence(train_rows: list[dict], val_rows: list[dict], test_rows: list[dict]) -> None:
+    train_s = _split_class_presence_summary(train_rows)
+    val_s = _split_class_presence_summary(val_rows)
+    test_s = _split_class_presence_summary(test_rows)
+    logger.info(
+        "Split class-presence by image | train=%s | val=%s | test=%s",
+        train_s,
+        val_s,
+        test_s,
+    )
+    if int(val_s["n_g5_pos_images"]) < 2:
+        logger.warning(
+            "Validation split has low G5 support: %d G5-positive images (<2).",
+            int(val_s["n_g5_pos_images"]),
+        )
+
+
+def _val_min_class_presence_from_cfg(cfg: dict) -> dict[str, int]:
+    return {
+        "n_g3_pos_images": int(cfg.get("val_min_g3_pos_images", 1)),
+        "n_g4_pos_images": int(cfg.get("val_min_g4_pos_images", 1)),
+        "n_g5_pos_images": int(cfg.get("val_min_g5_pos_images", 2)),
+    }
+
+
+def _val_presence_shortfalls(val_rows: list[dict], required: dict[str, int]) -> dict[str, tuple[int, int]]:
+    summary = _split_class_presence_summary(val_rows)
+    out: dict[str, tuple[int, int]] = {}
+    for k, req in required.items():
+        got = int(summary.get(k, 0))
+        if got < int(req):
+            out[k] = (got, int(req))
+    return out
 
 
 def _stratify_key(row: dict) -> str:
@@ -307,6 +365,8 @@ def _build_split_rows(
     rows: list[dict],
     split_mode: str,
     seed: int,
+    required_val_presence: dict[str, int] | None = None,
+    max_attempts: int = 1,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     mode = split_mode.strip().lower()
     if mode not in {"iter_80_20", "final_80_10_10"}:
@@ -315,33 +375,52 @@ def _build_split_rows(
             f"got {split_mode!r}"
         )
 
-    if mode == "iter_80_20":
-        train_rows, val_rows = _split_two_way_stratified(
-            rows, right_fraction=0.2, seed=seed
-        )
-        test_rows: list[dict] = []
-    else:
-        train_rows, holdout_rows = _split_two_way_stratified(
-            rows, right_fraction=0.2, seed=seed
-        )
-        val_rows, test_rows = _split_two_way_stratified(
-            holdout_rows, right_fraction=0.5, seed=seed + 1
-        )
+    attempts = max(1, int(max_attempts))
+    required = required_val_presence or {}
+    last_shortfalls: dict[str, tuple[int, int]] = {}
+    for i in range(attempts):
+        split_seed = seed + i
+        if mode == "iter_80_20":
+            train_rows, val_rows = _split_two_way_stratified(
+                rows, right_fraction=0.2, seed=split_seed
+            )
+            test_rows = []
+        else:
+            train_rows, holdout_rows = _split_two_way_stratified(
+                rows, right_fraction=0.2, seed=split_seed
+            )
+            val_rows, test_rows = _split_two_way_stratified(
+                holdout_rows, right_fraction=0.5, seed=split_seed + 1
+            )
 
-    if not train_rows or not val_rows:
-        raise RuntimeError(
-            f"Split produced empty subset(s): train={len(train_rows)} val={len(val_rows)} "
-            f"test={len(test_rows)}"
-        )
+        if not train_rows or not val_rows:
+            raise RuntimeError(
+                f"Split produced empty subset(s): train={len(train_rows)} val={len(val_rows)} "
+                f"test={len(test_rows)}"
+            )
 
-    train_ids = {r["image_id"] for r in train_rows}
-    val_ids = {r["image_id"] for r in val_rows}
-    test_ids = {r["image_id"] for r in test_rows}
+        train_ids = {r["image_id"] for r in train_rows}
+        val_ids = {r["image_id"] for r in val_rows}
+        test_ids = {r["image_id"] for r in test_rows}
 
-    if train_ids & val_ids or train_ids & test_ids or val_ids & test_ids:
-        raise RuntimeError("Split overlap detected across train/val/test.")
+        if train_ids & val_ids or train_ids & test_ids or val_ids & test_ids:
+            raise RuntimeError("Split overlap detected across train/val/test.")
 
-    return train_rows, val_rows, test_rows
+        shortfalls = _val_presence_shortfalls(val_rows=val_rows, required=required)
+        if not shortfalls:
+            return train_rows, val_rows, test_rows
+        last_shortfalls = shortfalls
+
+    req_desc = ", ".join(
+        f"{k}>={v}" for k, v in sorted(required.items())
+    ) or "none"
+    got_desc = ", ".join(
+        f"{k}:{got}/{need}" for k, (got, need) in sorted(last_shortfalls.items())
+    ) or "unknown"
+    raise RuntimeError(
+        "Failed to build split meeting validation class-presence minimums after "
+        f"{attempts} attempts (required: {req_desc}; shortfalls: {got_desc})."
+    )
 
 
 def _loo_consensus_mean_from_rows(dataset: GleasonConsensusDataset, rows: list[dict]) -> float:
@@ -1028,14 +1107,32 @@ def _post_min_component_sizes_from_cfg(cfg: dict) -> dict[int, int]:
     }
 
 
-def _composite_from_metrics(metrics: dict[str, float], w_macro: float, w_sens: float) -> float:
-    macro = metrics["macro_dice"]
-    sens = metrics["sensitivity"]
-    if math.isnan(macro) and math.isnan(sens):
+def _composite_from_metrics(
+    metrics: dict[str, float],
+    w_macro: float,
+    w_weighted_macro: float,
+    w_dice_g5: float,
+    w_sens: float,
+) -> float:
+    terms = {
+        "macro_dice": metrics["macro_dice"],
+        "weighted_macro_dice": metrics["weighted_macro_dice"],
+        "dice_g5": metrics["dice_g5"],
+        "sensitivity": metrics["sensitivity"],
+    }
+    if all(math.isnan(v) for v in terms.values()):
         return float("nan")
-    macro0 = 0.0 if math.isnan(macro) else macro
-    sens0 = 0.0 if math.isnan(sens) else sens
-    return (w_macro * macro0) + (w_sens * sens0)
+    weights = {
+        "macro_dice": w_macro,
+        "weighted_macro_dice": w_weighted_macro,
+        "dice_g5": w_dice_g5,
+        "sensitivity": w_sens,
+    }
+    score = 0.0
+    for key in COMPOSITE_WEIGHT_KEYS:
+        val = terms[key]
+        score += weights[key] * (0.0 if math.isnan(val) else val)
+    return float(score)
 
 
 def _selected_stream_metrics(
@@ -1261,6 +1358,9 @@ def main() -> None:
         )
 
     all_rows = _build_sample_metadata(dataset=dataset, cfg=cfg)
+    enforce_val_presence = bool(cfg.get("enforce_val_class_presence", True))
+    val_presence_required = _val_min_class_presence_from_cfg(cfg)
+    split_search_attempts = max(1, int(cfg.get("split_search_max_attempts", 100)))
 
     split_mode = str(cfg.get("split_mode", "iter_80_20"))
     split_manifest_path = resolve_split_manifest_path(cfg)
@@ -1270,6 +1370,8 @@ def main() -> None:
             rows=all_rows,
             split_mode=split_mode,
             seed=seed,
+            required_val_presence=(val_presence_required if enforce_val_presence else {}),
+            max_attempts=split_search_attempts,
         )
         _write_split_manifest(
             path=split_manifest_path,
@@ -1298,6 +1400,19 @@ def main() -> None:
                 "Existing split manifest does not match discovered samples. "
                 "Pass --new-split-manifest to regenerate."
             )
+        if enforce_val_presence:
+            shortfalls = _val_presence_shortfalls(
+                val_rows=val_rows,
+                required=val_presence_required,
+            )
+            if shortfalls:
+                detail = ", ".join(
+                    f"{k}:{got}/{need}" for k, (got, need) in sorted(shortfalls.items())
+                )
+                raise RuntimeError(
+                    "Existing split manifest failed validation class-presence minimums: "
+                    f"{detail}. Pass --new-split-manifest to regenerate."
+                )
         logger.info("Using existing split manifest at %s", split_manifest_path)
 
     split_manifest_copy_path = run_dir / "train_val_split_manifest.json"
@@ -1387,6 +1502,7 @@ def main() -> None:
         len(val_ds),
         len(test_ds) if test_ds is not None else 0,
     )
+    _log_split_class_presence(train_rows=train_rows, val_rows=val_rows, test_rows=test_rows)
     if bool(cfg.get("eval_leave_one_rater_out", False)):
         loo_train = _loo_consensus_mean_from_rows(dataset, train_rows)
         loo_val = _loo_consensus_mean_from_rows(dataset, val_rows)
@@ -1577,9 +1693,11 @@ def main() -> None:
     val_start_epoch = max(1, int(cfg.get("val_start_epoch", 1)))
     keep_last_n = int(cfg.get("keep_last_checkpoints", 3))
 
-    w_macro = float(cfg.get("best_ckpt_w_macro_dice", 0.4))
-    w_sens = float(cfg.get("best_ckpt_w_sensitivity", 0.6))
-    best_ckpt_metric_source = str(cfg.get("best_ckpt_metric_source", "post")).strip().lower()
+    w_macro = float(cfg.get("best_ckpt_w_macro_dice", 0.45))
+    w_weighted_macro = float(cfg.get("best_ckpt_w_weighted_macro_dice", 0.15))
+    w_dice_g5 = float(cfg.get("best_ckpt_w_dice_g5", 0.30))
+    w_sens = float(cfg.get("best_ckpt_w_sensitivity", 0.10))
+    best_ckpt_metric_source = str(cfg.get("best_ckpt_metric_source", "raw")).strip().lower()
     if best_ckpt_metric_source not in {"raw", "post"}:
         raise ValueError(
             f"best_ckpt_metric_source must be 'raw' or 'post', got {best_ckpt_metric_source!r}"
@@ -1609,9 +1727,11 @@ def main() -> None:
         viz_prediction_source,
     )
     logger.info(
-        "Best-checkpoint source=%s | composite weights: macro_dice=%.3f sensitivity=%.3f",
+        "Best-checkpoint source=%s | composite weights: macro_dice=%.3f weighted_macro_dice=%.3f dice_g5=%.3f sensitivity=%.3f",
         best_ckpt_metric_source,
         w_macro,
+        w_weighted_macro,
+        w_dice_g5,
         w_sens,
     )
 
@@ -1856,8 +1976,20 @@ def main() -> None:
                 val_log[f"val_{stream}/{k}"] = val_metrics[f"val_{stream}/{k}"]
         raw_view = _selected_stream_metrics(val_metrics, source="raw")
         post_view = _selected_stream_metrics(val_metrics, source="post")
-        raw_composite = _composite_from_metrics(raw_view, w_macro=w_macro, w_sens=w_sens)
-        post_composite = _composite_from_metrics(post_view, w_macro=w_macro, w_sens=w_sens)
+        raw_composite = _composite_from_metrics(
+            raw_view,
+            w_macro=w_macro,
+            w_weighted_macro=w_weighted_macro,
+            w_dice_g5=w_dice_g5,
+            w_sens=w_sens,
+        )
+        post_composite = _composite_from_metrics(
+            post_view,
+            w_macro=w_macro,
+            w_weighted_macro=w_weighted_macro,
+            w_dice_g5=w_dice_g5,
+            w_sens=w_sens,
+        )
         val_log["val_raw/composite_score"] = raw_composite
         val_log["val_post/composite_score"] = post_composite
         wandb_logger.log_epoch(val_log, step=epoch)

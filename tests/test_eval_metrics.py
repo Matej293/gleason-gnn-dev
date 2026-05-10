@@ -23,6 +23,7 @@ def test_multiclass_metrics_keys_and_ranges():
     m = compute_multiclass_metrics(logits, hard, ignore, include_background_in_dice=False)
     for k in (
         "macro_dice",
+        "weighted_macro_dice",
         "grade5_dice",
         "miou",
         "grade5_iou",
@@ -80,6 +81,7 @@ def test_metrics_from_pred_matches_logits_path():
     pred = logits.argmax(dim=1)
     m_pred = compute_multiclass_metrics_from_pred(pred, hard, ignore, include_background_in_dice=False)
     assert abs(float(m_logits["macro_dice"]) - float(m_pred["macro_dice"])) < 1e-8
+    assert abs(float(m_logits["weighted_macro_dice"]) - float(m_pred["weighted_macro_dice"])) < 1e-8
     assert abs(float(m_logits["miou"]) - float(m_pred["miou"])) < 1e-8
 
 
@@ -130,3 +132,45 @@ def test_postprocess_improves_metrics_when_raw_predicts_outside_tissue():
 
     assert float(m_post["dice_benign"]) > float(m_raw["dice_benign"])
     assert float(m_post["iou_tumor_vs_benign"]) > float(m_raw["iou_tumor_vs_benign"])
+
+
+def test_weighted_macro_matches_macro_on_balanced_support():
+    pred = torch.zeros((1, 4, 4), dtype=torch.long)
+    hard = torch.zeros((1, 4, 4), dtype=torch.long)
+    ignore = torch.zeros((1, 4, 4), dtype=torch.uint8)
+
+    hard[:, 0:2, 0:2] = 1
+    hard[:, 0:2, 2:4] = 2
+    pred[:, 0:2, 0:2] = 1
+    pred[:, 0:2, 2:4] = 2
+
+    m = compute_multiclass_metrics_from_pred(
+        pred=pred,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        include_background_in_dice=False,
+    )
+    assert abs(float(m["weighted_macro_dice"]) - float(m["macro_dice"])) < 1e-8
+
+
+def test_weighted_macro_reflects_imbalanced_support():
+    pred = torch.zeros((1, 6, 6), dtype=torch.long)
+    hard = torch.zeros((1, 6, 6), dtype=torch.long)
+    ignore = torch.zeros((1, 6, 6), dtype=torch.uint8)
+
+    hard[:, 0:4, :] = 1  # 24 pixels
+    hard[:, 4:6, 0:2] = 2  # 4 pixels
+    pred[:, 0:3, :] = 1  # misses one row of class-1 region
+    pred[:, 4:6, :] = 2  # overpredicts class-2 region
+
+    m = compute_multiclass_metrics_from_pred(
+        pred=pred,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        include_background_in_dice=False,
+    )
+    macro = float(m["macro_dice"])
+    weighted = float(m["weighted_macro_dice"])
+    assert 0.0 <= macro <= 1.0
+    assert 0.0 <= weighted <= 1.0
+    assert weighted != macro

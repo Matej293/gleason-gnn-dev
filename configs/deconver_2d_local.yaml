@@ -21,6 +21,11 @@ supervised_image_subdirs: [Train_imgs]
 # Split logic
 split_mode: final_80_10_10 # iter_80_20 | final_80_10_10
 split_manifest_path: ./outputs/splits/gleason_consensus_split_local_80_10_10.json
+enforce_val_class_presence: true
+val_min_g3_pos_images: 1
+val_min_g4_pos_images: 1
+val_min_g5_pos_images: 1
+split_search_max_attempts: 100
 
 # Loader robustness and tissue/background handling
 renormalize_probs: true
@@ -87,13 +92,15 @@ use_compile: false
 keep_last_checkpoints: 5
 
 # Best checkpoint selection
-best_ckpt_w_macro_dice: 0.75
-best_ckpt_w_sensitivity: 0.25
-best_ckpt_metric_source: post # raw | post
+best_ckpt_w_macro_dice: 0.45
+best_ckpt_w_weighted_macro_dice: 0.15
+best_ckpt_w_dice_g5: 0.30
+best_ckpt_w_sensitivity: 0.10
+best_ckpt_metric_source: raw # raw | post
 nan_recovery_log_every: 1
 
 # Early stopping
-early_stopping_patience: 60
+early_stopping_patience: 80
 early_stopping_min_delta: 0.001
 
 # Postprocessing (memory-neutral, label-space)
@@ -124,4 +131,4 @@ viz_every_n_epochs: 5
 viz_num_cases: 8
 viz_output_subdir: val_viz
 viz_log_wandb: true
-viz_prediction_source: post # raw | post | both
+viz_prediction_source: both # raw | post | both

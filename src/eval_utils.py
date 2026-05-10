@@ -133,6 +133,17 @@ def compute_multiclass_metrics_from_pred(
     used = [d for d in dice_values[start:] if not math.isnan(d)]
     used_iou = [x for x in iou_values[start:] if not math.isnan(x)]
     macro_dice = float(sum(used) / len(used)) if used else float("nan")
+    weighted_num = 0.0
+    weighted_den = 0.0
+    for c in range(start, num_classes):
+        support = int(((hard_mask == c) & valid).sum().item())
+        dice_c = dice_values[c]
+        if support > 0 and not math.isnan(dice_c):
+            weighted_num += float(support) * float(dice_c)
+            weighted_den += float(support)
+    weighted_macro_dice = (
+        float(weighted_num / weighted_den) if weighted_den > 0.0 else float("nan")
+    )
     miou = float(sum(used_iou) / len(used_iou)) if used_iou else float("nan")
     grade5_dice = dice_values[3] if len(dice_values) > 3 else float("nan")
     grade5_iou = iou_values[3] if len(iou_values) > 3 else float("nan")
@@ -157,6 +168,7 @@ def compute_multiclass_metrics_from_pred(
 
     return {
         "macro_dice": macro_dice,
+        "weighted_macro_dice": weighted_macro_dice,
         "grade5_dice": grade5_dice,
         "miou": miou,
         "grade5_iou": grade5_iou,
