@@ -2,31 +2,29 @@
 
 This repository provides a pipeline for Gleason consensus segmentation and
 region-graph preparation:
+
 - segmentation models: `deconver` and `unet_lite`
 - consensus-aware training/evaluation with tissue-based background ignore
 - superpixel graph artifact export for downstream GNN experiments
 
 ## Install Dependencies
 
-Core dependencies:
+Dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
 
-Optional dependency for graph neural network models (`graphsage`, `gcn`, `gat`):
-```bash
-pip install torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
-```
-`mlp` baseline does not require PyG.
-
 ## Train
 
 `deconver`:
+
 ```bash
 PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
 ```
 
 `unet_lite` (fast baseline):
+
 ```bash
 PYTHONPATH=. python -m src.train_deconver --config configs/unet_lite_local.yaml
 ```
@@ -41,6 +39,7 @@ PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
 ```
 
 Evaluation JSON includes:
+
 - `aggregate_raw`: per-case mean metrics from raw argmax predictions
 - `aggregate_post`: per-case mean metrics after postprocessing
 - `aggregate`: alias of `aggregate_post` (backward compatibility)
@@ -64,6 +63,7 @@ PYTHONPATH=. python scripts/build_superpixel_graphs.py \
 ```
 
 Example with a real UNet-lite run:
+
 ```bash
 PYTHONPATH=. python scripts/build_superpixel_graphs.py \
   --run outputs/runs/20260510_184849_unet_lite_consensus_local \
@@ -78,8 +78,8 @@ outputs/graphs/<run_name>/<split>/<image_id>/graph_data.npz
 
 ## Train GNN Node Classifier
 
-Install PyTorch Geometric (PyG) with a wheel that matches your Torch/CUDA build
-if you use `graphsage`, `gcn`, or `gat`.
+PyTorch Geometric (PyG) is a required dependency and is installed via
+`requirements.txt`.
 
 Train a GNN baseline on prepared graph splits (`mlp`, `graphsage`, `gcn`, `gat`):
 
@@ -115,6 +115,7 @@ PYTHONPATH=. python scripts/count_class_distribution_fast.py --config configs/de
 ```
 
 Output includes:
+
 - `Pixel counts`: total pixels per class across the train split
 - `Pixel fractions`: normalized class frequency
 - `Images containing class`: how many train images contain each class
@@ -201,6 +202,7 @@ The training and evaluation pipeline now tracks the following metrics.
 | `num_loo_entries` | Eval summary (when enabled) | Number of LOO entries used in that mean |
 
 Notes:
+
 - Validation metrics are logged as per-case means (not batch means) during training and evaluation.
 - LOO aggregate metrics are included when `eval_leave_one_rater_out: true`.
 
@@ -246,6 +248,7 @@ total_loss = lambda_soft * soft_term + lambda_dice * hard_overlap_term
 ```
 
 Where:
+
 - `soft_dice`:
   - `soft_term` = soft-label CE (`soft_label_loss: ce`) or KL (`soft_label_loss: kl`) vs STAPLE probabilities
   - `hard_overlap_term` = Dice loss
@@ -257,6 +260,7 @@ Where:
   - this variant does **not** use soft-label CE/KL
 
 Additional details:
+
 - `use_confidence_mask` + `confidence_threshold` excludes low-consensus pixels from both terms.
 - `exclude_absent_classes_in_dice_loss` prevents absent classes from contributing to hard overlap loss.
 
@@ -275,11 +279,13 @@ ground-truth background labels.
 ## How To Run The New Changes
 
 1. Build consensus with weighted fusion.
+
 ```bash
 make consensus-weighted
 ```
 
 Equivalent raw command:
+
 ```bash
 PYTHONPATH=. python scripts/build_consensus.py \
   --dataset-root data \
@@ -300,7 +306,7 @@ PYTHONPATH=. python scripts/build_consensus.py \
   --workers 8
 ```
 
-2. Audit background-ignore safety (recommended before training).
+1. Audit background-ignore safety (recommended before training).
 
 ```bash
 make audit-background-ignore
@@ -311,7 +317,8 @@ Read `outputs/background_ignore_audit.json`:
 - `bg_not_ignored_*`: background leakage after `enforce_background_ignore` cleanup (should be near zero)
 - `tissue_ignored_*`: how much tissue is ignored after cleanup
 
-3. Train with upgraded loss controls (edit config first).
+1. Train with upgraded loss controls (edit config first).
+
 ```yaml
 # configs/deconver_local.yaml
 loss_variant: focal_dice
@@ -323,12 +330,14 @@ eval_leave_one_rater_out: true
 PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
 ```
 
-4. Evaluate checkpoint (includes raw/post per-case and aggregate summaries).
+1. Evaluate checkpoint (includes raw/post per-case and aggregate summaries).
+
 ```bash
 PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
 ```
 
-5. Build superpixel graph artifacts for GNN-stage experiments.
+1. Build superpixel graph artifacts for GNN-stage experiments.
+
 ```bash
 PYTHONPATH=. python scripts/build_superpixel_graphs.py \
   --run outputs/runs/<run_name> \

@@ -1,6 +1,7 @@
 torch
 torchvision
 torchaudio
+torch-geometric==2.7.0
 einops
 wandb
 setuptools<80
