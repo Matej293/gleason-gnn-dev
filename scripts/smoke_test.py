@@ -8,20 +8,20 @@ from pathlib import Path
 import torch
 
 from src.config import load_config
-from src.config_validation import validate_2d_deconver_config
+from src.config_validation import validate_deconver_config
 from src.eval_utils import collate_consensus_batch, compute_multiclass_metrics
 from src.gleason_consensus_dataset import GleasonConsensusDataset
 from src.models import build_model
 
 
 def main() -> int:
-    cfg_path = Path("configs/deconver_2d_local.yaml")
+    cfg_path = Path("configs/deconver_local.yaml")
     if not cfg_path.exists():
         print("FAIL: config missing", file=sys.stderr)
         return 1
 
     cfg = load_config(str(cfg_path))
-    validate_2d_deconver_config(cfg, for_eval=False, require_paths=False)
+    validate_deconver_config(cfg, for_eval=False, require_paths=False)
 
     data_root = Path(str(cfg.get("data_root", "./data")))
     consensus_root = Path(str(cfg.get("consensus_root", "./data/consensus")))

@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--config",
         type=str,
-        default="configs/deconver_2d_local.yaml",
+        default="configs/deconver_local.yaml",
         help="Path to training config YAML.",
     )
     return p.parse_args()

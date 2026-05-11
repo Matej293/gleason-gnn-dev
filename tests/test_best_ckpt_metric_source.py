@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from src.train_deconver_2d import _composite_from_metrics, _selected_stream_metrics
+from src.train_deconver import _composite_from_metrics, _selected_stream_metrics
 
 
 def test_best_ckpt_metric_source_changes_selected_composite_stream():

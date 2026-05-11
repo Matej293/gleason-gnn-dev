@@ -19,7 +19,7 @@ This repository is the official implementation of ["Deconver: A Deconvolutional 
 
 ## ✨ Key Features
 
-- 🏆 **State-of-the-art performance** on various 2D/3D medical segmentation tasks (ISLES'22, BraTS'23, GlaS, FIVES)
+- 🏆 **State-of-the-art performance** on various spatial medical segmentation tasks (ISLES'22, BraTS'23, GlaS, FIVES)
 - ⚡ **Significantly fewer FLOPs** compared to CNN and Transformer baselines
 - 🧠 **Parameter-efficient mixer module** using a *multiplicative update rule* for the source in deconvolution
 
@@ -41,7 +41,7 @@ pip install git+https://github.com/pashtari/deconver.git
 
 ## 🚀 Quick Start
 
-### 2D Segmentation: GlaS Example
+### Segmentation: GlaS Example
 
 ```python
 import torch

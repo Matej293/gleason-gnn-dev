@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Evaluate a 2D Deconver checkpoint on Gleason consensus labels.
+Evaluate a Deconver checkpoint on Gleason consensus labels.
 
 Usage:
-  PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py \
+  PYTHONPATH=. python scripts/evaluate_checkpoint.py \
       --run outputs/runs/<run_name>
 """
 
@@ -26,7 +26,7 @@ _SRC = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(_SRC))
 
 from config import load_config  # noqa: E402
-from config_validation import validate_2d_deconver_config  # noqa: E402
+from config_validation import validate_deconver_config  # noqa: E402
 from eval_utils import (  # noqa: E402
     collate_consensus_batch,
     compute_multiclass_metrics_from_pred,
@@ -39,7 +39,7 @@ from eval_utils import (  # noqa: E402
 from gleason_consensus_dataset import GleasonConsensusDataset  # noqa: E402
 from models import build_model  # noqa: E402
 from utils import ensure_cuda_binary_compatibility, load_checkpoint  # noqa: E402
-from visualization_2d import render_case_panel, save_case_panel  # noqa: E402
+from visualization import render_case_panel, save_case_panel  # noqa: E402
 from wandb_logger import WandbLogger  # noqa: E402
 
 logging.basicConfig(
@@ -145,7 +145,7 @@ def _aggregate_per_case_metrics(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate Deconver 2D checkpoint on Gleason consensus test split.",
+        description="Evaluate Deconver checkpoint on Gleason consensus test split.",
     )
     parser.add_argument(
         "--run",
@@ -163,7 +163,7 @@ def parse_args() -> argparse.Namespace:
         "--output-json",
         type=str,
         default=None,
-        help="Output JSON path (default: <run>/evaluation_2d_summary.json).",
+        help="Output JSON path (default: <run>/evaluation_summary.json).",
     )
     parser.add_argument("--save-viz", action="store_true", help="Save prediction panels as PNG.")
     parser.add_argument(
@@ -200,7 +200,7 @@ def main() -> None:
         raise FileNotFoundError(f"Run config not found: {cfg_path}")
 
     cfg = load_config(str(cfg_path))
-    validate_2d_deconver_config(cfg, for_eval=True, require_paths=True)
+    validate_deconver_config(cfg, for_eval=True, require_paths=True)
 
     ckpt_path = _resolve_checkpoint(run_dir, args.checkpoint)
     logger.info("Using checkpoint: %s", ckpt_path)
@@ -452,7 +452,7 @@ def main() -> None:
     out_path = (
         Path(args.output_json).resolve()
         if args.output_json is not None
-        else run_dir / "evaluation_2d_summary.json"
+        else run_dir / "evaluation_summary.json"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:

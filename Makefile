@@ -1,9 +1,9 @@
-.PHONY: help train eval smoke test consensus consensus-weighted viz-consensus-gt audit-background-ignore gnn-build gnn-eval gnn-train gnn-viz gnn-compare-viz
+.PHONY: help train eval smoke test consensus consensus-weighted viz-consensus-gt audit-background-ignore gnn-build gnn-eval gnn-train gnn-viz gnn-compare-viz 
 .DEFAULT_GOAL := help
 
 MAX_CASES ?= 64
 RUN ?= outputs/runs/<run_name>
-GNN_GRAPHS_ROOT ?= outputs/graphs/20260510_022358_deconver_2d_consensus_local
+GNN_GRAPHS_ROOT ?= outputs/graphs/20260510_022358_deconver_consensus_local
 GNN_PROFILE ?= thesis
 GNN_SEED ?= 42
 GNN_MODEL ?= graphsage
@@ -46,26 +46,26 @@ help:
 	@echo "  make gnn-train [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_MODEL=<mlp|graphsage|gcn|gat>]"
 	@echo "  make gnn-viz [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] GNN_RUN_DIR=outputs/gnn_runs/<run_dir>"
 	@echo "  make gnn-compare-viz GNN_COMPARISON_DIR=outputs/gnn_runs/<comparison_dir> [GNN_GRAPHS_ROOT=...]"
-	@echo "  gnn-build defaults: GNN_BUILD_BATCH_SIZE=8 GNN_BUILD_NUM_WORKERS=8"
+	@echo "  gnn-build defaults: GNN_BUILD_BATCH_SIZE=4 GNN_BUILD_NUM_WORKERS=8"
 
 train:
-	PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
+	PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
 
 eval:
 	@if [ -z "$(RUN)" ]; then echo "Usage: make eval RUN=outputs/runs/<run_name>"; exit 1; fi
-	PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run $(RUN)
+	PYTHONPATH=. python scripts/evaluate_checkpoint.py --run $(RUN)
 
 smoke:
-	PYTHONPATH=. python scripts/smoke_test_2d.py
+	PYTHONPATH=. python scripts/smoke_test.py
 
 test:
 	PYTHONPATH=. pytest -q tests
 
 consensus:
-	PYTHONPATH=. python scripts/build_consensus_2d.py --dataset-root data --output-root data/consensus
+	PYTHONPATH=. python scripts/build_consensus.py --dataset-root data --output-root data/consensus
 
 consensus-weighted:
-	PYTHONPATH=. python scripts/build_consensus_2d.py \
+	PYTHONPATH=. python scripts/build_consensus.py \
 		--dataset-root data \
 		--output-root data/consensus \
 		--consensus-fusion-mode weighted \
@@ -118,7 +118,7 @@ gnn-train:
 
 gnn-viz:
 	@if [ "$(GNN_RUN_DIR)" = "outputs/gnn_runs/<run_dir>" ]; then echo "Usage: make gnn-viz GNN_RUN_DIR=outputs/gnn_runs/<run_dir> [GNN_GRAPHS_ROOT=...]"; exit 1; fi
-	PYTHONPATH=. python scripts/visualize_gnn_predictions.py --graphs-root $(GNN_GRAPHS_ROOT) --run-dir $(GNN_RUN_DIR) --split test --seed $(GNN_SEED)
+	PYTHONPATH=. python scripts/visualize_gnn_predictions.py --graphs-root $(GNN_GRAPHS_ROOT) --run-dir $(GNN_RUN_DIR) --split $(GNN_VIZ_SPLIT) --seed $(GNN_SEED)
 
 gnn-compare-viz:
 	@if [ "$(GNN_COMPARISON_DIR)" = "outputs/gnn_runs/<comparison_dir>" ]; then echo "Usage: make gnn-compare-viz GNN_COMPARISON_DIR=outputs/gnn_runs/<comparison_dir> [GNN_GRAPHS_ROOT=...]"; exit 1; fi
@@ -129,3 +129,4 @@ gnn-compare-viz:
 		--split $(GNN_VIZ_SPLIT) \
 		--max-cases $(GNN_MAX_CASES) \
 		--seed $(GNN_SEED)
+

@@ -12,10 +12,12 @@ if str(_DECONVER_ROOT) not in sys.path:
 
 try:
     from deconver.deconver import Deconver as _Deconver
+
     _DECONVER_AVAILABLE = True
 except ImportError:
     _Deconver = None  # type: ignore[assignment,misc]
     _DECONVER_AVAILABLE = False
+
 
 def build_model(cfg: dict) -> nn.Module:
     name = str(cfg.get("model", "deconver")).lower()

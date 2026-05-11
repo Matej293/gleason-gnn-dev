@@ -1,4 +1,4 @@
-experiment_name: unet_lite_2d_consensus_local
+experiment_name: unet_lite_consensus_local
 epochs: 120
 batch_size: 12
 val_batch_size: 2
@@ -94,8 +94,8 @@ wandb_mode: online
 wandb_project: prostate-lesion-segmentation
 wandb_entity: ""
 wandb_run_name: ""
-wandb_group: unet-lite-2d-local
-wandb_tags: [unet_lite, consensus, 2d, local]
+wandb_group: unet-lite-local
+wandb_tags: [unet_lite, consensus, segmentation, local]
 wandb_log_config: true
 wandb_strict: false
 

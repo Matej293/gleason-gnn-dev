@@ -1,8 +1,8 @@
 """
-2D training for Gleason consensus labels (4-class segmentation).
+Training for Gleason consensus labels (4-class segmentation).
 
 Usage:
-    python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
+    python -m src.train_deconver --config configs/deconver_local.yaml
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from tqdm import tqdm
 
 from src.config import load_config
-from src.config_validation import validate_2d_deconver_config, validate_amp_runtime
+from src.config_validation import validate_amp_runtime, validate_deconver_config
 from src.eval_utils import (
     collate_consensus_batch,
     compute_multiclass_metrics_from_pred,
@@ -46,7 +46,7 @@ from src.utils import (
     save_latest_pointer,
     save_metadata,
 )
-from src.visualization_2d import render_case_panel, save_case_panel
+from src.visualization import render_case_panel, save_case_panel
 from src.wandb_logger import WandbLogger
 
 logging.basicConfig(
@@ -1271,7 +1271,7 @@ def _resolve_resize_divisor(cfg: dict) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train 2D segmentation model on Gleason consensus labels.",
+        description="Train segmentation model on Gleason consensus labels.",
     )
     parser.add_argument(
         "--config", type=str, required=True, help="Path to YAML config file"
@@ -1291,13 +1291,13 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    validate_2d_deconver_config(cfg, for_eval=False, require_paths=True)
+    validate_deconver_config(cfg, for_eval=False, require_paths=True)
 
     cfg_model = str(cfg.get("model", "deconver")).lower()
     spatial_dims = int(cfg.get("spatial_dims", 2))
     if spatial_dims != 2:
         raise ValueError(
-            f"train_deconver_2d requires spatial_dims=2, got {spatial_dims}"
+            f"train_deconver requires spatial_dims=2, got {spatial_dims}"
         )
 
     # Requested class mapping: 0=benign, 1=G3, 2=G4, 3=G5.

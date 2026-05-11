@@ -11,7 +11,7 @@ def _require_keys(cfg: dict, keys: list[str]) -> None:
         raise ValueError(f"Missing required config keys: {missing}")
 
 
-def validate_2d_deconver_config(
+def validate_deconver_config(
     cfg: dict,
     *,
     for_eval: bool,
@@ -150,4 +150,7 @@ def validate_amp_runtime(cfg: dict, device: torch.device) -> torch.dtype:
     return amp_dtype
 
 
-__all__ = ["validate_2d_deconver_config", "validate_amp_runtime"]
+__all__ = [
+    "validate_deconver_config",
+    "validate_amp_runtime",
+]

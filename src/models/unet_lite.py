@@ -24,7 +24,7 @@ class UNetLite(nn.Module):
     """
     Small U-Net baseline for fast experiments.
 
-    The goal is readability and stable 2D segmentation behavior, not SOTA capacity.
+    The goal is readability and stable segmentation behavior, not SOTA capacity.
     """
 
     def __init__(

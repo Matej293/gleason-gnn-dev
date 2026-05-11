@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.train_deconver_2d import _build_split_rows, _val_presence_shortfalls
+from src.train_deconver import _build_split_rows, _val_presence_shortfalls
 
 
 def _row(i: int, *, has_cancer: bool, has_g3: bool, has_g4: bool, has_grade5: bool) -> dict:

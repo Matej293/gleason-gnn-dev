@@ -1,5 +1,5 @@
 """
-2D augmentation and preprocessing transforms for Deconver JPG/PNG training.
+Augmentation and preprocessing transforms for Deconver JPG/PNG training.
 
 Uses MONAI dictionary transforms with keys:
   - ``image``: (C, H, W)
@@ -15,13 +15,13 @@ LABEL_KEY = "label"
 _BOTH = (IMAGE_KEY, LABEL_KEY)
 
 
-def get_train_transforms_2d(
+def get_train_transforms(
     patch_size: tuple[int, int] = (256, 256),
     pos_fraction: float = 0.75,
     num_samples: int = 1,
 ) -> T.Compose:
     """
-    Build MONAI training transforms for 2D segmentation.
+    Build MONAI training transforms for segmentation.
     """
     return T.Compose(
         [
@@ -104,15 +104,10 @@ def get_train_transforms_2d(
     )
 
 
-def get_val_transforms_2d() -> T.Compose:
+def get_val_transforms() -> T.Compose:
     """
-    Validation transform for 2D segmentation.
+    Validation transform for segmentation.
     """
     return T.Compose([])
 
-
-__all__ = [
-    "get_train_transforms_2d",
-    "get_val_transforms_2d",
-]
-
+__all__ = ["get_train_transforms", "get_val_transforms"]

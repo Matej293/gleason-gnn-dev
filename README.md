@@ -1,21 +1,34 @@
-# ProstateLesionSegmentation (2D Gleason Consensus Segmentation + Graph Prep)
+# ProstateLesionSegmentation (Gleason Consensus Segmentation + Graph Prep)
 
-This repository provides a 2D pipeline for Gleason consensus segmentation and
+This repository provides a pipeline for Gleason consensus segmentation and
 region-graph preparation:
 - segmentation models: `deconver` and `unet_lite`
 - consensus-aware training/evaluation with tissue-based background ignore
 - superpixel graph artifact export for downstream GNN experiments
 
+## Install Dependencies
+
+Core dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+Optional dependency for graph neural network models (`graphsage`, `gcn`, `gat`):
+```bash
+pip install torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+```
+`mlp` baseline does not require PyG.
+
 ## Train
 
 `deconver`:
 ```bash
-PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
+PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
 ```
 
 `unet_lite` (fast baseline):
 ```bash
-PYTHONPATH=. python -m src.train_deconver_2d --config configs/unet_lite_2d_local.yaml
+PYTHONPATH=. python -m src.train_deconver --config configs/unet_lite_local.yaml
 ```
 
 Training logs are written to Weights & Biases (W&B) per epoch.  
@@ -24,7 +37,7 @@ Set `WANDB_API_KEY` for online logging, or set `wandb_mode: offline` in config f
 ## Evaluate
 
 ```bash
-PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run outputs/runs/<run_name>
+PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
 ```
 
 Evaluation JSON includes:
@@ -36,7 +49,7 @@ Evaluation JSON includes:
 ## Smoke Test
 
 ```bash
-PYTHONPATH=. python scripts/smoke_test_2d.py
+PYTHONPATH=. python scripts/smoke_test.py
 ```
 
 ## Build Superpixel Graph Artifacts
@@ -53,7 +66,7 @@ PYTHONPATH=. python scripts/build_superpixel_graphs.py \
 Example with a real UNet-lite run:
 ```bash
 PYTHONPATH=. python scripts/build_superpixel_graphs.py \
-  --run outputs/runs/20260510_184849_unet_lite_2d_consensus_local \
+  --run outputs/runs/20260510_184849_unet_lite_consensus_local \
   --split test
 ```
 
@@ -65,12 +78,8 @@ outputs/graphs/<run_name>/<split>/<image_id>/graph_data.npz
 
 ## Train GNN Node Classifier
 
-Install PyTorch Geometric (PyG) with a wheel that matches your Torch/CUDA build.
-Example (adjust the `cu*` selector to your local torch wheel):
-
-```bash
-pip install torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
-```
+Install PyTorch Geometric (PyG) with a wheel that matches your Torch/CUDA build
+if you use `graphsage`, `gcn`, or `gat`.
 
 Train a GNN baseline on prepared graph splits (`mlp`, `graphsage`, `gcn`, `gat`):
 
@@ -102,7 +111,7 @@ Use this to count class pixels/images from `consensus_hard_mask.png` for `train_
 from your split manifest (fast scan, no dataset transform overhead).
 
 ```bash
-PYTHONPATH=. python scripts/count_class_distribution_fast.py --config configs/deconver_2d_local.yaml
+PYTHONPATH=. python scripts/count_class_distribution_fast.py --config configs/deconver_local.yaml
 ```
 
 Output includes:
@@ -114,13 +123,13 @@ Output includes:
 ## Regenerate Consensus Data
 
 ```bash
-PYTHONPATH=. python scripts/build_consensus_2d.py --dataset-root data --output-root data/consensus
+PYTHONPATH=. python scripts/build_consensus.py --dataset-root data --output-root data/consensus
 ```
 
 Weighted-fusion example (new):
 
 ```bash
-PYTHONPATH=. python scripts/build_consensus_2d.py \
+PYTHONPATH=. python scripts/build_consensus.py \
   --dataset-root data \
   --output-root data/consensus \
   --consensus-fusion-mode weighted \
@@ -272,7 +281,7 @@ make consensus-weighted
 
 Equivalent raw command:
 ```bash
-PYTHONPATH=. python scripts/build_consensus_2d.py \
+PYTHONPATH=. python scripts/build_consensus.py \
   --dataset-root data \
   --output-root data/consensus \
   --consensus-fusion-mode weighted \
@@ -304,19 +313,19 @@ Read `outputs/background_ignore_audit.json`:
 
 3. Train with upgraded loss controls (edit config first).
 ```yaml
-# configs/deconver_2d_local.yaml
+# configs/deconver_local.yaml
 loss_variant: focal_dice
 class_loss_weights: [1.0, 1.2, 1.2, 2.5]
 eval_leave_one_rater_out: true
 ```
 
 ```bash
-PYTHONPATH=. python -m src.train_deconver_2d --config configs/deconver_2d_local.yaml
+PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
 ```
 
 4. Evaluate checkpoint (includes raw/post per-case and aggregate summaries).
 ```bash
-PYTHONPATH=. python scripts/evaluate_checkpoint_2d.py --run outputs/runs/<run_name>
+PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
 ```
 
 5. Build superpixel graph artifacts for GNN-stage experiments.
@@ -328,9 +337,9 @@ PYTHONPATH=. python scripts/build_superpixel_graphs.py \
 
 ## Configs
 
-- `configs/deconver_2d.yaml`
-- `configs/deconver_2d_local.yaml`
-- `configs/unet_lite_2d_local.yaml`
+- `configs/deconver.yaml`
+- `configs/deconver_local.yaml`
+- `configs/unet_lite_local.yaml`
 
 All provided local configs are set up for TITAN V / Volta compatibility:
 

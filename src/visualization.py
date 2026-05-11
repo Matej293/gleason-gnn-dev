@@ -22,7 +22,7 @@ CLASS_LABELS: dict[int, str] = {
 }
 
 
-def _to_numpy_2d(x: torch.Tensor | np.ndarray) -> np.ndarray:
+def _to_numpy(x: torch.Tensor | np.ndarray) -> np.ndarray:
     if isinstance(x, torch.Tensor):
         arr = x.detach().cpu().numpy()
     else:
@@ -30,7 +30,7 @@ def _to_numpy_2d(x: torch.Tensor | np.ndarray) -> np.ndarray:
     if arr.ndim == 3 and arr.shape[0] == 1:
         arr = arr[0]
     if arr.ndim != 2:
-        raise ValueError(f"Expected 2D tensor/array, got shape {arr.shape}")
+        raise ValueError(f"Expected tensor/array, got shape {arr.shape}")
     return arr
 
 
@@ -61,7 +61,7 @@ def _to_rgb_image(image: torch.Tensor | np.ndarray) -> Image.Image:
 
 
 def colorize_mask(mask: torch.Tensor | np.ndarray) -> np.ndarray:
-    m = _to_numpy_2d(mask).astype(np.int64)
+    m = _to_numpy(mask).astype(np.int64)
     out = np.zeros((m.shape[0], m.shape[1], 3), dtype=np.uint8)
     for cls_idx, color in CLASS_COLORS.items():
         out[m == int(cls_idx)] = np.asarray(color, dtype=np.uint8)
@@ -106,9 +106,9 @@ def render_case_panel(
     metrics: dict[str, Any] | None = None,
 ) -> Image.Image:
     rgb = np.asarray(_to_rgb_image(image))
-    gt = _to_numpy_2d(gt_mask).astype(np.int64)
-    pred = _to_numpy_2d(pred_mask).astype(np.int64)
-    ign = _to_numpy_2d(ignore_mask).astype(np.uint8) if ignore_mask is not None else None
+    gt = _to_numpy(gt_mask).astype(np.int64)
+    pred = _to_numpy(pred_mask).astype(np.int64)
+    ign = _to_numpy(ignore_mask).astype(np.uint8) if ignore_mask is not None else None
 
     gt_rgb = _overlay_ignore(colorize_mask(gt), ign)
     pred_rgb = _overlay_ignore(colorize_mask(pred), ign)

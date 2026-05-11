@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from src.visualization_2d import CLASS_COLORS, colorize_mask, render_case_panel
+from src.visualization import CLASS_COLORS, colorize_mask, render_case_panel
 
 
 def test_colorize_mask_class_mapping_is_deterministic() -> None:

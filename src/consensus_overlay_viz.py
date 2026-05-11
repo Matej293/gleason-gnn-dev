@@ -6,13 +6,13 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from src.visualization_2d import CLASS_COLORS, CLASS_LABELS, colorize_mask
+from src.visualization import CLASS_COLORS, CLASS_LABELS, colorize_mask
 
 
 IGNORE_COLOR = np.asarray((0, 255, 255), dtype=np.float32)
 
 
-def _to_numpy_2d(x: torch.Tensor | np.ndarray) -> np.ndarray:
+def _to_numpy(x: torch.Tensor | np.ndarray) -> np.ndarray:
     if isinstance(x, torch.Tensor):
         arr = x.detach().cpu().numpy()
     else:
@@ -20,7 +20,7 @@ def _to_numpy_2d(x: torch.Tensor | np.ndarray) -> np.ndarray:
     if arr.ndim == 3 and arr.shape[0] == 1:
         arr = arr[0]
     if arr.ndim != 2:
-        raise ValueError(f"Expected 2D tensor/array, got shape {arr.shape}")
+        raise ValueError(f"Expected tensor/array, got shape {arr.shape}")
     return arr
 
 
@@ -59,13 +59,13 @@ def render_gt_overlay(
         raise ValueError(f"alpha must be in [0,1], got {alpha}")
 
     rgb = _to_rgb_uint8(image).astype(np.float32)
-    gt = _to_numpy_2d(hard_mask).astype(np.int64)
+    gt = _to_numpy(hard_mask).astype(np.int64)
     gt_rgb = colorize_mask(gt).astype(np.float32)
 
     blended = (1.0 - float(alpha)) * rgb + float(alpha) * gt_rgb
 
     if ignore_mask is not None:
-        ign = _to_numpy_2d(ignore_mask) > 0
+        ign = _to_numpy(ignore_mask) > 0
         if ign.any():
             blended[ign] = 0.65 * blended[ign] + 0.35 * IGNORE_COLOR
 
@@ -81,8 +81,8 @@ def render_gt_panel(
     alpha: float = 0.45,
 ) -> Image.Image:
     rgb = _to_rgb_uint8(image)
-    gt = _to_numpy_2d(hard_mask).astype(np.int64)
-    ign = _to_numpy_2d(ignore_mask).astype(np.uint8) if ignore_mask is not None else None
+    gt = _to_numpy(hard_mask).astype(np.int64)
+    ign = _to_numpy(ignore_mask).astype(np.uint8) if ignore_mask is not None else None
 
     overlay = np.asarray(render_gt_overlay(image=image, hard_mask=hard_mask, ignore_mask=ignore_mask, alpha=alpha))
     gt_rgb = colorize_mask(gt)
