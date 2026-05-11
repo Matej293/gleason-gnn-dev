@@ -30,9 +30,9 @@ def validate_deconver_config(
     )
 
     model_name = str(cfg.get("model", "")).strip().lower()
-    if model_name not in {"deconver", "unet_lite"}:
+    if model_name not in {"deconver", "unet_lite", "pspnet_gleason"}:
         raise ValueError(
-            f"Expected model in ['deconver', 'unet_lite'], got {model_name!r}"
+            f"Expected model in ['deconver', 'unet_lite', 'pspnet_gleason'], got {model_name!r}"
         )
 
     spatial_dims = int(cfg.get("spatial_dims", 2))
@@ -52,6 +52,44 @@ def validate_deconver_config(
             raise ValueError(
                 f"unet_lite_base_channels must be > 0, got {base_channels}"
             )
+    if model_name == "pspnet_gleason":
+        if input_channels != 3:
+            raise ValueError(
+                f"pspnet_gleason requires input_channels=3, got {input_channels}"
+            )
+        pspnet_loss_mode = str(cfg.get("pspnet_loss_mode", "consensus")).strip().lower()
+        if pspnet_loss_mode not in {"consensus", "gleason_ce", "gleason_ce_soft"}:
+            raise ValueError(
+                "pspnet_loss_mode must be one of ['consensus', 'gleason_ce', 'gleason_ce_soft'], "
+                f"got {pspnet_loss_mode!r}"
+            )
+        pspnet_soft_term = str(cfg.get("pspnet_soft_term", "ce")).strip().lower()
+        if pspnet_soft_term not in {"ce", "kl"}:
+            raise ValueError(
+                "pspnet_soft_term must be one of ['ce', 'kl'], "
+                f"got {pspnet_soft_term!r}"
+            )
+        pspnet_soft_weight = float(cfg.get("pspnet_soft_weight", 0.2))
+        if pspnet_soft_weight < 0.0:
+            raise ValueError(
+                f"pspnet_soft_weight must be >= 0, got {pspnet_soft_weight}"
+            )
+        aux_weight = float(cfg.get("pspnet_aux_weight", 0.5))
+        if not 0.0 <= aux_weight <= 1.0:
+            raise ValueError(
+                f"pspnet_aux_weight must be in [0, 1], got {aux_weight}"
+            )
+        encoder_name = str(cfg.get("pspnet_encoder_name", "resnet101")).strip().lower()
+        if not encoder_name:
+            raise ValueError("pspnet_encoder_name must be a non-empty string")
+        encoder_weights_raw = cfg.get("pspnet_encoder_weights", None)
+        if encoder_weights_raw is not None:
+            encoder_weights = str(encoder_weights_raw).strip().lower()
+            if encoder_weights not in {"imagenet", "none"}:
+                raise ValueError(
+                    "pspnet_encoder_weights must be one of ['imagenet', 'none'] when provided, "
+                    f"got {encoder_weights!r}"
+                )
 
     soft_label_loss = str(cfg.get("soft_label_loss", "ce")).strip().lower()
     if soft_label_loss not in {"ce", "kl"}:

@@ -58,6 +58,10 @@ logger = logging.getLogger(__name__)
 
 VAL_METRIC_KEYS = (
     "macro_dice",
+    "macro_f1",
+    "micro_f1",
+    "cohen_kappa",
+    "challenge_score",
     "weighted_macro_dice",
     "grade5_dice",
     "miou",
@@ -860,6 +864,243 @@ def _consensus_loss(
     }
 
 
+def _gleason_ce_loss(
+    logits: torch.Tensor,
+    hard_mask: torch.Tensor,
+    soft_probs: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    use_confidence_mask: bool,
+    confidence_threshold: float,
+    include_background_in_dice: bool,
+    exclude_absent_classes_in_dice_loss: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    hard_rs, soft_rs, ignore_rs = _resize_targets_for_logits(
+        logits=logits,
+        hard_mask=hard_mask,
+        soft_probs=soft_probs,
+        ignore_mask=ignore_mask,
+    )
+    valid_mask = _make_valid_mask(
+        ignore_mask=ignore_rs,
+        soft_probs=soft_rs,
+        use_confidence_mask=use_confidence_mask,
+        confidence_threshold=confidence_threshold,
+    )
+    target = hard_rs.clone()
+    target[ignore_rs != 0] = 255
+    loss = F.cross_entropy(logits, target, ignore_index=255)
+
+    probs = F.softmax(logits.float(), dim=1)
+    dice_c = _hard_dice_per_class(
+        probs=probs,
+        hard_mask=hard_rs,
+        valid_mask=valid_mask,
+        num_classes=logits.shape[1],
+    )
+    dice_valid_mask = _hard_dice_valid_class_mask(
+        hard_mask=hard_rs,
+        valid_mask=valid_mask,
+        num_classes=logits.shape[1],
+    )
+    if include_background_in_dice:
+        dice_used = dice_c
+        dice_valid_used = dice_valid_mask
+    else:
+        dice_used = dice_c[1:]
+        dice_valid_used = dice_valid_mask[1:]
+    if exclude_absent_classes_in_dice_loss:
+        hard_dice_loss = 1.0 - _nanmean_tensor(dice_used, dice_valid_used)
+    else:
+        hard_dice_loss = 1.0 - dice_used.mean()
+
+    valid_fraction = float((target != 255).float().mean().detach().cpu().item())
+    stats = {
+        "soft_loss": float(loss.detach().cpu().item()),
+        "hard_dice_loss": float(hard_dice_loss.detach().cpu().item()),
+        "valid_fraction": valid_fraction,
+    }
+    return loss, stats
+
+
+def _soft_target_term_loss(
+    logits: torch.Tensor,
+    soft_probs: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    sample_weights: torch.Tensor,
+    class_weights: torch.Tensor,
+    use_confidence_mask: bool,
+    confidence_threshold: float,
+    soft_loss_type: str,
+) -> torch.Tensor:
+    _, soft_rs, ignore_rs = _resize_targets_for_logits(
+        logits=logits,
+        hard_mask=torch.zeros_like(ignore_mask),
+        soft_probs=soft_probs,
+        ignore_mask=ignore_mask,
+    )
+    valid_mask = _make_valid_mask(
+        ignore_mask=ignore_rs,
+        soft_probs=soft_rs,
+        use_confidence_mask=use_confidence_mask,
+        confidence_threshold=confidence_threshold,
+    )
+    soft_map = _soft_loss_map(logits, soft_rs, loss_type=soft_loss_type)
+    expected_cls_weight = (soft_rs * class_weights.view(1, -1, 1, 1)).sum(dim=1)
+    soft_map = soft_map * expected_cls_weight
+    pixel_weight = sample_weights.view(-1, 1, 1)
+    valid_float = valid_mask.float()
+    soft_num = (soft_map * valid_float * pixel_weight).sum()
+    soft_den = (valid_float * pixel_weight).sum().clamp_min(1e-8)
+    return soft_num / soft_den
+
+
+def _compute_training_loss(
+    *,
+    logits: torch.Tensor,
+    scales: list[torch.Tensor],
+    aux: torch.Tensor | None,
+    hard_mask: torch.Tensor,
+    soft_probs: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    sample_weights: torch.Tensor,
+    class_weights: torch.Tensor,
+    use_confidence_mask: bool,
+    confidence_threshold: float,
+    soft_loss_type: str,
+    loss_variant: str,
+    lambda_soft: float,
+    lambda_dice: float,
+    include_background_in_dice: bool,
+    exclude_absent_classes_in_dice_loss: bool,
+    model_name: str,
+    pspnet_loss_mode: str,
+    pspnet_aux_weight: float,
+    pspnet_soft_weight: float,
+    pspnet_soft_term: str,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if model_name == "pspnet_gleason" and pspnet_loss_mode == "gleason_ce":
+        loss, stats = _gleason_ce_loss(
+            logits=logits,
+            hard_mask=hard_mask,
+            soft_probs=soft_probs,
+            ignore_mask=ignore_mask,
+            use_confidence_mask=use_confidence_mask,
+            confidence_threshold=confidence_threshold,
+            include_background_in_dice=include_background_in_dice,
+            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+        )
+        if aux is not None:
+            aux_loss, _ = _gleason_ce_loss(
+                logits=aux,
+                hard_mask=hard_mask,
+                soft_probs=soft_probs,
+                ignore_mask=ignore_mask,
+                use_confidence_mask=use_confidence_mask,
+                confidence_threshold=confidence_threshold,
+                include_background_in_dice=include_background_in_dice,
+                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+            )
+            loss = loss + (float(pspnet_aux_weight) * aux_loss)
+        return loss, stats
+    if model_name == "pspnet_gleason" and pspnet_loss_mode == "gleason_ce_soft":
+        loss, stats = _gleason_ce_loss(
+            logits=logits,
+            hard_mask=hard_mask,
+            soft_probs=soft_probs,
+            ignore_mask=ignore_mask,
+            use_confidence_mask=use_confidence_mask,
+            confidence_threshold=confidence_threshold,
+            include_background_in_dice=include_background_in_dice,
+            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+        )
+        if aux is not None:
+            aux_loss, _ = _gleason_ce_loss(
+                logits=aux,
+                hard_mask=hard_mask,
+                soft_probs=soft_probs,
+                ignore_mask=ignore_mask,
+                use_confidence_mask=use_confidence_mask,
+                confidence_threshold=confidence_threshold,
+                include_background_in_dice=include_background_in_dice,
+                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+            )
+            loss = loss + (float(pspnet_aux_weight) * aux_loss)
+        soft_term = _soft_target_term_loss(
+            logits=logits,
+            soft_probs=soft_probs,
+            ignore_mask=ignore_mask,
+            sample_weights=sample_weights,
+            class_weights=class_weights,
+            use_confidence_mask=use_confidence_mask,
+            confidence_threshold=confidence_threshold,
+            soft_loss_type=pspnet_soft_term,
+        )
+        loss = loss + (float(pspnet_soft_weight) * soft_term)
+        stats["soft_loss"] = float(soft_term.detach().cpu().item())
+        return loss, stats
+
+    loss, stats = _consensus_loss(
+        outputs=scales if len(scales) > 1 else logits,
+        hard_mask=hard_mask,
+        soft_probs=soft_probs,
+        ignore_mask=ignore_mask,
+        sample_weights=sample_weights,
+        class_weights=class_weights,
+        use_confidence_mask=use_confidence_mask,
+        confidence_threshold=confidence_threshold,
+        soft_loss_type=soft_loss_type,
+        loss_variant=loss_variant,
+        lambda_soft=lambda_soft,
+        lambda_dice=lambda_dice,
+        include_background_in_dice=include_background_in_dice,
+        exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+    )
+    if model_name == "pspnet_gleason" and aux is not None:
+        aux = aux.clamp(-15.0, 15.0)
+        aux_loss, _ = _consensus_loss(
+            outputs=aux,
+            hard_mask=hard_mask,
+            soft_probs=soft_probs,
+            ignore_mask=ignore_mask,
+            sample_weights=sample_weights,
+            class_weights=class_weights,
+            use_confidence_mask=use_confidence_mask,
+            confidence_threshold=confidence_threshold,
+            soft_loss_type=soft_loss_type,
+            loss_variant=loss_variant,
+            lambda_soft=lambda_soft,
+            lambda_dice=lambda_dice,
+            include_background_in_dice=include_background_in_dice,
+            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+        )
+        loss = loss + (float(pspnet_aux_weight) * aux_loss)
+    return loss, stats
+
+
+def _parse_model_outputs(
+    out: object,
+) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor | None]:
+    if isinstance(out, torch.Tensor):
+        return out, [out], None
+    if isinstance(out, dict):
+        main = out.get("out")
+        if not isinstance(main, torch.Tensor):
+            raise TypeError("Model output dict must include Tensor at key 'out'.")
+        aux = out.get("aux")
+        if aux is not None and not isinstance(aux, torch.Tensor):
+            raise TypeError("Model output dict key 'aux' must be a Tensor when present.")
+        scales = [main]
+        if isinstance(aux, torch.Tensor):
+            scales.append(aux)
+        return main, scales, aux
+    if isinstance(out, (list, tuple)) and out:
+        if not all(isinstance(x, torch.Tensor) for x in out):
+            raise TypeError("Model output sequences must contain tensors only.")
+        main = out[0]
+        return main, list(out), None
+    raise TypeError(f"Unsupported model output type: {type(out)!r}")
+
+
 def validate(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -876,6 +1117,11 @@ def validate(
     min_component_size_by_class: dict[int, int],
     use_amp: bool,
     amp_dtype: torch.dtype,
+    model_name: str,
+    pspnet_loss_mode: str,
+    pspnet_soft_weight: float,
+    pspnet_soft_term: str,
+    pspnet_aux_weight: float,
 ) -> dict[str, float]:
     model.eval()
 
@@ -910,13 +1156,14 @@ def validate(
                 device_type=autocast_device, dtype=amp_dtype, enabled=use_amp
             ):
                 out = model(images)
-                if isinstance(out, list):
-                    out = [o.clamp(-15.0, 15.0) for o in out]
-                else:
-                    out = out.clamp(-15.0, 15.0)
+                logits, scales, aux = _parse_model_outputs(out)
+                logits = logits.clamp(-15.0, 15.0)
+                scales = [s.clamp(-15.0, 15.0) for s in scales]
                 try:
-                    loss, _ = _consensus_loss(
-                        outputs=out,
+                    loss, _ = _compute_training_loss(
+                        logits=logits,
+                        scales=scales,
+                        aux=aux,
                         hard_mask=hard_mask,
                         soft_probs=soft_probs,
                         ignore_mask=ignore_mask,
@@ -930,6 +1177,11 @@ def validate(
                         lambda_dice=lambda_dice,
                         include_background_in_dice=include_background_in_dice,
                         exclude_absent_classes_in_dice_loss=False,
+                        model_name=model_name,
+                        pspnet_loss_mode=pspnet_loss_mode,
+                        pspnet_soft_weight=pspnet_soft_weight,
+                        pspnet_soft_term=pspnet_soft_term,
+                        pspnet_aux_weight=pspnet_aux_weight,
                     )
                 except FloatingPointError:
                     loss = torch.tensor(float("nan"), device=device)
@@ -943,13 +1195,14 @@ def validate(
                     enabled=False,
                 ):
                     out = model(images.float())
-                    if isinstance(out, list):
-                        out = [o.float().clamp(-15.0, 15.0) for o in out]
-                    else:
-                        out = out.float().clamp(-15.0, 15.0)
+                    logits, scales, aux = _parse_model_outputs(out)
+                    logits = logits.float().clamp(-15.0, 15.0)
+                    scales = [s.float().clamp(-15.0, 15.0) for s in scales]
                     try:
-                        loss, _ = _consensus_loss(
-                            outputs=out,
+                        loss, _ = _compute_training_loss(
+                            logits=logits,
+                            scales=scales,
+                            aux=aux,
                             hard_mask=hard_mask,
                             soft_probs=soft_probs,
                             ignore_mask=ignore_mask,
@@ -963,6 +1216,11 @@ def validate(
                             lambda_dice=lambda_dice,
                             include_background_in_dice=include_background_in_dice,
                             exclude_absent_classes_in_dice_loss=False,
+                            model_name=model_name,
+                            pspnet_loss_mode=pspnet_loss_mode,
+                            pspnet_soft_weight=pspnet_soft_weight,
+                            pspnet_soft_term=pspnet_soft_term,
+                            pspnet_aux_weight=pspnet_aux_weight,
                         )
                     except FloatingPointError:
                         loss = torch.tensor(float("nan"), device=device)
@@ -973,7 +1231,6 @@ def validate(
                     )
                     continue
 
-            logits = out[0] if isinstance(out, list) else out
             hard_rs, _, ignore_rs = _resize_targets_for_logits(
                 logits=logits,
                 hard_mask=hard_mask,
@@ -1049,6 +1306,11 @@ def validate_with_oom_retry(
     min_component_size_by_class: dict[int, int],
     use_amp: bool,
     amp_dtype: torch.dtype,
+    model_name: str,
+    pspnet_loss_mode: str,
+    pspnet_soft_weight: float,
+    pspnet_soft_term: str,
+    pspnet_aux_weight: float,
 ) -> dict[str, float]:
     try:
         return validate(
@@ -1067,6 +1329,11 @@ def validate_with_oom_retry(
             min_component_size_by_class=min_component_size_by_class,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
+            model_name=model_name,
+            pspnet_loss_mode=pspnet_loss_mode,
+            pspnet_soft_weight=pspnet_soft_weight,
+            pspnet_soft_term=pspnet_soft_term,
+            pspnet_aux_weight=pspnet_aux_weight,
         )
     except RuntimeError as exc:
         if device.type == "cuda" and _is_cuda_oom(exc):
@@ -1091,6 +1358,11 @@ def validate_with_oom_retry(
                 min_component_size_by_class=min_component_size_by_class,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
+                model_name=model_name,
+                pspnet_loss_mode=pspnet_loss_mode,
+                pspnet_soft_weight=pspnet_soft_weight,
+                pspnet_soft_term=pspnet_soft_term,
+                pspnet_aux_weight=pspnet_aux_weight,
             )
         raise
 
@@ -1185,7 +1457,7 @@ def _run_validation_visualizations(
             ignore_mask = batch["ignore_mask"].to(device, non_blocking=True)
             with torch.autocast(device_type=autocast_device, dtype=amp_dtype, enabled=use_amp):
                 out = model(images)
-            logits = out[0] if isinstance(out, list) else out
+            logits, _, _ = _parse_model_outputs(out)
             pred_raw = logits.argmax(dim=1)
             hard_rs, _, ignore_rs = _resize_targets_for_logits(
                 logits=logits,
@@ -1541,38 +1813,62 @@ def main() -> None:
             compiled_model = torch.compile(model)  # type: ignore[assignment]
     model = compiled_model
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg.get("learning_rate", 2e-4)),
-        weight_decay=float(cfg.get("weight_decay", 1e-5)),
-    )
+    lr = float(cfg.get("learning_rate", 2e-4))
+    wd = float(cfg.get("weight_decay", 1e-5))
+    optimizer_name = str(cfg.get("optimizer", "adamw")).strip().lower()
+    if optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=float(cfg.get("momentum", 0.9)),
+            weight_decay=wd,
+        )
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=wd,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer {optimizer_name!r}. Use 'adamw' or 'sgd'.")
 
     warmup_epochs = max(0, int(cfg.get("warmup_epochs", 0)))
     epochs = int(cfg.get("epochs", 100))
-    cosine_t_max = max(1, epochs - warmup_epochs)
-    if warmup_epochs > 0:
-        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+    lr_schedule = str(cfg.get("lr_schedule", "cosine")).strip().lower()
+    scheduler_step_per_batch = False
+    if lr_schedule == "poly":
+        poly_power = float(cfg.get("poly_power", 0.9))
+        total_steps = max(1, len(train_loader) * epochs)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            start_factor=0.1,
-            end_factor=1.0,
-            total_iters=warmup_epochs,
+            lr_lambda=lambda step: (1.0 - min(step, total_steps) / total_steps) ** poly_power,
         )
-        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=cosine_t_max,
-            eta_min=float(cfg.get("learning_rate", 2e-4)) * 1e-2,
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_sched, cosine_sched],
-            milestones=[warmup_epochs],
-        )
+        scheduler_step_per_batch = True
     else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=epochs,
-            eta_min=float(cfg.get("learning_rate", 2e-4)) * 1e-2,
-        )
+        cosine_t_max = max(1, epochs - warmup_epochs)
+        if warmup_epochs > 0:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=cosine_t_max,
+                eta_min=lr * 1e-2,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, cosine_sched],
+                milestones=[warmup_epochs],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=epochs,
+                eta_min=lr * 1e-2,
+            )
 
     class_weights_cfg = cfg.get("class_loss_weights", cfg.get("class_weights", None))
     if class_weights_cfg is not None:
@@ -1643,7 +1939,12 @@ def main() -> None:
             device=device,
         )
         start_epoch = int(ckpt["epoch"]) + 1
-        best_metric = float(ckpt.get("best_composite_score", float("-inf")))
+        best_metric = float(
+            ckpt.get(
+                "best_challenge_score",
+                ckpt.get("best_composite_score", float("-inf")),
+            )
+        )
         best_val_d = ckpt.get("best_val_dice", float("nan"))
         best_val_macro_dice = (
             float(best_val_d) if best_val_d is not None else float("nan")
@@ -1669,27 +1970,45 @@ def main() -> None:
     logger.info("torch.compile: %s", cfg.get("use_compile", False))
     logger.info("Experiment: %s", cfg["experiment_name"])
     logger.info("Run directory: %s", run_dir)
-    logger.info(
-        "Loss setup: variant=%s soft=%s (lambda=%.3f), hard_dice(lambda=%.3f), confidence_mask=%s(th=%.2f)",
-        loss_variant,
-        soft_loss_type,
-        lambda_soft,
-        lambda_dice,
-        use_confidence_mask,
-        confidence_threshold,
-    )
+    if cfg_model == "pspnet_gleason":
+        logger.info(
+            "Loss setup (pspnet_gleason): mode=%s aux_weight=%.3f soft_term=%s soft_weight=%.3f | confidence_mask=%s(th=%.2f)",
+            str(cfg.get("pspnet_loss_mode", "consensus")).strip().lower(),
+            float(cfg.get("pspnet_aux_weight", 0.5)),
+            str(cfg.get("pspnet_soft_term", "ce")).strip().lower(),
+            float(cfg.get("pspnet_soft_weight", 0.2)),
+            use_confidence_mask,
+            confidence_threshold,
+        )
+    else:
+        logger.info(
+            "Loss setup (%s): variant=%s soft=%s (lambda=%.3f), hard_dice(lambda=%.3f), confidence_mask=%s(th=%.2f)",
+            cfg_model,
+            loss_variant,
+            soft_loss_type,
+            lambda_soft,
+            lambda_dice,
+            use_confidence_mask,
+            confidence_threshold,
+        )
     logger.info(
         "Class weights: %s", [float(x) for x in class_weights.detach().cpu().tolist()]
     )
     logger.info(
-        "Loss schedule: enabled=%s switch_epoch=%d warmup(soft=%.3f,dice=%.3f) final(soft=%.3f,dice=%.3f)",
-        bool(cfg.get("loss_schedule_enabled", False)),
-        int(cfg.get("loss_schedule_transition_epoch", 15)),
-        float(cfg.get("lambda_soft_warmup", lambda_soft)),
-        float(cfg.get("lambda_dice_warmup", lambda_dice)),
-        float(cfg.get("lambda_soft_final", lambda_soft)),
-        float(cfg.get("lambda_dice_final", lambda_dice)),
+        "Optimizer/schedule: %s / %s",
+        optimizer_name,
+        lr_schedule,
     )
+    if cfg_model != "pspnet_gleason":
+        logger.info(
+            "Loss schedule: enabled=%s switch_epoch=%d warmup(soft=%.3f,dice=%.3f) final(soft=%.3f,dice=%.3f)",
+            bool(cfg.get("loss_schedule_enabled", False)),
+            int(cfg.get("loss_schedule_transition_epoch", 15)),
+            float(cfg.get("lambda_soft_warmup", lambda_soft)),
+            float(cfg.get("lambda_dice_warmup", lambda_dice)),
+            float(cfg.get("lambda_soft_final", lambda_soft)),
+            float(cfg.get("lambda_dice_final", lambda_dice)),
+        )
 
     max_nan_batches = 10
     nan_batch_count = 0
@@ -1732,13 +2051,33 @@ def main() -> None:
         viz_prediction_source,
     )
     logger.info(
-        "Best-checkpoint source=%s | composite weights: macro_dice=%.3f weighted_macro_dice=%.3f dice_g5=%.3f sensitivity=%.3f",
+        "Best-checkpoint metric=challenge_score | source=%s",
         best_ckpt_metric_source,
+    )
+    logger.info(
+        "Legacy composite (reference only): macro_dice=%.3f weighted_macro_dice=%.3f dice_g5=%.3f sensitivity=%.3f",
         w_macro,
         w_weighted_macro,
         w_dice_g5,
         w_sens,
     )
+    pspnet_aux_weight = float(cfg.get("pspnet_aux_weight", 0.5))
+    pspnet_loss_mode = str(cfg.get("pspnet_loss_mode", "consensus")).strip().lower()
+    if pspnet_loss_mode not in {"consensus", "gleason_ce", "gleason_ce_soft"}:
+        raise ValueError(
+            "pspnet_loss_mode must be one of {'consensus','gleason_ce','gleason_ce_soft'}, "
+            f"got {pspnet_loss_mode!r}"
+        )
+    pspnet_soft_term = str(cfg.get("pspnet_soft_term", "ce")).strip().lower()
+    if pspnet_soft_term not in {"ce", "kl"}:
+        raise ValueError(
+            f"pspnet_soft_term must be one of {{'ce','kl'}}, got {pspnet_soft_term!r}"
+        )
+    pspnet_soft_weight = float(cfg.get("pspnet_soft_weight", 0.2))
+    if pspnet_soft_weight < 0.0:
+        raise ValueError(f"pspnet_soft_weight must be >= 0, got {pspnet_soft_weight}")
+    if cfg_model != "pspnet_gleason":
+        pspnet_loss_mode = "consensus"
 
     for epoch in tqdm(range(start_epoch, epochs + 1), desc="Epochs", unit="epoch"):
         epoch_lambda_soft, epoch_lambda_dice = _resolve_epoch_lambda_weights(
@@ -1752,6 +2091,7 @@ def main() -> None:
         epoch_soft = 0.0
         epoch_hard = 0.0
         epoch_valid_frac = 0.0
+        epoch_optimizer_steps = 0
 
         batch_bar = tqdm(
             train_loader, desc=f"Train {epoch}/{epochs}", leave=False, unit="batch"
@@ -1774,13 +2114,14 @@ def main() -> None:
             try:
                 with amp_ctx:
                     out = model(images)
-                    if isinstance(out, list):
-                        out = [o.clamp(-15.0, 15.0) for o in out]
-                    else:
-                        out = out.clamp(-15.0, 15.0)
+                    logits, scales, aux = _parse_model_outputs(out)
+                    logits = logits.clamp(-15.0, 15.0)
+                    scales = [s.clamp(-15.0, 15.0) for s in scales]
 
-                    loss, stats = _consensus_loss(
-                        outputs=out,
+                    loss, stats = _compute_training_loss(
+                        logits=logits,
+                        scales=scales,
+                        aux=aux,
                         hard_mask=hard_mask,
                         soft_probs=soft_probs,
                         ignore_mask=ignore_mask,
@@ -1794,6 +2135,11 @@ def main() -> None:
                         lambda_dice=epoch_lambda_dice,
                         include_background_in_dice=include_background_in_dice,
                         exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+                        model_name=cfg_model,
+                        pspnet_loss_mode=pspnet_loss_mode,
+                        pspnet_soft_weight=pspnet_soft_weight,
+                        pspnet_soft_term=pspnet_soft_term,
+                        pspnet_aux_weight=pspnet_aux_weight,
                     )
             except FloatingPointError:
                 loss = torch.tensor(float("nan"), device=device)
@@ -1814,12 +2160,13 @@ def main() -> None:
                 try:
                     with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", enabled=False):
                         out = model(images.float())
-                        if isinstance(out, list):
-                            out = [o.float().clamp(-15.0, 15.0) for o in out]
-                        else:
-                            out = out.float().clamp(-15.0, 15.0)
-                        loss, stats = _consensus_loss(
-                            outputs=out,
+                        logits, scales, aux = _parse_model_outputs(out)
+                        logits = logits.float().clamp(-15.0, 15.0)
+                        scales = [s.float().clamp(-15.0, 15.0) for s in scales]
+                        loss, stats = _compute_training_loss(
+                            logits=logits,
+                            scales=scales,
+                            aux=aux,
                             hard_mask=hard_mask,
                             soft_probs=soft_probs,
                             ignore_mask=ignore_mask,
@@ -1833,6 +2180,11 @@ def main() -> None:
                             lambda_dice=epoch_lambda_dice,
                             include_background_in_dice=include_background_in_dice,
                             exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+                            model_name=cfg_model,
+                            pspnet_loss_mode=pspnet_loss_mode,
+                            pspnet_soft_weight=pspnet_soft_weight,
+                            pspnet_soft_term=pspnet_soft_term,
+                            pspnet_aux_weight=pspnet_aux_weight,
                         )
                 except FloatingPointError:
                     loss = torch.tensor(float("nan"), device=device)
@@ -1870,12 +2222,20 @@ def main() -> None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                optimizer_stepped = True
             else:
+                prev_scale = scaler.get_scale()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer_stepped = scaler.get_scale() >= prev_scale
+
+            if optimizer_stepped:
+                epoch_optimizer_steps += 1
+            if scheduler_step_per_batch and optimizer_stepped:
+                scheduler.step()
 
             loss_item = float(loss.detach().cpu().item())
             epoch_loss += loss_item
@@ -1890,7 +2250,8 @@ def main() -> None:
 
             del out, images, soft_probs, hard_mask, ignore_mask, sample_w, loss
 
-        scheduler.step()
+        if not scheduler_step_per_batch and epoch_optimizer_steps > 0:
+            scheduler.step()
 
         nb = max(1, len(train_loader))
         avg_loss = epoch_loss / nb
@@ -1973,6 +2334,11 @@ def main() -> None:
             min_component_size_by_class=post_min_comp,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
+            model_name=cfg_model,
+            pspnet_loss_mode=pspnet_loss_mode,
+            pspnet_soft_weight=pspnet_soft_weight,
+            pspnet_soft_term=pspnet_soft_term,
+            pspnet_aux_weight=pspnet_aux_weight,
         )
 
         val_log: dict[str, float] = {"val/loss": val_metrics["val_loss"]}
@@ -2040,6 +2406,11 @@ def main() -> None:
             )
 
         selected_composite = post_composite if best_ckpt_metric_source == "post" else raw_composite
+        selected_challenge_score = (
+            val_metrics["val_post/challenge_score"]
+            if best_ckpt_metric_source == "post"
+            else val_metrics["val_raw/challenge_score"]
+        )
         selected_macro = (
             val_metrics["val_post/macro_dice"]
             if best_ckpt_metric_source == "post"
@@ -2051,20 +2422,26 @@ def main() -> None:
                 {"val/composite_score": selected_composite},
                 step=epoch,
             )
+        if not math.isnan(selected_challenge_score):
+            wandb_logger.log_epoch(
+                {"val/challenge_score": selected_challenge_score},
+                step=epoch,
+            )
             logger.info(
-                "Epoch %d/%d | selected_composite(%s)=%.4f (best=%s)",
+                "Epoch %d/%d | selected_challenge_score(%s)=%.4f (best=%s) | selected_composite=%.4f",
                 epoch,
                 epochs,
                 best_ckpt_metric_source,
-                selected_composite,
+                selected_challenge_score,
                 _fmt(best_metric),
+                selected_composite,
             )
 
         if (
-            not math.isnan(selected_composite)
-            and selected_composite > best_metric + es_min_delta
+            not math.isnan(selected_challenge_score)
+            and selected_challenge_score > best_metric + es_min_delta
         ):
-            best_metric = selected_composite
+            best_metric = selected_challenge_score
             best_val_macro_dice = selected_macro
             save_checkpoint(
                 model,
@@ -2078,7 +2455,7 @@ def main() -> None:
                 last_hd95=float("nan"),
             )
             logger.info(
-                "New best model at epoch %d (%s composite=%.4f, val_macro_dice=%s) -> %s",
+                "New best model at epoch %d (%s challenge_score=%.4f, val_macro_dice=%s) -> %s",
                 epoch,
                 best_ckpt_metric_source,
                 best_metric,
@@ -2087,7 +2464,7 @@ def main() -> None:
             )
             es_counter = 0
         else:
-            if es_enabled and not math.isnan(selected_composite):
+            if es_enabled and not math.isnan(selected_challenge_score):
                 es_counter += 1
                 logger.info("Early stopping counter: %d / %d", es_counter, es_patience)
 
@@ -2109,6 +2486,7 @@ def main() -> None:
         "best_checkpoint_exists": bool(best_ckpt.exists()),
         "best_checkpoint": str(best_ckpt if best_ckpt.exists() else ""),
         "latest_epoch_checkpoint": str(epoch_ckpts[-1]) if epoch_ckpts else "",
+        "best_challenge_score": None if math.isnan(best_metric) else float(best_metric),
         "best_composite_score": None if math.isnan(best_metric) else float(best_metric),
         "best_val_macro_dice": None
         if math.isnan(best_val_macro_dice)
@@ -2123,7 +2501,7 @@ def main() -> None:
     wandb_logger.finish()
 
     logger.info("Training complete.")
-    logger.info("Best composite score: %s", _fmt(best_metric))
+    logger.info("Best challenge score: %s", _fmt(best_metric))
     logger.info("Best validation macro Dice: %s", _fmt(best_val_macro_dice))
     logger.info("Artifacts saved to: %s", run_dir)
     logger.info("Training summary: %s", summary_path)

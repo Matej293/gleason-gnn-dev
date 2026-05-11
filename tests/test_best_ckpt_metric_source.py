@@ -8,10 +8,18 @@ from src.train_deconver import _composite_from_metrics, _selected_stream_metrics
 def test_best_ckpt_metric_source_changes_selected_composite_stream():
     val_metrics = {
         "val_raw/macro_dice": 0.40,
+        "val_raw/macro_f1": 0.40,
+        "val_raw/micro_f1": 0.40,
+        "val_raw/cohen_kappa": 0.20,
+        "val_raw/challenge_score": 0.60,
         "val_raw/weighted_macro_dice": 0.50,
         "val_raw/dice_g5": 0.10,
         "val_raw/sensitivity": 0.20,
         "val_post/macro_dice": 0.70,
+        "val_post/macro_f1": 0.70,
+        "val_post/micro_f1": 0.70,
+        "val_post/cohen_kappa": 0.50,
+        "val_post/challenge_score": 1.20,
         "val_post/weighted_macro_dice": 0.65,
         "val_post/dice_g5": 0.60,
         "val_post/sensitivity": 0.90,

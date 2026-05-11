@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from src.graph_pipeline.graph_build import build_touch_adjacency_edges
 from src.graph_pipeline.node_features import compute_node_features
@@ -66,3 +67,11 @@ def test_superpixel_preset_resolution() -> None:
     num_segments, compactness = mod._resolve_superpixel_params(args)
     assert num_segments == 300
     assert compactness == 10.0
+
+
+def test_extract_logits_supports_tensor_dict_and_sequence() -> None:
+    mod = _load_build_graphs_module()
+    t = torch.randn(2, 4, 8, 8)
+    assert mod._extract_logits(t) is t
+    assert mod._extract_logits({"out": t}) is t
+    assert mod._extract_logits([t]) is t

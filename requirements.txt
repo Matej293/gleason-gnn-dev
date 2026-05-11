@@ -14,3 +14,4 @@ pyyaml
 Pillow
 tqdm
 SimpleITK
+segmentation-models-pytorch

@@ -3,7 +3,7 @@
 This repository provides a pipeline for Gleason consensus segmentation and
 region-graph preparation:
 
-- segmentation models: `deconver` and `unet_lite`
+- segmentation models: `deconver`, `unet_lite`, and `pspnet_gleason`
 - consensus-aware training/evaluation with tissue-based background ignore
 - superpixel graph artifact export for downstream GNN experiments
 
@@ -27,6 +27,12 @@ PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
 
 ```bash
 PYTHONPATH=. python -m src.train_deconver --config configs/unet_lite_local.yaml
+```
+
+`pspnet_gleason` (winner-inspired PSPNet variant):
+
+```bash
+PYTHONPATH=. python -m src.train_deconver --config configs/pspnet_gleason_local.yaml
 ```
 
 Training logs are written to Weights & Biases (W&B) per epoch.  
@@ -349,6 +355,7 @@ PYTHONPATH=. python scripts/build_superpixel_graphs.py \
 - `configs/deconver.yaml`
 - `configs/deconver_local.yaml`
 - `configs/unet_lite_local.yaml`
+- `configs/pspnet_gleason_local.yaml`
 
 All provided local configs are set up for TITAN V / Volta compatibility:
 

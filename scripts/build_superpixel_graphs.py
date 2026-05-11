@@ -90,6 +90,19 @@ def _resolve_checkpoint(run_dir: Path, checkpoint_arg: str) -> Path:
     raise FileNotFoundError(f"Checkpoint not found: {checkpoint_arg}")
 
 
+def _extract_logits(out: object) -> torch.Tensor:
+    if isinstance(out, torch.Tensor):
+        return out
+    if isinstance(out, dict):
+        logits = out.get("out")
+        if isinstance(logits, torch.Tensor):
+            return logits
+        raise TypeError("Model output dict must contain tensor under key 'out'.")
+    if isinstance(out, (list, tuple)) and out and isinstance(out[0], torch.Tensor):
+        return out[0]
+    raise TypeError(f"Unsupported model output type: {type(out)!r}")
+
+
 def _select_indices(dataset: GleasonConsensusDataset, split_manifest: Path, split: str) -> list[int]:
     manifest = safe_read_json(split_manifest)
     if split == "all":
@@ -164,7 +177,7 @@ def main() -> None:
             image_ids = [str(x) for x in batch["image_id"]]
 
             out = model(images)
-            logits = out[0] if isinstance(out, list) else out
+            logits = _extract_logits(out)
             probs = torch.softmax(logits.float(), dim=1).detach().cpu()
 
             for i, image_id in enumerate(image_ids):

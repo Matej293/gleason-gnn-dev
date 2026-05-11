@@ -51,6 +51,10 @@ logger = logging.getLogger(__name__)
 
 METRIC_KEYS = [
     "macro_dice",
+    "macro_f1",
+    "micro_f1",
+    "cohen_kappa",
+    "challenge_score",
     "grade5_dice",
     "miou",
     "grade5_iou",
@@ -143,6 +147,19 @@ def _aggregate_per_case_metrics(
     return {k: (sums[k] / counts[k]) if counts[k] > 0 else float("nan") for k in METRIC_KEYS}
 
 
+def _extract_logits(out: object) -> torch.Tensor:
+    if isinstance(out, torch.Tensor):
+        return out
+    if isinstance(out, dict):
+        logits = out.get("out")
+        if isinstance(logits, torch.Tensor):
+            return logits
+        raise TypeError("Model output dict must contain tensor under key 'out'.")
+    if isinstance(out, (list, tuple)) and out and isinstance(out[0], torch.Tensor):
+        return out[0]
+    raise TypeError(f"Unsupported model output type: {type(out)!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate Deconver checkpoint on Gleason consensus test split.",
@@ -175,8 +192,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--viz-max-cases",
         type=int,
-        default=64,
-        help="Maximum number of cases to save as visualizations.",
+        default=-1,
+        help="Maximum number of cases to save as visualizations (<=0 means all).",
     )
     parser.add_argument(
         "--viz-worst-k",
@@ -187,7 +204,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-wandb-viz",
         action="store_true",
-        help="Log up to 8 evaluation panels to W&B.",
+        help="Log evaluation panels to W&B.",
+    )
+    parser.add_argument(
+        "--log-wandb-metrics",
+        action="store_true",
+        help="Log aggregate and per-case evaluation metrics to W&B.",
     )
     return parser.parse_args()
 
@@ -265,7 +287,7 @@ def main() -> None:
             image_ids = [str(x) for x in batch["image_id"]]
 
             out = model(images)
-            logits = out[0] if isinstance(out, list) else out
+            logits = _extract_logits(out)
             pred = logits.argmax(dim=1)
             pred_post = postprocess_predictions(
                 pred=pred,
@@ -389,23 +411,55 @@ def main() -> None:
         "per_case": per_case,
     }
 
+    wandb_logger = None
+    if args.log_wandb_viz or args.log_wandb_metrics:
+        wandb_logger = WandbLogger(cfg=cfg, run_dir=run_dir)
+
+    if args.log_wandb_metrics and wandb_logger is not None and wandb_logger.enabled:
+        metrics_payload: dict[str, float] = {}
+        for key, value in aggregate_raw.items():
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                metrics_payload[f"eval/raw/{key}"] = float(value)
+        for key, value in aggregate_post.items():
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                metrics_payload[f"eval/post/{key}"] = float(value)
+        if metrics_payload:
+            wandb_logger.log_dict(metrics_payload, step=0)
+
+        raw_rows: list[dict[str, float | str]] = []
+        for row in per_case:
+            image_id = str(row.get("image_id", ""))
+            for key, value in row.items():
+                if key == "image_id":
+                    continue
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    raw_rows.append(
+                        {
+                            "image_id": image_id,
+                            "metric": str(key),
+                            "value": float(value),
+                        }
+                    )
+        if raw_rows:
+            wb_table = wandb_logger.make_table(raw_rows)
+            if wb_table is not None:
+                wandb_logger.log_dict({"eval/per_case_metrics": wb_table}, step=0)
+
     if args.save_viz:
         viz_dir = (
             Path(args.viz_dir).resolve()
             if args.viz_dir is not None
             else (run_dir / "eval_viz")
         )
-        viz_max_cases = max(0, int(args.viz_max_cases))
+        viz_max_cases = int(args.viz_max_cases)
         viz_worst_k = max(0, int(args.viz_worst_k))
-        selected = viz_candidates[:viz_max_cases]
+        selected = list(viz_candidates) if viz_max_cases <= 0 else viz_candidates[:viz_max_cases]
         if viz_worst_k > 0:
             finite = [x for x in viz_candidates if not math.isnan(float(x["macro_dice"]))]
             finite = sorted(finite, key=lambda x: float(x["macro_dice"]))
-            selected = finite[: min(viz_max_cases, viz_worst_k)]
+            limit = viz_worst_k if viz_max_cases <= 0 else min(viz_max_cases, viz_worst_k)
+            selected = finite[:limit]
 
-        wandb_logger = None
-        if args.log_wandb_viz:
-            wandb_logger = WandbLogger(cfg=cfg, run_dir=run_dir)
         wandb_images = []
 
         for idx, case in enumerate(selected, start=1):
@@ -423,7 +477,7 @@ def main() -> None:
                     "grade5_dice": f"{float(case['grade5_dice']):.4f}",
                 },
             )
-            if wandb_logger is not None and wandb_logger.enabled and len(wandb_images) < 8:
+            if wandb_logger is not None and wandb_logger.enabled and args.log_wandb_viz:
                 panel = render_case_panel(
                     image=case["image"],
                     gt_mask=case["hard_mask"],
@@ -445,9 +499,11 @@ def main() -> None:
                 if wb is not None:
                     wandb_images.append(wb)
         if args.log_wandb_viz and wandb_logger is not None:
-            wandb_logger.log_images("eval/panels", wandb_images, step=0)
-            wandb_logger.finish()
+            wandb_logger.log_images("eval/panels/all", wandb_images, step=0)
         logger.info("Saved %d evaluation visualization panels to %s", len(selected), viz_dir)
+
+    if wandb_logger is not None and (args.log_wandb_viz or args.log_wandb_metrics):
+        wandb_logger.finish()
 
     out_path = (
         Path(args.output_json).resolve()

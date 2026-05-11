@@ -110,13 +110,23 @@ def compute_multiclass_metrics_from_pred(
     include_background_in_dice: bool,
 ) -> dict[str, float]:
     valid = ignore_mask == 0
+    valid_n = int(valid.sum().item())
 
     num_classes = 4
     dice_values: list[float] = []
     iou_values: list[float] = []
+    tp_per_class: list[float] = []
+    fp_per_class: list[float] = []
+    fn_per_class: list[float] = []
     for c in range(num_classes):
         p = (pred == c) & valid
         t = (hard_mask == c) & valid
+        tp_c = float((p & t).sum().item())
+        fp_c = float((p & (~t)).sum().item())
+        fn_c = float(((~p) & t).sum().item())
+        tp_per_class.append(tp_c)
+        fp_per_class.append(fp_c)
+        fn_per_class.append(fn_c)
         denom = p.sum().item() + t.sum().item()
         union = (p | t).sum().item()
         if denom == 0:
@@ -145,6 +155,43 @@ def compute_multiclass_metrics_from_pred(
     weighted_macro_dice = (
         float(weighted_num / weighted_den) if weighted_den > 0.0 else float("nan")
     )
+
+    # For single-label segmentation, per-class Dice equals per-class F1.
+    macro_f1 = macro_dice
+    tp_sum = float(sum(tp_per_class))
+    fp_sum = float(sum(fp_per_class))
+    fn_sum = float(sum(fn_per_class))
+    micro_f1 = (
+        (2.0 * tp_sum) / ((2.0 * tp_sum) + fp_sum + fn_sum + 1e-8)
+        if valid_n > 0
+        else float("nan")
+    )
+
+    # Multiclass Cohen's kappa over valid pixels.
+    if valid_n > 0:
+        conf = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=pred.device)
+        pred_v = pred[valid].long().clamp(0, num_classes - 1).view(-1)
+        hard_v = hard_mask[valid].long().clamp(0, num_classes - 1).view(-1)
+        flat_idx = (hard_v * num_classes) + pred_v
+        conf.view(-1).index_add_(
+            0,
+            flat_idx,
+            torch.ones_like(flat_idx, dtype=torch.float64, device=pred.device),
+        )
+        po = float(conf.diag().sum().item() / float(valid_n))
+        row = conf.sum(dim=1)
+        col = conf.sum(dim=0)
+        pe = float((row * col).sum().item() / float(valid_n * valid_n))
+        denom = 1.0 - pe
+        cohen_kappa = float((po - pe) / denom) if abs(denom) > 1e-12 else float("nan")
+    else:
+        cohen_kappa = float("nan")
+
+    if any(math.isnan(v) for v in (cohen_kappa, macro_f1, micro_f1)):
+        challenge_score = float("nan")
+    else:
+        challenge_score = float(cohen_kappa + ((macro_f1 + micro_f1) / 2.0))
+
     miou = float(sum(used_iou) / len(used_iou)) if used_iou else float("nan")
     grade5_dice = dice_values[3] if len(dice_values) > 3 else float("nan")
     grade5_iou = iou_values[3] if len(iou_values) > 3 else float("nan")
@@ -169,6 +216,10 @@ def compute_multiclass_metrics_from_pred(
 
     return {
         "macro_dice": macro_dice,
+        "macro_f1": macro_f1,
+        "micro_f1": micro_f1,
+        "cohen_kappa": cohen_kappa,
+        "challenge_score": challenge_score,
         "weighted_macro_dice": weighted_macro_dice,
         "grade5_dice": grade5_dice,
         "miou": miou,

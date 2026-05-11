@@ -2,6 +2,7 @@
 .DEFAULT_GOAL := help
 
 MAX_CASES ?= 64
+CONFIG ?= configs/deconver_local.yaml
 RUN ?= outputs/runs/<run_name>
 GNN_GRAPHS_ROOT ?= outputs/graphs/20260510_022358_deconver_consensus_local
 GNN_PROFILE ?= thesis
@@ -21,6 +22,7 @@ GNN_EPOCHS ?=
 GNN_PATIENCE ?=
 GNN_BUILD_BATCH_SIZE ?= 4
 GNN_BUILD_NUM_WORKERS ?= 8
+GNN_CHECKPOINT ?=
 GNN_SUPERPIXEL_PRESET ?=
 GNN_NUM_SEGMENTS ?= 300
 GNN_COMPACTNESS ?= 10.0
@@ -33,7 +35,7 @@ GNN_MAX_CASES ?= 12
 
 help:
 	@echo "Targets:"
-	@echo "  make train"
+	@echo "  make train [CONFIG=configs/deconver_local.yaml]"
 	@echo "  make smoke"
 	@echo "  make test"
 	@echo "  make eval RUN=outputs/runs/<run_name>"
@@ -49,11 +51,11 @@ help:
 	@echo "  gnn-build defaults: GNN_BUILD_BATCH_SIZE=4 GNN_BUILD_NUM_WORKERS=8"
 
 train:
-	PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
+	PYTHONPATH=. python -m src.train_deconver --config $(CONFIG)
 
 eval:
 	@if [ -z "$(RUN)" ]; then echo "Usage: make eval RUN=outputs/runs/<run_name>"; exit 1; fi
-	PYTHONPATH=. python scripts/evaluate_checkpoint.py --run $(RUN)
+	PYTHONPATH=. python scripts/evaluate_checkpoint.py --run $(RUN) --save-viz --log-wandb-viz --log-wandb-metrics
 
 smoke:
 	PYTHONPATH=. python scripts/smoke_test.py
@@ -92,7 +94,7 @@ audit-background-ignore:
 gnn-build:
 	@if [ -z "$(RUN)" ]; then echo "Usage: make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>"; exit 1; fi
 	@if [ -z "$(SPLIT)" ]; then echo "Usage: make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>"; exit 1; fi
-	PYTHONPATH=. python scripts/build_superpixel_graphs.py --run $(RUN) --split $(SPLIT) --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),)
+	PYTHONPATH=. python scripts/build_superpixel_graphs.py --run $(RUN) --split $(SPLIT) --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) $(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),)
 
 gnn-eval:
 	PYTHONPATH=. python scripts/eval_gnn_baselines.py --graphs-root $(GNN_GRAPHS_ROOT) --profile $(GNN_PROFILE) --seed $(GNN_SEED)
@@ -129,4 +131,3 @@ gnn-compare-viz:
 		--split $(GNN_VIZ_SPLIT) \
 		--max-cases $(GNN_MAX_CASES) \
 		--seed $(GNN_SEED)
-

@@ -86,10 +86,20 @@ class WandbLogger:
             return
         self._wandb.log({str(key): images}, step=int(step))
 
+    def log_dict(self, values: dict[str, Any], step: int) -> None:
+        if not self.enabled or not values:
+            return
+        self._wandb.log(values, step=int(step))
+
     def make_image(self, image: Any, caption: str | None = None) -> Any:
         if not self.enabled:
             return None
         return self._wandb.Image(image, caption=caption)
+
+    def make_table(self, rows: list[dict[str, Any]]) -> Any:
+        if not self.enabled or not rows:
+            return None
+        return self._wandb.Table(data=rows)
 
     def set_summary(self, values: dict[str, Any]) -> None:
         if not self.enabled:

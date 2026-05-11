@@ -23,6 +23,10 @@ def test_multiclass_metrics_keys_and_ranges():
     m = compute_multiclass_metrics(logits, hard, ignore, include_background_in_dice=False)
     for k in (
         "macro_dice",
+        "macro_f1",
+        "micro_f1",
+        "cohen_kappa",
+        "challenge_score",
         "weighted_macro_dice",
         "grade5_dice",
         "miou",
@@ -48,6 +52,7 @@ def test_multiclass_metrics_keys_and_ranges():
     assert 0.0 <= m["precision"] <= 1.0
     assert 0.0 <= m["iou_tumor_vs_benign"] <= 1.0
     assert 0.0 <= m["ignored_pixel_fraction"] <= 1.0
+    assert -1.0 <= m["cohen_kappa"] <= 1.0
 
 
 def test_postprocess_predictions_forces_benign_outside_valid_and_removes_tiny_components():
