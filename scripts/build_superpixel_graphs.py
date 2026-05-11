@@ -46,15 +46,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--split",
         choices=["train", "val", "test", "all"],
-        default="test",
-        help="Which split to export graphs for (default: test).",
+        required=True,
+        help="Which split to export graphs for.",
     )
     p.add_argument("--output-dir", type=str, default="outputs/graphs")
     p.add_argument("--num-segments", type=int, default=300)
     p.add_argument("--compactness", type=float, default=10.0)
+    p.add_argument("--superpixel-preset", choices=["low", "med", "high"], default=None)
     p.add_argument("--sigma", type=float, default=1.0)
     p.add_argument("--min-majority-fraction", type=float, default=0.6)
+    p.add_argument("--tiny-superpixel-max-pixels", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=None, help="Override loader batch size.")
+    p.add_argument("--num-workers", type=int, default=None, help="Override loader worker count.")
     return p.parse_args()
+
+
+def _resolve_superpixel_params(args: argparse.Namespace) -> tuple[int, float]:
+    if args.superpixel_preset is None:
+        return int(args.num_segments), float(args.compactness)
+    presets = {
+        "low": (220, 6.0),
+        "med": (300, 10.0),
+        "high": (420, 16.0),
+    }
+    return presets[args.superpixel_preset]
 
 
 def _resolve_resize_divisor(cfg: dict) -> int:
@@ -89,6 +104,7 @@ def _select_indices(dataset: GleasonConsensusDataset, split_manifest: Path, spli
 
 def main() -> None:
     args = parse_args()
+    num_segments, compactness = _resolve_superpixel_params(args)
     run_dir = Path(args.run).resolve()
     cfg_path = run_dir / "config.yaml"
     if not cfg_path.exists():
@@ -124,17 +140,20 @@ def main() -> None:
     split_manifest = resolve_split_manifest_path(cfg)
     indices = _select_indices(dataset, split_manifest, args.split)
     subset = Subset(dataset, indices)
+    batch_size = int(args.batch_size) if args.batch_size is not None else int(cfg.get("val_batch_size", 1))
+    num_workers = int(args.num_workers) if args.num_workers is not None else int(cfg.get("num_workers", 0))
     loader = DataLoader(
         subset,
-        batch_size=int(cfg.get("val_batch_size", 1)),
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=int(cfg.get("num_workers", 0)),
+        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         collate_fn=collate_consensus_batch,
     )
 
     run_out = Path(args.output_dir).resolve() / run_dir.name / args.split
     run_out.mkdir(parents=True, exist_ok=True)
+    per_graph_stats: list[dict[str, float | int | str]] = []
 
     with torch.inference_mode():
         for batch in tqdm(loader, desc="Build checkpoint graphs", unit="batch"):
@@ -153,8 +172,8 @@ def main() -> None:
                 sp = generate_slic_superpixels(
                     image_rgb=image_rgb,
                     tissue_mask=tissue_mask[i].numpy().astype(np.uint8),
-                    num_segments=args.num_segments,
-                    compactness=args.compactness,
+                    num_segments=num_segments,
+                    compactness=compactness,
                     sigma=args.sigma,
                 )
                 edge_index = build_touch_adjacency_edges(sp)
@@ -169,6 +188,22 @@ def main() -> None:
                     superpixels=sp,
                     seg_probs=probs[i].numpy().astype(np.float32),
                 )
+                feature_version = "v2" if x.shape[1] >= 22 else "v1"
+                valid_sp = sp[sp >= 0]
+                counts_sp = np.bincount(valid_sp) if valid_sp.size else np.zeros((0,), dtype=np.int64)
+                num_nodes = int(node_ids.shape[0])
+                edge_count_undirected = int(edge_index.shape[1] // 2)
+                tiny_count = int((counts_sp <= int(args.tiny_superpixel_max_pixels)).sum()) if counts_sp.size else 0
+                empty_or_degenerate = int((counts_sp <= 1).sum()) if counts_sp.size else 0
+                per_graph_stats.append(
+                    {
+                        "image_id": image_id,
+                        "num_nodes": num_nodes,
+                        "num_edges_undirected": edge_count_undirected,
+                        "tiny_superpixel_fraction": float(tiny_count / max(num_nodes, 1)),
+                        "empty_or_degenerate_superpixel_fraction": float(empty_or_degenerate / max(num_nodes, 1)),
+                    }
+                )
 
                 out_dir = run_out / image_id
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +217,44 @@ def main() -> None:
                     superpixels=sp.astype(np.int32),
                 )
 
+    counts = {"benign": 0, "g3": 0, "g4": 0, "g5": 0}
+    supervised = 0
+    invalid = 0
+    isolated = 0
+    feature_dim = None
+    for graph_path in sorted(run_out.glob("*/graph_data.npz")):
+        d = np.load(graph_path)
+        y = d["y"].astype(np.int64)
+        tm = d["train_mask"].astype(np.bool_)
+        ei = d["edge_index"]
+        x = d["x"]
+        feature_dim = int(x.shape[1])
+        for i,k in enumerate(["benign","g3","g4","g5"]):
+            counts[k] += int((y == i).sum())
+        supervised += int(tm.sum())
+        invalid += int(((y < 0) | (y > 3)).sum())
+        deg = np.zeros((x.shape[0],), dtype=np.int64)
+        if ei.size:
+            deg += np.bincount(ei[0], minlength=x.shape[0])
+        isolated += int((deg == 0).sum())
+
+    node_counts = np.array([int(r["num_nodes"]) for r in per_graph_stats], dtype=np.int64)
+    edge_counts = np.array([int(r["num_edges_undirected"]) for r in per_graph_stats], dtype=np.int64)
+    tiny_fracs = np.array([float(r["tiny_superpixel_fraction"]) for r in per_graph_stats], dtype=np.float32)
+    deg_fracs = np.array([float(r["empty_or_degenerate_superpixel_fraction"]) for r in per_graph_stats], dtype=np.float32)
+
+    def _dist(values: np.ndarray) -> dict[str, float]:
+        if values.size == 0:
+            return {"mean": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+        return {
+            "mean": float(np.mean(values)),
+            "median": float(np.median(values)),
+            "p10": float(np.percentile(values, 10)),
+            "p90": float(np.percentile(values, 90)),
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+        }
+
     meta = {
         "run_dir": str(run_dir),
         "checkpoint": str(ckpt_path),
@@ -189,6 +262,42 @@ def main() -> None:
         "num_images": int(len(indices)),
         "output_dir": str(run_out),
         "uses_model_predictions": True,
+        "feature_version": "v2" if (feature_dim or 0) >= 22 else "v1",
+        "feature_dim": feature_dim,
+        "feature_index_map": {
+            "legacy_prob_slice": [9, 13],
+        },
+        "build_args": {
+            "num_segments": num_segments,
+            "compactness": compactness,
+            "sigma": args.sigma,
+            "min_majority_fraction": args.min_majority_fraction,
+            "superpixel_preset": args.superpixel_preset,
+            "tiny_superpixel_max_pixels": int(args.tiny_superpixel_max_pixels),
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+        },
+        "superpixel_params": {
+            "num_segments": num_segments,
+            "compactness": compactness,
+            "sigma": args.sigma,
+            "preset": args.superpixel_preset,
+        },
+        "superpixel_quality": {
+            "tiny_superpixel_fraction_distribution": _dist(tiny_fracs),
+            "empty_or_degenerate_superpixel_fraction_distribution": _dist(deg_fracs),
+            "per_graph": per_graph_stats,
+        },
+        "graph_size_distribution": {
+            "node_count": _dist(node_counts),
+            "edge_count_undirected": _dist(edge_counts),
+        },
+        "validation_report": {
+            "class_counts": counts,
+            "supervised_nodes": supervised,
+            "invalid_labels": invalid,
+            "isolated_nodes": isolated,
+        },
     }
     with (run_out / "build_metadata.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -199,4 +308,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

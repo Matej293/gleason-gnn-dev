@@ -63,6 +63,39 @@ Outputs are saved to:
 outputs/graphs/<run_name>/<split>/<image_id>/graph_data.npz
 ```
 
+## Train GNN Node Classifier
+
+Install PyTorch Geometric (PyG) with a wheel that matches your Torch/CUDA build.
+Example (adjust the `cu*` selector to your local torch wheel):
+
+```bash
+pip install torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+```
+
+Train a GNN baseline on prepared graph splits (`mlp`, `graphsage`, `gcn`, `gat`):
+
+```bash
+PYTHONPATH=. python scripts/train_gnn_node_classifier.py \
+  --graphs-root outputs/graphs/<run_name> \
+  --model graphsage
+```
+
+Run baseline comparison (`seg_only`, `mlp`, `graphsage`, `gcn`, `gat`):
+
+```bash
+PYTHONPATH=. python scripts/eval_gnn_baselines.py \
+  --graphs-root outputs/graphs/<run_name>
+```
+
+Compare + visualize baselines:
+
+```bash
+make gnn-eval GNN_GRAPHS_ROOT=outputs/graphs/<run_name>
+make gnn-compare-viz \
+  GNN_COMPARISON_DIR=outputs/gnn_runs/<timestamp>_baseline_comparison \
+  GNN_GRAPHS_ROOT=outputs/graphs/<run_name>
+```
+
 ## Fast Class Distribution Count (Train Split)
 
 Use this to count class pixels/images from `consensus_hard_mask.png` for `train_image_ids`
