@@ -15,6 +15,7 @@ class GraphSample:
     y: torch.Tensor
     supervision_mask: torch.Tensor
     eval_mask: torch.Tensor
+    raw_seg_probs: torch.Tensor | None = None
 
 
 REQUIRED_KEYS = ("node_ids", "x", "edge_index", "y", "train_mask")
@@ -54,6 +55,9 @@ def _load_graph_npz(path: Path, split: str) -> GraphSample:
     valid_class = (y >= 0) & (y <= 3)
     supervision = train_mask & valid_class if split == "train" else valid_class
     eval_mask = valid_class
+    raw_seg_probs = None
+    if x.shape[1] >= 13:
+        raw_seg_probs = torch.from_numpy(x[:, 9:13].copy())
 
     return GraphSample(
         image_id=path.parent.name,
@@ -62,6 +66,7 @@ def _load_graph_npz(path: Path, split: str) -> GraphSample:
         y=torch.from_numpy(y),
         supervision_mask=torch.from_numpy(supervision),
         eval_mask=torch.from_numpy(eval_mask),
+        raw_seg_probs=raw_seg_probs,
     )
 
 

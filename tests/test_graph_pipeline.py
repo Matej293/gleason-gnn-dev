@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.graph_pipeline.graph_build import build_touch_adjacency_edges
+from src.graph_pipeline.graph_build import build_edges, build_touch_adjacency_edges
 from src.graph_pipeline.node_features import compute_node_features
 from src.graph_pipeline.node_labels import assign_majority_node_labels
 
@@ -59,6 +59,38 @@ def test_compute_node_features_shape() -> None:
     node_ids, feats = compute_node_features(img, sp, probs)
     assert node_ids.tolist() == [0, 1, 2, 3]
     assert feats.shape == (4, 22)
+
+
+def test_compute_node_features_neighbor_contrast_uses_adjacent_nodes() -> None:
+    img = np.zeros((3, 3, 3), dtype=np.uint8)
+    sp = np.array(
+        [
+            [0, 0, 1],
+            [0, 2, 1],
+            [2, 2, 1],
+        ],
+        dtype=np.int32,
+    )
+    probs = np.zeros((4, 3, 3), dtype=np.float32)
+    probs[:, :, :] = np.array([0.1, 0.8, 0.1, 0.0], dtype=np.float32)[:, None, None]
+    probs[:, sp == 0] = np.array([0.9, 0.1, 0.0, 0.0], dtype=np.float32)[:, None]
+    probs[:, sp == 1] = np.array([0.0, 0.9, 0.1, 0.0], dtype=np.float32)[:, None]
+    probs[:, sp == 2] = np.array([0.0, 0.1, 0.9, 0.0], dtype=np.float32)[:, None]
+    node_ids, feats = compute_node_features(img, sp, probs)
+    id_to_row = {int(n): i for i, n in enumerate(node_ids.tolist())}
+    contrast_idx = 19
+    # Node 0 neighbors are {1,2}; contrast should be finite positive and bounded.
+    assert feats[id_to_row[0], contrast_idx] > 0.0
+    assert np.isfinite(feats[id_to_row[0], contrast_idx])
+
+
+def test_build_edges_touch_plus_knn_superset_of_touch() -> None:
+    sp = np.array([[0, 0, 1], [0, 2, 2]], dtype=np.int32)
+    touch = build_edges(sp, policy="touch")
+    hybrid = build_edges(sp, policy="touch_plus_knn", knn_k=1)
+    touch_set = set((int(a), int(b)) for a, b in touch.T.tolist())
+    hybrid_set = set((int(a), int(b)) for a, b in hybrid.T.tolist())
+    assert touch_set.issubset(hybrid_set)
 
 
 def test_superpixel_preset_resolution() -> None:

@@ -16,7 +16,7 @@ from src.eval_utils import collate_consensus_batch, resolve_split_manifest_path,
 from src.gleason_consensus_dataset import GleasonConsensusDataset
 from src.graph_pipeline import (
     assign_majority_node_labels,
-    build_touch_adjacency_edges,
+    build_edges,
     compute_node_features,
     generate_slic_superpixels,
 )
@@ -54,10 +54,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compactness", type=float, default=10.0)
     p.add_argument("--superpixel-preset", choices=["low", "med", "high"], default=None)
     p.add_argument("--sigma", type=float, default=1.0)
+    p.add_argument("--edge-policy", choices=["touch", "knn", "touch_plus_knn"], default="touch")
+    p.add_argument("--edge-knn-k", type=int, default=2)
+    p.add_argument("--edge-knn-max-distance", type=float, default=0.0, help="0 disables distance threshold.")
     p.add_argument("--min-majority-fraction", type=float, default=0.6)
     p.add_argument("--tiny-superpixel-max-pixels", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=None, help="Override loader batch size.")
     p.add_argument("--num-workers", type=int, default=None, help="Override loader worker count.")
+    p.add_argument(
+        "--min-supervised-ratio",
+        type=float,
+        default=0.01,
+        help="Fail build if supervised node ratio falls below this threshold.",
+    )
     return p.parse_args()
 
 
@@ -189,7 +198,12 @@ def main() -> None:
                     compactness=compactness,
                     sigma=args.sigma,
                 )
-                edge_index = build_touch_adjacency_edges(sp)
+                edge_index = build_edges(
+                    sp,
+                    policy=args.edge_policy,
+                    knn_k=int(args.edge_knn_k),
+                    knn_max_distance=None if float(args.edge_knn_max_distance) <= 0.0 else float(args.edge_knn_max_distance),
+                )
                 y, train_mask = assign_majority_node_labels(
                     superpixels=sp,
                     hard_mask=hard_mask[i].numpy().astype(np.int64),
@@ -231,7 +245,9 @@ def main() -> None:
                 )
 
     counts = {"benign": 0, "g3": 0, "g4": 0, "g5": 0}
+    supervised_counts = {"benign": 0, "g3": 0, "g4": 0, "g5": 0}
     supervised = 0
+    total_nodes = 0
     invalid = 0
     isolated = 0
     feature_dim = None
@@ -244,7 +260,9 @@ def main() -> None:
         feature_dim = int(x.shape[1])
         for i,k in enumerate(["benign","g3","g4","g5"]):
             counts[k] += int((y == i).sum())
+            supervised_counts[k] += int(((y == i) & tm).sum())
         supervised += int(tm.sum())
+        total_nodes += int(y.shape[0])
         invalid += int(((y < 0) | (y > 3)).sum())
         deg = np.zeros((x.shape[0],), dtype=np.int64)
         if ei.size:
@@ -289,12 +307,20 @@ def main() -> None:
             "tiny_superpixel_max_pixels": int(args.tiny_superpixel_max_pixels),
             "batch_size": batch_size,
             "num_workers": num_workers,
+            "edge_policy": args.edge_policy,
+            "edge_knn_k": int(args.edge_knn_k),
+            "edge_knn_max_distance": float(args.edge_knn_max_distance),
         },
         "superpixel_params": {
             "num_segments": num_segments,
             "compactness": compactness,
             "sigma": args.sigma,
             "preset": args.superpixel_preset,
+        },
+        "graph_params": {
+            "edge_policy": args.edge_policy,
+            "edge_knn_k": int(args.edge_knn_k),
+            "edge_knn_max_distance": float(args.edge_knn_max_distance),
         },
         "superpixel_quality": {
             "tiny_superpixel_fraction_distribution": _dist(tiny_fracs),
@@ -307,11 +333,18 @@ def main() -> None:
         },
         "validation_report": {
             "class_counts": counts,
+            "supervised_class_counts": supervised_counts,
             "supervised_nodes": supervised,
+            "total_nodes": total_nodes,
+            "supervised_node_ratio": float(supervised / max(total_nodes, 1)),
             "invalid_labels": invalid,
             "isolated_nodes": isolated,
         },
     }
+    if float(supervised / max(total_nodes, 1)) < float(args.min_supervised_ratio):
+        raise RuntimeError(
+            f"Supervised node ratio too low: {float(supervised / max(total_nodes, 1)):.4f} < {float(args.min_supervised_ratio):.4f}"
+        )
     with (run_out / "build_metadata.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
         f.write("\n")

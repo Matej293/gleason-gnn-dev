@@ -21,6 +21,28 @@ def _boundary_touch_ratio(mask: np.ndarray) -> float:
     return float((mask & boundary).sum()) / total
 
 
+def _adjacent_nodes(superpixels: np.ndarray) -> dict[int, set[int]]:
+    node_ids = np.unique(superpixels)
+    node_ids = node_ids[node_ids >= 0]
+    adj: dict[int, set[int]] = {int(n): set() for n in node_ids.tolist()}
+    h, w = superpixels.shape
+
+    def _add(a: int, b: int) -> None:
+        if a < 0 or b < 0 or a == b:
+            return
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    for y in range(h):
+        for x in range(w):
+            src = int(superpixels[y, x])
+            if x + 1 < w:
+                _add(src, int(superpixels[y, x + 1]))
+            if y + 1 < h:
+                _add(src, int(superpixels[y + 1, x]))
+    return adj
+
+
 def compute_node_features(image_rgb: np.ndarray, superpixels: np.ndarray, seg_probs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
         raise ValueError("Expected image_rgb [H, W, 3].")
@@ -43,6 +65,7 @@ def compute_node_features(image_rgb: np.ndarray, superpixels: np.ndarray, seg_pr
             prob_mean_by_node[int(node_id)] = seg_probs[:, m].mean(axis=1).astype(np.float32)
             masks_by_node[int(node_id)] = m
 
+    adjacency = _adjacent_nodes(superpixels)
     features: list[np.ndarray] = []
     for node_id in node_ids.tolist():
         m = masks_by_node.get(int(node_id))
@@ -63,8 +86,7 @@ def compute_node_features(image_rgb: np.ndarray, superpixels: np.ndarray, seg_pr
         margin = float(top2[-1] - top2[-2])
         entropy = _safe_entropy(mean_probs)
 
-        neighbors = np.unique(superpixels[np.pad(m, 1, mode="constant")[1:-1, 1:-1] == 0])
-        neighbors = neighbors[(neighbors >= 0) & (neighbors != node_id)]
+        neighbors = np.asarray(sorted(adjacency.get(int(node_id), set())), dtype=np.int64)
         if neighbors.size > 0:
             nmean = np.stack([prob_mean_by_node.get(int(n), mean_probs) for n in neighbors.tolist()], axis=0).mean(axis=0)
             contrast = float(np.mean(np.abs(mean_probs - nmean)))

@@ -9,6 +9,8 @@ NUM_CLASSES = 4
 
 
 def json_safe(value: object) -> object:
+    if isinstance(value, bool):
+        return value
     if isinstance(value, dict):
         return {k: json_safe(v) for k, v in value.items()}
     if isinstance(value, list):

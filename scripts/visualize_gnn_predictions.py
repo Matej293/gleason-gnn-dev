@@ -72,45 +72,55 @@ def _build_model_from_metadata(meta: dict) -> torch.nn.Module:
     dropout = float(meta["dropout"])
     feature_dropout = float(meta.get("feature_dropout", 0.0))
     residual_head = bool(meta.get("residual_head", False))
+    residual_alpha = float(meta.get("residual_alpha", 0.2))
     seg_prob_idx = _seg_prob_idx_from_meta(meta)
 
     if model_name == "mlp":
-        return NodeMLP(
+        model = NodeMLP(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
             feature_dropout=feature_dropout,
             residual_head=residual_head,
+            residual_alpha=residual_alpha,
             seg_prob_idx=seg_prob_idx,
         )
-    if model_name == "graphsage":
-        return GraphSAGENet(
+    elif model_name == "graphsage":
+        model = GraphSAGENet(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
             feature_dropout=feature_dropout,
             residual_head=residual_head,
+            residual_alpha=residual_alpha,
             seg_prob_idx=seg_prob_idx,
         )
-    if model_name == "gcn":
-        return GCNNet(
+    elif model_name == "gcn":
+        model = GCNNet(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
             feature_dropout=feature_dropout,
             residual_head=residual_head,
+            residual_alpha=residual_alpha,
             seg_prob_idx=seg_prob_idx,
         )
-    if model_name == "gat":
-        return GATNet(
+    elif model_name == "gat":
+        model = GATNet(
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
             feature_dropout=feature_dropout,
             residual_head=residual_head,
+            residual_alpha=residual_alpha,
             seg_prob_idx=seg_prob_idx,
         )
-    raise ValueError(f"Unsupported model type in checkpoint: {model_name}")
+    else:
+        raise ValueError(f"Unsupported model type in checkpoint: {model_name}")
+    uses_raw = bool(meta.get("residual_uses_raw_seg_probs", False))
+    setattr(model, "residual_uses_raw_seg_probs", uses_raw)
+    setattr(model, "allow_legacy_normalized_residual", not uses_raw)
+    return model
 
 
 def _resolve_norm_stats(ckpt: dict, run_cfg: dict) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -412,7 +422,11 @@ def main() -> None:
         y_true = y[valid]
 
         with torch.no_grad():
-            logits = model(x, edge_index)
+            raw_seg = None
+            if bool(getattr(model, "residual_uses_raw_seg_probs", False)):
+                seg_start, seg_end = getattr(model, "seg_prob_idx", (9, 13))
+                raw_seg = x_raw[:, int(seg_start) : int(seg_end)]
+            logits = model(x, edge_index, raw_seg_probs=raw_seg)
             pred_model = torch.argmax(logits, dim=1).cpu().numpy().astype(np.int64)
         pred_seg = seg_only_predict(x_raw).cpu().numpy().astype(np.int64)
 

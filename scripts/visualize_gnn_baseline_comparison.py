@@ -125,6 +125,7 @@ def _build_model_from_metadata(meta: dict) -> torch.nn.Module:
     dropout = float(meta["dropout"])
     feature_dropout = float(meta.get("feature_dropout", 0.0))
     residual_head = bool(meta.get("residual_head", False))
+    residual_alpha = float(meta.get("residual_alpha", 0.2))
     seg_prob_idx = _seg_prob_idx_from_meta(meta)
     kwargs = dict(
         in_dim=in_dim,
@@ -132,17 +133,23 @@ def _build_model_from_metadata(meta: dict) -> torch.nn.Module:
         dropout=dropout,
         feature_dropout=feature_dropout,
         residual_head=residual_head,
+        residual_alpha=residual_alpha,
         seg_prob_idx=seg_prob_idx,
     )
     if model_name == "mlp":
-        return NodeMLP(**kwargs)
-    if model_name == "graphsage":
-        return GraphSAGENet(**kwargs)
-    if model_name == "gcn":
-        return GCNNet(**kwargs)
-    if model_name == "gat":
-        return GATNet(**kwargs)
-    raise ValueError(f"Unsupported model type in checkpoint: {model_name}")
+        model = NodeMLP(**kwargs)
+    elif model_name == "graphsage":
+        model = GraphSAGENet(**kwargs)
+    elif model_name == "gcn":
+        model = GCNNet(**kwargs)
+    elif model_name == "gat":
+        model = GATNet(**kwargs)
+    else:
+        raise ValueError(f"Unsupported model type in checkpoint: {model_name}")
+    uses_raw = bool(meta.get("residual_uses_raw_seg_probs", False))
+    setattr(model, "residual_uses_raw_seg_probs", uses_raw)
+    setattr(model, "allow_legacy_normalized_residual", not uses_raw)
+    return model
 
 
 def _resolve_norm_stats(ckpt: dict, run_cfg: dict) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -477,7 +484,11 @@ def main() -> None:
             if artifact["normalize_features"]:
                 x = _apply_norm_x(x_raw, artifact["norm_mean"], artifact["norm_std"])
             with torch.no_grad():
-                logits = artifact["model"](x, edge_index)
+                raw_seg = None
+                if bool(getattr(artifact["model"], "residual_uses_raw_seg_probs", False)):
+                    seg_start, seg_end = getattr(artifact["model"], "seg_prob_idx", (9, 13))
+                    raw_seg = x_raw[:, int(seg_start) : int(seg_end)]
+                logits = artifact["model"](x, edge_index, raw_seg_probs=raw_seg)
                 preds[m] = torch.argmax(logits, dim=1).cpu().numpy().astype(np.int64)
 
         gt_map = _labels_to_map(d["superpixels"], node_ids, y)
