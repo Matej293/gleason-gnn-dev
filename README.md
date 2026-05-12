@@ -1,369 +1,40 @@
-# ProstateLesionSegmentation (Gleason Consensus Segmentation + Graph Prep)
+# ProstateLesionSegmentation
 
-This repository provides a pipeline for Gleason consensus segmentation and
-region-graph preparation:
+Segmentation and graph-preparation pipeline for the Gleason 2019 challenge dataset.
 
-- segmentation models: `deconver`, `unet_lite`, and `pspnet_gleason`
-- consensus-aware training/evaluation with tissue-based background ignore
-- superpixel graph artifact export for downstream GNN experiments
+## Scope
 
-## Install Dependencies
+This repository covers:
 
-Dependencies:
+- Segmentation training (`deconver`, `unet_lite`, `pspnet_gleason`)
+- Consensus label generation (STAPLE and weighted fusion)
+- Checkpoint evaluation (raw and postprocessed metrics)
+- Superpixel graph export
+- GNN baselines (`mlp`, `graphsage`, `gcn`, `gat`) and visualization
+
+## Repository structure
+
+- `src/`: training, datasets, model code, consensus, graph pipeline, GNN modules
+- `scripts/`: runnable CLI entry points
+- `configs/`: training/evaluation configs
+- `tests/`: `pytest` test suite
+- `data/`: dataset and consensus outputs (local only)
+- `outputs/`: training runs, graph artifacts, reports, visualizations
+
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Train
+## Dataset
 
-`deconver`:
+`data/` is not tracked in git.
 
-```bash
-PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
-```
+Register/download Gleason 2019 here:
+https://gleason2019.grand-challenge.org/Register/
 
-`unet_lite` (fast baseline):
-
-```bash
-PYTHONPATH=. python -m src.train_deconver --config configs/unet_lite_local.yaml
-```
-
-`pspnet_gleason` (winner-inspired PSPNet variant):
-
-```bash
-PYTHONPATH=. python -m src.train_deconver --config configs/pspnet_gleason_local.yaml
-```
-
-Training logs are written to Weights & Biases (W&B) per epoch.  
-Set `WANDB_API_KEY` for online logging, or set `wandb_mode: offline` in config for local-only logging.
-
-## Evaluate
-
-```bash
-PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
-```
-
-Evaluation JSON includes:
-
-- `aggregate_raw`: per-case mean metrics from raw argmax predictions
-- `aggregate_post`: per-case mean metrics after postprocessing
-- `aggregate`: alias of `aggregate_post` (backward compatibility)
-- `per_case`: both `raw_*` and `post_*` metrics per image
-
-## Smoke Test
-
-```bash
-PYTHONPATH=. python scripts/smoke_test.py
-```
-
-## Build Superpixel Graph Artifacts
-
-Create superpixel-based node/edge/feature artifacts for GNN training from
-model predictions (checkpoint-driven, thesis default):
-
-```bash
-PYTHONPATH=. python scripts/build_superpixel_graphs.py \
-  --run outputs/runs/<run_name> \
-  --split test
-```
-
-Example with a real UNet-lite run:
-
-```bash
-PYTHONPATH=. python scripts/build_superpixel_graphs.py \
-  --run outputs/runs/20260510_184849_unet_lite_consensus_local \
-  --split test
-```
-
-Outputs are saved to:
-
-```text
-outputs/graphs/<run_name>/<split>/<image_id>/graph_data.npz
-```
-
-## Train GNN Node Classifier
-
-PyTorch Geometric (PyG) is a required dependency and is installed via
-`requirements.txt`.
-
-Train a GNN baseline on prepared graph splits (`mlp`, `graphsage`, `gcn`, `gat`):
-
-```bash
-PYTHONPATH=. python scripts/train_gnn_node_classifier.py \
-  --graphs-root outputs/graphs/<run_name> \
-  --model graphsage
-```
-
-Run baseline comparison (`seg_only`, `mlp`, `graphsage`, `gcn`, `gat`):
-
-```bash
-PYTHONPATH=. python scripts/eval_gnn_baselines.py \
-  --graphs-root outputs/graphs/<run_name>
-```
-
-Compare + visualize baselines:
-
-```bash
-make gnn-eval GNN_GRAPHS_ROOT=outputs/graphs/<run_name>
-make gnn-compare-viz \
-  GNN_COMPARISON_DIR=outputs/gnn_runs/<timestamp>_baseline_comparison \
-  GNN_GRAPHS_ROOT=outputs/graphs/<run_name>
-```
-
-## Fast Class Distribution Count (Train Split)
-
-Use this to count class pixels/images from `consensus_hard_mask.png` for `train_image_ids`
-from your split manifest (fast scan, no dataset transform overhead).
-
-```bash
-PYTHONPATH=. python scripts/count_class_distribution_fast.py --config configs/deconver_local.yaml
-```
-
-Output includes:
-
-- `Pixel counts`: total pixels per class across the train split
-- `Pixel fractions`: normalized class frequency
-- `Images containing class`: how many train images contain each class
-- `Missing hard masks`: train IDs that did not have a mask file
-
-## Regenerate Consensus Data
-
-```bash
-PYTHONPATH=. python scripts/build_consensus.py --dataset-root data --output-root data/consensus
-```
-
-Weighted-fusion example (new):
-
-```bash
-PYTHONPATH=. python scripts/build_consensus.py \
-  --dataset-root data \
-  --output-root data/consensus \
-  --consensus-fusion-mode weighted \
-  --target-ignore-tissue-frac 0.05 \
-  --target-ignore-total-frac 0.12 \
-  --ignore-threshold-min 0.05 \
-  --ignore-threshold-max 0.35 \
-  --auto-calibrate-ignore-threshold \
-  --boundary-dilate-px 1 \
-  --edge-smooth-open-px 0 \
-  --edge-smooth-close-px 1 \
-  --remove-small-islands-px 64 \
-  --fill-small-holes-px 64 \
-  --single-rater-ignore-policy confidence_mask \
-  --disable-gpu \
-  --workers 8
-```
-
-Make target:
-
-```bash
-make consensus-weighted
-```
-
-Background-ignore audit:
-
-```bash
-make audit-background-ignore
-```
-
-This writes:
-
-```text
-outputs/background_ignore_audit.json
-```
-
-This runs the vendored STAPLE consensus builder and writes outputs to:
-
-```text
-data/consensus/<image_id>/
-  consensus_probs_compact.npz
-  consensus_hard_mask.png
-  ignore_mask.png
-  qc_report.json
-```
-
-## Tests
-
-```bash
-PYTHONPATH=. pytest -q tests
-```
-
-## Metrics Tracked
-
-The training and evaluation pipeline now tracks the following metrics.
-
-| Metric | Where tracked | Meaning |
-|---|---|---|
-| `train/loss` | Train | Total training loss (`lambda_soft * soft_loss + lambda_dice * hard_term`) |
-| `train/soft_loss` | Train | Soft-label term (CE/KL or focal variant depending on `loss_variant`) |
-| `train/hard_dice_loss` | Train | Hard supervision overlap loss term (Dice/Tversky path) |
-| `train/valid_pixel_fraction` | Train | Fraction of non-ignored pixels used for supervision |
-| `train/lr` | Train | Learning rate per epoch |
-| `val/loss` | Validation | Total validation loss |
-| `val_raw/*` | Validation | Metrics on raw argmax predictions |
-| `val_post/*` | Validation | Metrics after postprocessing |
-| `val/composite_score` | Validation | Checkpoint ranking score from selected source (`raw` or `post`) |
-| `mean_loo_dice_multiclass` | Eval summary (when enabled) | Mean leave-one-rater-out Dice from `qc_report.json` |
-| `num_loo_entries` | Eval summary (when enabled) | Number of LOO entries used in that mean |
-
-Notes:
-
-- Validation metrics are logged as per-case means (not batch means) during training and evaluation.
-- LOO aggregate metrics are included when `eval_leave_one_rater_out: true`.
-
-## New Consensus/Training Options (4-class upgrade)
-
-### Consensus builder
-
-- `consensus_fusion_mode`: `staple_unweighted` (baseline) or `weighted` (uses `weights_per_pathologist`)
-- `ignore_threshold_loose`, `ignore_threshold_strict`: confidence threshold used to build `ignore_mask.png`
-- `target_ignore_tissue_frac`, `target_ignore_total_frac`: per-image ignore targets for auto-calibration
-- `ignore_threshold_min`, `ignore_threshold_max`: calibration bounds
-- `auto_calibrate_ignore_threshold`: lower threshold per image to reduce excessive ignore
-- `boundary_dilate_px`, `edge_smooth_open_px`, `edge_smooth_close_px`, `remove_small_islands_px`, `fill_small_holes_px`: edge/refinement controls
-- `single_rater_ignore_policy`: `confidence_mask` (default) or `all_ignore`
-
-`qc_report.json` now includes:
-
-- `consensus_fusion.effective_fusion_mode`
-- `consensus_fusion.used_weights_per_pathologist`
-- `consensus_fusion.ignore_threshold_used` (when applicable)
-- `consensus_fusion.ignored_total_fraction`
-- `consensus_fusion.ignored_tissue_fraction`
-- `consensus_fusion.ignored_boundary_fraction`
-- `consensus_fusion.boundary_length_before_refine` / `boundary_length_after_refine`
-- `consensus_fusion.small_component_count_before_refine` / `small_component_count_after_refine`
-- `consensus_fusion.excessive_tissue_ignore`
-- `final_thresholds_used.ignore_confidence_threshold`
-
-### Training/evaluation config
-
-- `class_loss_weights`: per-class weights `[benign, G3, G4, G5]`  
-  (`class_weights` is still supported for backward compatibility)
-- `loss_variant`: `soft_dice` (default), `focal_dice`, or `tversky_dice`
-- `eval_leave_one_rater_out`: when `true`, logs/reports LOO-consensus diagnostics
-- `enforce_background_ignore`: defaults to `true`; forces non-tissue pixels to ignore during dataset loading
-
-### Loss Computation (Important)
-
-The total training loss is:
-
-```text
-total_loss = lambda_soft * soft_term + lambda_dice * hard_overlap_term
-```
-
-Where:
-
-- `soft_dice`:
-  - `soft_term` = soft-label CE (`soft_label_loss: ce`) or KL (`soft_label_loss: kl`) vs STAPLE probabilities
-  - `hard_overlap_term` = Dice loss
-- `tversky_dice`:
-  - same soft-label term as above
-  - hard term uses Tversky loss (`alpha=0.3`, `beta=0.7`)
-- `focal_dice`:
-  - `soft_term` is replaced by hard-label focal CE (with class weights)
-  - this variant does **not** use soft-label CE/KL
-
-Additional details:
-
-- `use_confidence_mask` + `confidence_threshold` excludes low-consensus pixels from both terms.
-- `exclude_absent_classes_in_dice_loss` prevents absent classes from contributing to hard overlap loss.
-
-### Tissue/background handling in training
-
-The model is trained on 4 tissue classes (`benign`, `G3`, `G4`, `G5`). Background is not a fifth class.
-
-During dataset loading, tissue/background is estimated from RGB via Otsu + morphology. With
-`enforce_background_ignore: true` (default), all detected non-tissue pixels are forced to `ignore=1`
-before loss computation. This prevents accidental supervision on whitespace/background even if stored
-`ignore_mask.png` does not fully cover it.
-
-Important: this safety check validates consistency with loader-derived tissue/background, not pathology
-ground-truth background labels.
-
-## How To Run The New Changes
-
-1. Build consensus with weighted fusion.
-
-```bash
-make consensus-weighted
-```
-
-Equivalent raw command:
-
-```bash
-PYTHONPATH=. python scripts/build_consensus.py \
-  --dataset-root data \
-  --output-root data/consensus \
-  --consensus-fusion-mode weighted \
-  --target-ignore-tissue-frac 0.05 \
-  --target-ignore-total-frac 0.12 \
-  --ignore-threshold-min 0.05 \
-  --ignore-threshold-max 0.35 \
-  --auto-calibrate-ignore-threshold \
-  --boundary-dilate-px 1 \
-  --edge-smooth-open-px 0 \
-  --edge-smooth-close-px 1 \
-  --remove-small-islands-px 64 \
-  --fill-small-holes-px 64 \
-  --single-rater-ignore-policy confidence_mask \
-  --disable-gpu \
-  --workers 8
-```
-
-1. Audit background-ignore safety (recommended before training).
-
-```bash
-make audit-background-ignore
-```
-
-Read `outputs/background_ignore_audit.json`:
-
-- `bg_not_ignored_*`: background leakage after `enforce_background_ignore` cleanup (should be near zero)
-- `tissue_ignored_*`: how much tissue is ignored after cleanup
-
-1. Train with upgraded loss controls (edit config first).
-
-```yaml
-# configs/deconver_local.yaml
-loss_variant: focal_dice
-class_loss_weights: [1.0, 1.2, 1.2, 2.5]
-eval_leave_one_rater_out: true
-```
-
-```bash
-PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
-```
-
-1. Evaluate checkpoint (includes raw/post per-case and aggregate summaries).
-
-```bash
-PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
-```
-
-1. Build superpixel graph artifacts for GNN-stage experiments.
-
-```bash
-PYTHONPATH=. python scripts/build_superpixel_graphs.py \
-  --run outputs/runs/<run_name> \
-  --split test
-```
-
-## Configs
-
-- `configs/deconver.yaml`
-- `configs/deconver_local.yaml`
-- `configs/unet_lite_local.yaml`
-- `configs/pspnet_gleason_local.yaml`
-
-All provided local configs are set up for TITAN V / Volta compatibility:
-
-- `use_amp: true`
-- `amp_dtype: fp16`
-- `use_compile`: model/config dependent (`deconver` default false, `unet_lite` fast config true)
-
-## Expected data layout
+Expected layout:
 
 ```text
 data/
@@ -376,5 +47,167 @@ data/
       consensus_probs_compact.npz
       consensus_hard_mask.png
       ignore_mask.png
-      qc_report.json (optional)
+      qc_report.json
+```
+
+## Segmentation pipeline
+
+1. Build consensus labels.
+
+```bash
+make consensus-weighted
+# baseline alternative:
+# make consensus
+```
+
+2. Optional sanity check for tissue/background ignore handling.
+
+```bash
+make audit-background-ignore
+```
+
+3. Train one segmentation model.
+
+```bash
+# deconver
+make train CONFIG=configs/deconver_local.yaml
+
+# unet_lite
+make train CONFIG=configs/unet_lite_local.yaml
+
+# pspnet_gleason
+make train CONFIG=configs/pspnet_gleason_local.yaml
+```
+
+4. Evaluate the segmentation run.
+
+```bash
+make eval RUN=outputs/runs/<run_name>
+```
+
+5. Run segmentation sanity checks.
+
+```bash
+make smoke
+make test
+```
+
+Segmentation outputs:
+
+- Trained runs are stored under `outputs/runs/<run_name>/`
+- Use that `<run_name>` as input to the GNN pipeline
+
+## GNN pipeline
+
+1. Export graph artifacts from a completed segmentation run.
+
+```bash
+make gnn-build-all RUN=outputs/runs/<run_name>
+# split-specific alternative:
+# make gnn-build RUN=outputs/runs/<run_name> SPLIT=train|val|test
+```
+
+2. Run GNN baseline evaluation.
+
+```bash
+make gnn-eval GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>
+```
+
+3. Train GNN models.
+
+```bash
+# single model
+make gnn-train GNN_GRAPHS_ROOT=outputs/graphs/<graph_run> GNN_MODEL=graphsage
+
+# full set: mlp, graphsage, gcn, gat
+make gnn-train-all GNN_GRAPHS_ROOT=outputs/graphs/<graph_run> GNN_TRAIN_NAME=thesis
+```
+
+4. Visualize predictions and model comparisons.
+
+```bash
+make gnn-viz GNN_GRAPHS_ROOT=outputs/graphs/<graph_run> GNN_RUN_DIR=outputs/gnn_runs/<run_dir>
+make gnn-viz-best GNN_GRAPHS_ROOT=outputs/graphs/<graph_run> GNN_TRAIN_NAME=thesis
+make gnn-compare-viz GNN_COMPARISON_DIR=outputs/gnn_runs/<comparison_dir> GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>
+```
+
+Conventions:
+
+- `<run_name>`: segmentation run folder under `outputs/runs/`
+- `<graph_run>`: graph folder under `outputs/graphs/`, typically derived from `<run_name>`
+
+## Core Make targets
+
+```bash
+make help
+make train CONFIG=configs/deconver_local.yaml
+make eval RUN=outputs/runs/<run_name>
+make consensus
+make consensus-weighted
+make gnn-build RUN=outputs/runs/<run_name> SPLIT=test
+make gnn-eval GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>
+```
+
+## CLI equivalents
+
+```bash
+PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
+PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
+PYTHONPATH=. python scripts/build_superpixel_graphs.py --run outputs/runs/<run_name> --split test
+PYTHONPATH=. python scripts/train_gnn_node_classifier.py --graphs-root outputs/graphs/<graph_run> --model graphsage
+PYTHONPATH=. python scripts/eval_gnn_baselines.py --graphs-root outputs/graphs/<graph_run>
+```
+
+## Evaluation output
+
+`evaluate_checkpoint.py` writes summary JSON with:
+
+- `aggregate_raw`: per-case means from raw argmax predictions
+- `aggregate_post`: per-case means after postprocessing
+- `aggregate`: alias of `aggregate_post` (compatibility)
+- `per_case`: per-image raw and post metrics
+
+## Consensus and training notes
+
+Weighted consensus entry point:
+
+```bash
+PYTHONPATH=. python scripts/build_consensus.py \
+  --dataset-root data \
+  --output-root data/consensus \
+  --consensus-fusion-mode weighted
+```
+
+Useful config keys:
+
+- `consensus_fusion_mode`: `staple_unweighted` or `weighted`
+- `auto_calibrate_ignore_threshold`
+- `single_rater_ignore_policy`: `confidence_mask` or `all_ignore`
+- `enforce_background_ignore`
+
+Training uses 4 tissue classes: `benign`, `G3`, `G4`, `G5` (background excluded).
+
+Loss form:
+
+```text
+total_loss = lambda_soft * soft_term + lambda_dice * hard_overlap_term
+```
+
+Supported variants:
+
+- `soft_dice`
+- `tversky_dice` (`alpha=0.3`, `beta=0.7`)
+- `focal_dice`
+
+## Weights & Biases
+
+- Set `WANDB_API_KEY` for online logging
+- Use offline mode in config when needed
+- Keep local `wandb/` directory untracked
+
+## Testing
+
+```bash
+PYTHONPATH=. pytest -q tests
+pytest -q tests/test_graph_pipeline.py
 ```
