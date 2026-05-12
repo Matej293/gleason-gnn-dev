@@ -40,6 +40,12 @@ GNN_EDGE_POLICY ?= touch
 GNN_EDGE_KNN_K ?= 2
 GNN_EDGE_KNN_MAX_DISTANCE ?= 0
 GNN_PARITY_CHECK ?= on
+GNN_LOG_WANDB ?= 1
+GNN_WANDB_PROJECT ?= prostate-lesion-segmentation
+GNN_WANDB_ENTITY ?=
+GNN_WANDB_RUN_NAME ?=
+GNN_WANDB_TAGS ?=
+GNN_WANDB_LOG_MAX_CASE_IMAGES ?= 24
 
 help:
 	@echo "Targets:"
@@ -190,4 +196,10 @@ gnn-compare-viz:
 		--gnn-runs-root $(GNN_RUNS_ROOT) \
 		--split $(GNN_VIZ_SPLIT) \
 		--max-cases $(GNN_MAX_CASES) \
-		--seed $(GNN_SEED)
+		--seed $(GNN_SEED) \
+		$(if $(filter 1 true on yes,$(GNN_LOG_WANDB)),--log-wandb,--no-log-wandb) \
+		--wandb-project "$(GNN_WANDB_PROJECT)" \
+		--wandb-log-max-case-images $(GNN_WANDB_LOG_MAX_CASE_IMAGES) \
+		$(if $(GNN_WANDB_ENTITY),--wandb-entity "$(GNN_WANDB_ENTITY)",) \
+		$(if $(GNN_WANDB_RUN_NAME),--wandb-run-name "$(GNN_WANDB_RUN_NAME)",) \
+		$(if $(GNN_WANDB_TAGS),--wandb-tags $(GNN_WANDB_TAGS),)

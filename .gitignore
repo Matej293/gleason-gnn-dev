@@ -2,6 +2,7 @@
 data/
 outputs/
 cache/
+wandb/
 
 # Python runtime/build artifacts
 __pycache__/

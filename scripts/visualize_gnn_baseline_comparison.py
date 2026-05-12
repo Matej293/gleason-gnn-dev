@@ -5,6 +5,7 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,6 +39,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-cases", default=12, type=int)
     p.add_argument("--seed", default=42, type=int)
     p.add_argument("--models", nargs="+", default=None)
+    p.add_argument("--log-wandb", dest="log_wandb", action="store_true")
+    p.add_argument("--no-log-wandb", dest="log_wandb", action="store_false")
+    p.set_defaults(log_wandb=True)
+    p.add_argument("--wandb-project", default="prostate-lesion-segmentation", type=str)
+    p.add_argument("--wandb-entity", default=None, type=str)
+    p.add_argument("--wandb-run-name", default=None, type=str)
+    p.add_argument("--wandb-tags", nargs="+", default=None)
+    p.add_argument("--wandb-log-max-case-images", default=24, type=int)
     return p.parse_args()
 
 
@@ -407,6 +416,74 @@ def _choose_cases(case_ids: list[str], per_case_arrays: dict, split: str, best_m
     return selected
 
 
+def _maybe_init_wandb(args: argparse.Namespace, output_dir: Path, summary: dict) -> Any | None:
+    if not args.log_wandb:
+        return None
+    try:
+        import wandb
+    except Exception as exc:
+        print(f"[warn] WandB logging requested but unavailable ({exc}); continuing without WandB.")
+        return None
+    run_name = args.wandb_run_name or f"gnn_compare_viz_{output_dir.name}"
+    tags = args.wandb_tags if args.wandb_tags is not None else ["gnn", "comparison-viz", args.split]
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=run_name,
+        tags=tags,
+        config=json_safe(summary.get("config", {})),
+    )
+
+
+def _wandb_log_outputs(
+    run: Any,
+    output_files: dict[str, str],
+    per_case_manifest: dict[str, str],
+    summary: dict,
+    max_case_images: int,
+) -> None:
+    if run is None:
+        return
+    import wandb
+
+    metrics = summary.get("selected_case_metrics_per_case_mean", {})
+    leaderboard = summary.get("leaderboard_snapshot", [])
+    best_row = leaderboard[0] if leaderboard else {}
+    run.summary["best_method"] = best_row.get("method")
+    run.summary["best_test_macro_f1"] = best_row.get("test_macro_f1")
+    run.summary["best_test_balanced_accuracy"] = best_row.get("test_balanced_accuracy")
+    run.summary["selected_case_count"] = len(per_case_manifest)
+    run.summary["output_dir"] = summary.get("config", {}).get("output_dir")
+    run.summary["source_comparison_dir"] = summary.get("source", {}).get("comparison_dir")
+    run.summary["source_graphs_root"] = summary.get("source", {}).get("graphs_root")
+    for method, vals in metrics.items():
+        for metric_name, metric_val in vals.items():
+            run.summary[f"selected/{method}/{metric_name}"] = metric_val
+
+    log_payload = {}
+    for key, file_path in output_files.items():
+        p = Path(file_path)
+        if p.exists():
+            log_payload[f"plots/{key}"] = wandb.Image(str(p), caption=key)
+
+    items = sorted(per_case_manifest.items())
+    if max_case_images >= 0:
+        items = items[:max_case_images]
+    for image_id, file_path in items:
+        p = Path(file_path)
+        if p.exists():
+            log_payload[f"cases/{image_id}"] = wandb.Image(str(p), caption=image_id)
+
+    if log_payload:
+        run.log(log_payload)
+    summary_path = Path(summary["config"]["output_dir"]) / "comparison_viz_summary.json"
+    if summary_path.exists():
+        artifact = wandb.Artifact("comparison_viz_summary", type="report")
+        artifact.add_file(str(summary_path))
+        run.log_artifact(artifact)
+    run.finish()
+
+
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
@@ -562,6 +639,14 @@ def main() -> None:
         _, per_case_mean, _, _ = aggregate_case_metrics(method_case_metrics[m])
         summary["selected_case_metrics_per_case_mean"][m] = per_case_mean
     (output_dir / "comparison_viz_summary.json").write_text(json.dumps(json_safe(summary), indent=2) + "\n", encoding="utf-8")
+    run = _maybe_init_wandb(args, output_dir, summary)
+    _wandb_log_outputs(
+        run=run,
+        output_files=output_files,
+        per_case_manifest=per_case_manifest,
+        summary=summary,
+        max_case_images=args.wandb_log_max_case_images,
+    )
     print(f"Saved comparison visualizations to: {output_dir}")
 
 
