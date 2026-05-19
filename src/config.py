@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,15 +28,22 @@ def _require_cfg_key(cfg: dict[str, Any], key: str) -> Any:
     return cfg[key]
 
 
-def resolve_resize_divisor(cfg: dict[str, Any]) -> int:
-    model_name = str(cfg.get("model", "deconver")).strip().lower()
-    if model_name == "deconver":
-        raw_strides = _require_cfg_key(cfg, "deconver_strides")
-        if not isinstance(raw_strides, (list, tuple)) or not raw_strides:
-            raise ValueError("deconver_strides must be a non-empty list/tuple.")
-        deconver_strides = tuple(int(x) for x in raw_strides)
-        return int(math.prod([s for s in deconver_strides if s > 1])) or 1
-    return 8
+def resolve_patch_size(cfg: dict[str, Any]) -> tuple[int, int]:
+    raw = _require_cfg_key(cfg, "patch_size")
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        raise ValueError("patch_size must be a 2-item list/tuple [H, W].")
+    patch_h = int(raw[0])
+    patch_w = int(raw[1])
+    if patch_h <= 0 or patch_w <= 0:
+        raise ValueError(f"patch_size entries must be > 0, got [{patch_h}, {patch_w}]")
+    return patch_h, patch_w
+
+
+def resolve_patch_overlap(cfg: dict[str, Any]) -> float:
+    overlap = float(cfg.get("patch_overlap", 0.5))
+    if overlap < 0.0 or overlap >= 1.0:
+        raise ValueError(f"patch_overlap must be in [0.0, 1.0), got {overlap}")
+    return overlap
 
 
 def consensus_dataset_kwargs_from_config(
@@ -49,7 +55,6 @@ def consensus_dataset_kwargs_from_config(
     if not isinstance(raw_image_subdirs, (list, tuple)) or not raw_image_subdirs:
         raise ValueError("image_subdirs must be a non-empty list/tuple.")
 
-    max_long_side = int(cfg.get("max_long_side", 0))
     return {
         "data_root": str(cfg.get("data_root", "./data")),
         "consensus_root": str(cfg.get("consensus_root", "./data/consensus")),
@@ -62,8 +67,6 @@ def consensus_dataset_kwargs_from_config(
         "otsu_min_hole_size": int(cfg.get("otsu_min_hole_size", 4096)),
         "probs_eps": float(cfg.get("probs_eps", 1e-8)),
         "load_qc_report": False,
-        "max_long_side": max_long_side or None,
-        "resize_divisor": resolve_resize_divisor(cfg),
     }
 
 

@@ -80,6 +80,8 @@ def validate_deconver_config(
             "consensus_root",
             "base_output_dir",
             "image_subdirs",
+            "patch_size",
+            "patch_overlap",
             "transforms_enabled",
             "transforms_profile",
             "transforms_seed_sync",
@@ -108,6 +110,27 @@ def validate_deconver_config(
     image_subdirs = cfg.get("image_subdirs")
     if not isinstance(image_subdirs, (list, tuple)) or not image_subdirs:
         raise ValueError("image_subdirs must be a non-empty list/tuple.")
+
+    patch_size = cfg.get("patch_size", None)
+    if not isinstance(patch_size, (list, tuple)) or len(patch_size) != 2:
+        raise ValueError("patch_size must be a 2-item list/tuple [H, W].")
+    patch_h = int(patch_size[0])
+    patch_w = int(patch_size[1])
+    if patch_h <= 0 or patch_w <= 0:
+        raise ValueError(f"patch_size entries must be > 0, got [{patch_h}, {patch_w}]")
+
+    patch_overlap = float(cfg.get("patch_overlap", 0.5))
+    if patch_overlap < 0.0 or patch_overlap >= 1.0:
+        raise ValueError(
+            f"patch_overlap must be in [0.0, 1.0), got {patch_overlap}"
+        )
+
+    patch_min_tissue_fraction = float(cfg.get("patch_min_tissue_fraction", 0.0))
+    if patch_min_tissue_fraction < 0.0 or patch_min_tissue_fraction > 1.0:
+        raise ValueError(
+            "patch_min_tissue_fraction must be in [0.0, 1.0], "
+            f"got {patch_min_tissue_fraction}"
+        )
 
     spatial_dims = int(cfg.get("spatial_dims", 2))
     if spatial_dims != 2:

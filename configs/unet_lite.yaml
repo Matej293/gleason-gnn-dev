@@ -25,7 +25,10 @@ split_search_max_attempts: 100
 
 renormalize_probs: true
 enforce_background_ignore: true
-max_long_side: 512
+patch_size: [512, 512]
+patch_overlap: 0.5
+patch_tissue_filter_enabled: true
+patch_min_tissue_fraction: 0.0
 otsu_close_radius: 3
 otsu_min_object_size: 4096
 otsu_min_hole_size: 4096

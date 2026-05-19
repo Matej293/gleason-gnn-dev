@@ -19,13 +19,19 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from monai.inferers import sliding_window_inference
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 _SRC = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(_SRC))
 
-from config import consensus_dataset_kwargs_from_config, load_config  # noqa: E402
+from config import (  # noqa: E402
+    consensus_dataset_kwargs_from_config,
+    load_config,
+    resolve_patch_overlap,
+    resolve_patch_size,
+)
 from cli_utils import (  # noqa: E402
     require_existing_dir,
     require_existing_file,
@@ -79,6 +85,24 @@ METRIC_KEYS = [
     "ignored_pixel_fraction",
     "tumor_pixels_ignored_fraction",
 ]
+
+
+def _sliding_window_logits(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    patch_size: tuple[int, int],
+    patch_overlap: float,
+) -> torch.Tensor:
+    def _predictor(window: torch.Tensor) -> torch.Tensor:
+        return _extract_logits(model(window))
+
+    return sliding_window_inference(
+        inputs=images,
+        roi_size=patch_size,
+        sw_batch_size=1,
+        predictor=_predictor,
+        overlap=patch_overlap,
+    )
 
 
 def _aggregate_loo_from_qc_reports(
@@ -208,6 +232,9 @@ def main() -> None:
     cfg = load_config(cfg_path)
     validate_deconver_config(cfg, for_eval=True, require_paths=True)
 
+    patch_size = resolve_patch_size(cfg)
+    patch_overlap = resolve_patch_overlap(cfg)
+
     ckpt_path = resolve_checkpoint_path(run_dir, args.checkpoint, prefer_best=True)
 
     dataset_kwargs = consensus_dataset_kwargs_from_config(cfg)
@@ -215,11 +242,14 @@ def main() -> None:
 
     split_manifest_path = resolve_split_manifest_path(cfg)
     logger.info(
-        "Evaluation setup | run=%s checkpoint=%s split_manifest=%s output_json=%s",
+        "Evaluation setup | run=%s checkpoint=%s split_manifest=%s output_json=%s patch_size=(%d,%d) overlap=%.2f",
         run_dir,
         ckpt_path,
         split_manifest_path,
         args.output_json if args.output_json is not None else (run_dir / "evaluation_summary.json"),
+        patch_size[0],
+        patch_size[1],
+        patch_overlap,
     )
     test_indices = load_test_indices_from_manifest(dataset.items, split_manifest_path)
     test_ds = Subset(dataset, test_indices)
@@ -259,8 +289,13 @@ def main() -> None:
             ignore_mask = batch["ignore_mask"].to(device, non_blocking=True)
             image_ids = [str(x) for x in batch["image_id"]]
 
-            out = model(images)
-            logits = _extract_logits(out)
+            logits = _sliding_window_logits(
+                model=model,
+                images=images,
+                patch_size=patch_size,
+                patch_overlap=patch_overlap,
+            )
+            logits = logits.clamp(-15.0, 15.0)
             pred = logits.argmax(dim=1)
             pred_post = postprocess_predictions(
                 pred=pred,

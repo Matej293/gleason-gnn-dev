@@ -5,13 +5,11 @@ from typing import Callable
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+from monai.data.utils import dense_patch_slices
 from PIL import Image
 from skimage.filters import threshold_otsu
 from skimage.morphology import closing, disk, remove_small_holes, remove_small_objects
 from torch.utils.data import Dataset
-
-_PIL_RESAMPLING = getattr(Image, "Resampling", Image)
 
 
 def build_tissue_mask_from_image(
@@ -78,8 +76,6 @@ class GleasonConsensusDataset(Dataset):
         otsu_min_hole_size: int = 4096,
         probs_eps: float = 1e-8,
         load_qc_report: bool = False,
-        max_long_side: int | None = None,
-        resize_divisor: int = 1,
     ) -> None:
         self.data_root = Path(data_root)
         self.consensus_root = Path(consensus_root)
@@ -98,8 +94,6 @@ class GleasonConsensusDataset(Dataset):
         self.otsu_min_hole_size = int(otsu_min_hole_size)
         self.probs_eps = float(probs_eps)
         self.load_qc_report = bool(load_qc_report)
-        self.max_long_side = int(max_long_side) if max_long_side and int(max_long_side) > 0 else None
-        self.resize_divisor = max(1, int(resize_divisor))
 
         self.items = self._discover_items()
         if not self.items:
@@ -174,82 +168,6 @@ class GleasonConsensusDataset(Dataset):
 
         return probs
 
-    def _maybe_resize_sample(
-        self,
-        image: np.ndarray,
-        hard: np.ndarray,
-        ignore: np.ndarray,
-        probs: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if self.max_long_side is None:
-            return image, hard, ignore, probs
-
-        h, w = image.shape[:2]
-        longest = max(h, w)
-        if longest <= self.max_long_side:
-            return image, hard, ignore, probs
-
-        scale = float(self.max_long_side) / float(longest)
-        new_h = max(1, int(round(h * scale)))
-        new_w = max(1, int(round(w * scale)))
-        if self.resize_divisor > 1:
-            # Deconver's U-Net skip concatenation expects aligned shapes after
-            # repeated stride-2 down/up sampling. Snap to divisor to prevent
-            # off-by-one shape mismatches in the decoder.
-            new_h = max(self.resize_divisor, (new_h // self.resize_divisor) * self.resize_divisor)
-            new_w = max(self.resize_divisor, (new_w // self.resize_divisor) * self.resize_divisor)
-
-        image_rs = np.array(
-            Image.fromarray(image).resize(
-                (new_w, new_h),
-                resample=_PIL_RESAMPLING.BILINEAR,
-            ),
-            dtype=np.uint8,
-            copy=True,
-        )
-        hard_rs = np.array(
-            Image.fromarray(hard).resize(
-                (new_w, new_h),
-                resample=_PIL_RESAMPLING.NEAREST,
-            ),
-            dtype=np.uint8,
-            copy=True,
-        )
-        ignore_rs = np.array(
-            Image.fromarray(ignore).resize(
-                (new_w, new_h),
-                resample=_PIL_RESAMPLING.NEAREST,
-            ),
-            dtype=np.uint8,
-            copy=True,
-        )
-
-        probs_t = torch.from_numpy(probs).unsqueeze(0)
-        probs_rs = F.interpolate(
-            probs_t,
-            size=(new_h, new_w),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0).numpy()
-        probs_rs = np.clip(np.nan_to_num(probs_rs, nan=0.0, posinf=1.0, neginf=0.0), 0.0, None)
-
-        if self.renormalize_probs:
-            probs_sum = probs_rs.sum(axis=0, keepdims=True)
-            nonzero = probs_sum >= self.probs_eps
-            probs_rs = np.divide(
-                probs_rs,
-                np.clip(probs_sum, self.probs_eps, None),
-                out=np.zeros_like(probs_rs, dtype=np.float32),
-                where=nonzero,
-            )
-            zero_mask = ~nonzero[0]
-            if zero_mask.any():
-                probs_rs[0, zero_mask] = 1.0
-        else:
-            probs_rs = probs_rs.astype(np.float32, copy=False)
-
-        return image_rs, hard_rs, ignore_rs, probs_rs
-
     def __getitem__(self, idx: int) -> dict:
         item = self.items[idx]
 
@@ -257,12 +175,6 @@ class GleasonConsensusDataset(Dataset):
         hard = np.array(Image.open(item["hard_path"]), dtype=np.uint8)
         ignore = np.array(Image.open(item["ignore_path"]), dtype=np.uint8)
         probs = self._load_probs(item["soft_path"], image_id=str(item["image_id"]))
-        image, hard, ignore, probs = self._maybe_resize_sample(
-            image=image,
-            hard=hard,
-            ignore=ignore,
-            probs=probs,
-        )
 
         if hard.shape != image.shape[:2] or ignore.shape != image.shape[:2]:
             raise ValueError(f"Shape mismatch for {item['image_id']}")
@@ -293,8 +205,150 @@ class GleasonConsensusDataset(Dataset):
         return sample
 
 
+class SlidingWindowPatchDataset(Dataset):
+    """Patch-level dataset using deterministic MONAI dense sliding windows."""
+
+    def __init__(
+        self,
+        base_dataset: GleasonConsensusDataset,
+        source_indices: list[int] | tuple[int, ...],
+        patch_size: tuple[int, int],
+        overlap: float = 0.5,
+        patch_tissue_filter_enabled: bool = True,
+        patch_min_tissue_fraction: float = 0.0,
+        transform: Callable | None = None,
+    ) -> None:
+        if not isinstance(base_dataset, GleasonConsensusDataset):
+            raise TypeError("base_dataset must be a GleasonConsensusDataset instance.")
+        if not isinstance(source_indices, (list, tuple)) or not source_indices:
+            raise ValueError("source_indices must be a non-empty list/tuple of dataset indices.")
+
+        patch_h = int(patch_size[0])
+        patch_w = int(patch_size[1])
+        if patch_h <= 0 or patch_w <= 0:
+            raise ValueError(f"patch_size entries must be > 0, got [{patch_h}, {patch_w}].")
+
+        overlap_f = float(overlap)
+        if overlap_f < 0.0 or overlap_f >= 1.0:
+            raise ValueError(f"overlap must be in [0.0, 1.0), got {overlap_f}.")
+
+        patch_min_tissue_fraction_f = float(patch_min_tissue_fraction)
+        if patch_min_tissue_fraction_f < 0.0 or patch_min_tissue_fraction_f > 1.0:
+            raise ValueError(
+                "patch_min_tissue_fraction must be in [0.0, 1.0], "
+                f"got {patch_min_tissue_fraction_f}."
+            )
+
+        self.base_dataset = base_dataset
+        self.source_indices = tuple(int(i) for i in source_indices)
+        self.patch_size = (patch_h, patch_w)
+        self.overlap = overlap_f
+        self.patch_tissue_filter_enabled = bool(patch_tissue_filter_enabled)
+        self.patch_min_tissue_fraction = patch_min_tissue_fraction_f
+        self.transform = transform
+        self.scan_interval = (
+            max(1, int(round(self.patch_size[0] * (1.0 - self.overlap)))),
+            max(1, int(round(self.patch_size[1] * (1.0 - self.overlap)))),
+        )
+
+        self.total_candidate_patches = 0
+        self.kept_patches = 0
+        self.skipped_patches = 0
+        self.keep_ratio = 0.0
+
+        self.patch_items = self._build_patch_items()
+        self.kept_patches = len(self.patch_items)
+        self.skipped_patches = self.total_candidate_patches - self.kept_patches
+        self.keep_ratio = (
+            float(self.kept_patches) / float(self.total_candidate_patches)
+            if self.total_candidate_patches > 0
+            else 0.0
+        )
+
+        if not self.patch_items:
+            raise RuntimeError("No sliding-window patches were generated.")
+
+    def _build_patch_items(self) -> list[dict[str, object]]:
+        patch_items: list[dict[str, object]] = []
+
+        for source_index in self.source_indices:
+            if source_index < 0 or source_index >= len(self.base_dataset.items):
+                raise IndexError(f"source index out of range: {source_index}")
+
+            item = self.base_dataset.items[source_index]
+            tissue_mask = None
+            if self.patch_tissue_filter_enabled:
+                sample = self.base_dataset[source_index]
+                tissue_mask = sample.get("tissue_mask", None)
+                if tissue_mask is None:
+                    raise ValueError(
+                        "SlidingWindowPatchDataset requires 'tissue_mask' from base_dataset samples "
+                        "when patch_tissue_filter_enabled=True."
+                    )
+
+            image_path = Path(str(item["image_path"]))
+            with Image.open(image_path) as img:
+                width, height = img.size
+
+            slices = dense_patch_slices(
+                image_size=(int(height), int(width)),
+                patch_size=self.patch_size,
+                scan_interval=self.scan_interval,
+                return_slice=True,
+            )
+
+            image_id = str(item["image_id"])
+            for y_slice, x_slice in slices:
+                self.total_candidate_patches += 1
+                if tissue_mask is not None:
+                    patch_tissue = tissue_mask[y_slice, x_slice]
+                    tissue_fraction = float(patch_tissue.float().mean().item())
+                    if self.patch_min_tissue_fraction <= 0.0:
+                        if tissue_fraction <= 0.0:
+                            continue
+                    elif tissue_fraction < self.patch_min_tissue_fraction:
+                        continue
+
+                patch_items.append(
+                    {
+                        "source_index": int(source_index),
+                        "image_id": image_id,
+                        "y_slice": y_slice,
+                        "x_slice": x_slice,
+                    }
+                )
+
+        return patch_items
+
+    def __len__(self) -> int:
+        return len(self.patch_items)
+
+    def __getitem__(self, idx: int) -> dict:
+        patch = self.patch_items[idx]
+        source_index = int(patch["source_index"])
+        sample = self.base_dataset[source_index]
+
+        y_slice = patch["y_slice"]
+        x_slice = patch["x_slice"]
+
+        out: dict[str, object] = {"image_id": str(sample["image_id"])}
+        out["image"] = sample["image"][:, y_slice, x_slice].contiguous()
+        out["hard_mask"] = sample["hard_mask"][y_slice, x_slice].contiguous()
+        out["ignore_mask"] = sample["ignore_mask"][y_slice, x_slice].contiguous()
+
+        if "soft_probs" in sample:
+            out["soft_probs"] = sample["soft_probs"][:, y_slice, x_slice].contiguous()
+        if "tissue_mask" in sample:
+            out["tissue_mask"] = sample["tissue_mask"][y_slice, x_slice].contiguous()
+
+        if self.transform is not None:
+            out = self.transform(out)
+        return out
+
+
 __all__ = [
     "GleasonConsensusDataset",
+    "SlidingWindowPatchDataset",
     "build_tissue_mask_from_image",
     "clean_ignore_mask",
 ]

@@ -5,11 +5,18 @@ import sys
 from pathlib import Path
 
 import torch
+from monai.inferers import sliding_window_inference
 
-from src.config import consensus_dataset_kwargs_from_config, load_config
+from src.config import (
+    consensus_dataset_kwargs_from_config,
+    load_config,
+    resolve_patch_overlap,
+    resolve_patch_size,
+)
 from src.config_validation import validate_deconver_config
 from src.eval_utils import collate_consensus_batch, compute_multiclass_metrics
 from src.gleason_consensus_dataset import GleasonConsensusDataset
+from src.model_outputs import extract_logits
 from src.models import build_model
 
 
@@ -36,10 +43,22 @@ def main() -> int:
     sample = ds[0]
     batch = collate_consensus_batch([sample])
 
+    patch_size = resolve_patch_size(cfg)
+    patch_overlap = resolve_patch_overlap(cfg)
+
     model = build_model(cfg).eval()
+
+    def _predictor(window: torch.Tensor) -> torch.Tensor:
+        return extract_logits(model(window))
+
     with torch.inference_mode():
-        out = model(batch["image"])
-        logits = out[0] if isinstance(out, list) else out
+        logits = sliding_window_inference(
+            inputs=batch["image"],
+            roi_size=patch_size,
+            sw_batch_size=1,
+            predictor=_predictor,
+            overlap=patch_overlap,
+        )
 
     metrics = compute_multiclass_metrics(
         logits=logits.float(),

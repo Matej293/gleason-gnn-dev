@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from monai.inferers import sliding_window_inference
 from PIL import Image
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from tqdm import tqdm
@@ -28,7 +29,8 @@ from src.config import (
     consensus_dataset_kwargs_from_config,
     consensus_train_val_transforms_from_config,
     load_config,
-    resolve_resize_divisor,
+    resolve_patch_overlap,
+    resolve_patch_size,
 )
 from src.config_validation import validate_amp_runtime, validate_deconver_config
 from src.consensus_transforms import set_transform_random_state
@@ -46,7 +48,7 @@ from src.eval_utils import (
     resolve_split_manifest_path,
     safe_read_json,
 )
-from src.gleason_consensus_dataset import GleasonConsensusDataset
+from src.gleason_consensus_dataset import GleasonConsensusDataset, SlidingWindowPatchDataset
 from src.models import build_model
 from src.utils import (
     create_run_dir,
@@ -1126,6 +1128,26 @@ def _parse_model_outputs(
     raise TypeError(f"Unsupported model output type: {type(out)!r}")
 
 
+def _sliding_window_logits(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    patch_size: tuple[int, int],
+    patch_overlap: float,
+) -> torch.Tensor:
+    def _predictor(window: torch.Tensor) -> torch.Tensor:
+        out = model(window)
+        logits, _, _ = _parse_model_outputs(out)
+        return logits
+
+    return sliding_window_inference(
+        inputs=images,
+        roi_size=patch_size,
+        sw_batch_size=1,
+        predictor=_predictor,
+        overlap=patch_overlap,
+    )
+
+
 def validate(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -1140,6 +1162,8 @@ def validate(
     lambda_dice: float,
     include_background_in_dice: bool,
     min_component_size_by_class: dict[int, int],
+    patch_size: tuple[int, int],
+    patch_overlap: float,
     use_amp: bool,
     amp_dtype: torch.dtype,
     model_name: str,
@@ -1180,10 +1204,15 @@ def validate(
             with torch.autocast(
                 device_type=autocast_device, dtype=amp_dtype, enabled=use_amp
             ):
-                out = model(images)
-                logits, scales, aux = _parse_model_outputs(out)
+                logits = _sliding_window_logits(
+                    model=model,
+                    images=images,
+                    patch_size=patch_size,
+                    patch_overlap=patch_overlap,
+                )
                 logits = logits.clamp(-15.0, 15.0)
-                scales = [s.clamp(-15.0, 15.0) for s in scales]
+                scales = [logits]
+                aux = None
                 try:
                     loss, _ = _compute_training_loss(
                         logits=logits,
@@ -1219,10 +1248,15 @@ def validate(
                     device_type=autocast_device,
                     enabled=False,
                 ):
-                    out = model(images.float())
-                    logits, scales, aux = _parse_model_outputs(out)
+                    logits = _sliding_window_logits(
+                        model=model,
+                        images=images.float(),
+                        patch_size=patch_size,
+                        patch_overlap=patch_overlap,
+                    )
                     logits = logits.float().clamp(-15.0, 15.0)
-                    scales = [s.float().clamp(-15.0, 15.0) for s in scales]
+                    scales = [logits]
+                    aux = None
                     try:
                         loss, _ = _compute_training_loss(
                             logits=logits,
@@ -1329,6 +1363,8 @@ def validate_with_oom_retry(
     lambda_dice: float,
     include_background_in_dice: bool,
     min_component_size_by_class: dict[int, int],
+    patch_size: tuple[int, int],
+    patch_overlap: float,
     use_amp: bool,
     amp_dtype: torch.dtype,
     model_name: str,
@@ -1352,6 +1388,8 @@ def validate_with_oom_retry(
             lambda_dice=lambda_dice,
             include_background_in_dice=include_background_in_dice,
             min_component_size_by_class=min_component_size_by_class,
+            patch_size=patch_size,
+            patch_overlap=patch_overlap,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             model_name=model_name,
@@ -1381,6 +1419,8 @@ def validate_with_oom_retry(
                 lambda_dice=lambda_dice,
                 include_background_in_dice=include_background_in_dice,
                 min_component_size_by_class=min_component_size_by_class,
+                patch_size=patch_size,
+                patch_overlap=patch_overlap,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
                 model_name=model_name,
@@ -1456,6 +1496,8 @@ def _run_validation_visualizations(
     epoch: int,
     include_background_in_dice: bool,
     min_component_size_by_class: dict[int, int],
+    patch_size: tuple[int, int],
+    patch_overlap: float,
     prediction_source: str,
     use_amp: bool,
     amp_dtype: torch.dtype,
@@ -1481,8 +1523,13 @@ def _run_validation_visualizations(
             hard_mask = batch["hard_mask"].to(device, non_blocking=True)
             ignore_mask = batch["ignore_mask"].to(device, non_blocking=True)
             with torch.autocast(device_type=autocast_device, dtype=amp_dtype, enabled=use_amp):
-                out = model(images)
-            logits, _, _ = _parse_model_outputs(out)
+                logits = _sliding_window_logits(
+                    model=model,
+                    images=images,
+                    patch_size=patch_size,
+                    patch_overlap=patch_overlap,
+                )
+            logits = logits.clamp(-15.0, 15.0)
             pred_raw = logits.argmax(dim=1)
             hard_rs, _, ignore_rs = _resize_targets_for_logits(
                 logits=logits,
@@ -1682,30 +1729,29 @@ def main() -> None:
             seed_sync,
         )
 
+    patch_size = resolve_patch_size(cfg)
+    patch_overlap = resolve_patch_overlap(cfg)
+    patch_tissue_filter_enabled = bool(cfg.get("patch_tissue_filter_enabled", True))
+    patch_min_tissue_fraction = float(cfg.get("patch_min_tissue_fraction", 0.0))
+    patch_stride = (
+        max(1, int(round(patch_size[0] * (1.0 - patch_overlap)))),
+        max(1, int(round(patch_size[1] * (1.0 - patch_overlap)))),
+    )
+    logger.info(
+        "Sliding-window patching enabled: patch_size=(%d,%d) overlap=%.2f stride=(%d,%d) "
+        "tissue_filter=%s min_tissue_fraction=%.4f",
+        patch_size[0],
+        patch_size[1],
+        patch_overlap,
+        patch_stride[0],
+        patch_stride[1],
+        patch_tissue_filter_enabled,
+        patch_min_tissue_fraction,
+    )
+
     dataset_kwargs = consensus_dataset_kwargs_from_config(cfg, transform=None)
     dataset = GleasonConsensusDataset(**dataset_kwargs)
     setattr(dataset, "_transform_seed_sync", seed_sync)
-
-    train_dataset = dataset
-    if train_transform is not None:
-        train_dataset_kwargs = consensus_dataset_kwargs_from_config(cfg, transform=train_transform)
-        train_dataset = GleasonConsensusDataset(**train_dataset_kwargs)
-        setattr(train_dataset, "_transform_seed_sync", seed_sync)
-
-        if len(train_dataset.items) != len(dataset.items):
-            raise RuntimeError("Train dataset discovery mismatch after transform setup.")
-        if any(
-            str(train_dataset.items[i]["image_id"]) != str(dataset.items[i]["image_id"])
-            for i in range(len(dataset.items))
-        ):
-            raise RuntimeError("Train dataset item ordering mismatch after transform setup.")
-
-    if dataset_kwargs["max_long_side"] is not None:
-        logger.info(
-            "Consensus loader resize enabled: max_long_side=%d px (divisor=%d)",
-            int(dataset_kwargs["max_long_side"]),
-            resolve_resize_divisor(cfg),
-        )
 
     all_rows = _build_sample_metadata(dataset=dataset, cfg=cfg)
     enforce_val_presence = bool(cfg.get("enforce_val_class_presence", True))
@@ -1772,13 +1818,36 @@ def main() -> None:
     val_indices = [int(r["dataset_index"]) for r in val_rows]
     test_indices = [int(r["dataset_index"]) for r in test_rows]
 
-    train_ds = Subset(train_dataset, train_indices)
+    train_ds = SlidingWindowPatchDataset(
+        base_dataset=dataset,
+        source_indices=train_indices,
+        patch_size=patch_size,
+        overlap=patch_overlap,
+        patch_tissue_filter_enabled=patch_tissue_filter_enabled,
+        patch_min_tissue_fraction=patch_min_tissue_fraction,
+        transform=train_transform,
+    )
+    setattr(train_ds, "_transform_seed_sync", seed_sync)
+
     val_ds = Subset(dataset, val_indices)
     test_ds = Subset(dataset, test_indices) if test_indices else None
 
     image_weight_map = {
         str(r["image_id"]): float(r.get("qc_weight", 1.0)) for r in all_rows
     }
+
+    train_row_by_index = {int(r["dataset_index"]): r for r in train_rows}
+    train_patch_rows = [
+        train_row_by_index[int(p["source_index"])]
+        for p in train_ds.patch_items
+    ]
+    logger.info(
+        "Train patch filter stats: candidates=%d kept=%d skipped=%d keep_ratio=%.4f",
+        int(train_ds.total_candidate_patches),
+        int(train_ds.kept_patches),
+        int(train_ds.skipped_patches),
+        float(train_ds.keep_ratio),
+    )
 
     num_workers_cfg = int(cfg.get("num_workers", 0))
     num_workers, mp_context, start_method = _resolve_dataloader_context(
@@ -1802,7 +1871,7 @@ def main() -> None:
     loader_generator = torch.Generator()
     loader_generator.manual_seed(seed)
 
-    train_sampler = _build_train_sampler(train_rows=train_rows, cfg=cfg, seed=seed)
+    train_sampler = _build_train_sampler(train_rows=train_patch_rows, cfg=cfg, seed=seed)
     train_loader = DataLoader(
         train_ds,
         batch_size=int(cfg.get("batch_size", 8)),
@@ -1846,8 +1915,9 @@ def main() -> None:
         )
 
     logger.info(
-        "Split mode=%s | train=%d | val=%d | test=%d",
+        "Split mode=%s | train_images=%d | train_patches=%d | val_images=%d | test_images=%d",
         split_mode,
+        len(train_rows),
         len(train_ds),
         len(val_ds),
         len(test_ds) if test_ds is not None else 0,
@@ -2412,6 +2482,8 @@ def main() -> None:
             lambda_dice=epoch_lambda_dice,
             include_background_in_dice=include_background_in_dice,
             min_component_size_by_class=post_min_comp,
+            patch_size=patch_size,
+            patch_overlap=patch_overlap,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             model_name=cfg_model,
@@ -2471,6 +2543,8 @@ def main() -> None:
                 epoch=epoch,
                 include_background_in_dice=include_background_in_dice,
                 min_component_size_by_class=post_min_comp,
+                patch_size=patch_size,
+                patch_overlap=patch_overlap,
                 prediction_source=viz_prediction_source,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
@@ -2572,6 +2646,12 @@ def main() -> None:
         if math.isnan(best_val_macro_dice)
         else float(best_val_macro_dice),
         "split_manifest_path": str(split_manifest_copy_path),
+        "patch_tissue_filter_enabled": bool(patch_tissue_filter_enabled),
+        "patch_min_tissue_fraction": float(patch_min_tissue_fraction),
+        "train_patch_candidate_count": int(train_ds.total_candidate_patches),
+        "train_patch_kept_count": int(train_ds.kept_patches),
+        "train_patch_skipped_count": int(train_ds.skipped_patches),
+        "train_patch_keep_ratio": float(train_ds.keep_ratio),
     }
     summary_path = run_dir / "training_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
