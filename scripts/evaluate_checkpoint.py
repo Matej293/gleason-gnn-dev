@@ -25,7 +25,13 @@ from tqdm import tqdm
 _SRC = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(_SRC))
 
-from config import load_config  # noqa: E402
+from config import consensus_dataset_kwargs_from_config, load_config  # noqa: E402
+from cli_utils import (  # noqa: E402
+    require_existing_dir,
+    require_existing_file,
+    resolve_checkpoint_path,
+    validate_non_negative_int,
+)
 from config_validation import validate_deconver_config  # noqa: E402
 from eval_utils import (  # noqa: E402
     collate_consensus_batch,
@@ -38,6 +44,7 @@ from eval_utils import (  # noqa: E402
 )
 from gleason_consensus_dataset import GleasonConsensusDataset  # noqa: E402
 from models import build_model  # noqa: E402
+from model_outputs import extract_logits as _extract_logits  # noqa: E402
 from utils import ensure_cuda_binary_compatibility, load_checkpoint  # noqa: E402
 from visualization import render_case_panel, save_case_panel  # noqa: E402
 from wandb_logger import WandbLogger  # noqa: E402
@@ -106,32 +113,6 @@ def _aggregate_loo_from_qc_reports(
     }
 
 
-def _resolve_checkpoint(run_dir: Path, ckpt_arg: str | None) -> Path:
-    ckpt_dir = run_dir / "checkpoints"
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory missing: {ckpt_dir}")
-
-    if ckpt_arg:
-        direct = Path(ckpt_arg)
-        if direct.exists():
-            return direct.resolve()
-        candidate = ckpt_dir / ckpt_arg
-        if candidate.exists():
-            return candidate.resolve()
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_arg} (checked direct path and {ckpt_dir})"
-        )
-
-    best = ckpt_dir / "best.pt"
-    if best.exists():
-        return best.resolve()
-
-    epoch_files = sorted(ckpt_dir.glob("epoch_*.pt"))
-    if not epoch_files:
-        raise FileNotFoundError(f"No checkpoint files found in {ckpt_dir}")
-    return epoch_files[-1].resolve()
-
-
 def _aggregate_per_case_metrics(
     per_case: list[dict[str, object]],
     prefix: str,
@@ -147,107 +128,99 @@ def _aggregate_per_case_metrics(
     return {k: (sums[k] / counts[k]) if counts[k] > 0 else float("nan") for k in METRIC_KEYS}
 
 
-def _extract_logits(out: object) -> torch.Tensor:
-    if isinstance(out, torch.Tensor):
-        return out
-    if isinstance(out, dict):
-        logits = out.get("out")
-        if isinstance(logits, torch.Tensor):
-            return logits
-        raise TypeError("Model output dict must contain tensor under key 'out'.")
-    if isinstance(out, (list, tuple)) and out and isinstance(out[0], torch.Tensor):
-        return out[0]
-    raise TypeError(f"Unsupported model output type: {type(out)!r}")
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate Deconver checkpoint on Gleason consensus test split.",
+        description="Evaluate a segmentation checkpoint on the configured Gleason consensus test split.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+
+    io_group = parser.add_argument_group("I/O")
+    io_group.add_argument(
         "--run",
         required=True,
         type=str,
-        help="Run directory containing config.yaml and checkpoints/",
+        help="Run directory containing config.yaml and checkpoints/.",
     )
-    parser.add_argument(
+    io_group.add_argument(
         "--checkpoint",
         type=str,
         default=None,
-        help="Checkpoint file path or filename inside run/checkpoints (default: best.pt or latest epoch).",
+        help="Checkpoint file path or filename inside run/checkpoints. Default resolves best.pt then latest epoch.",
     )
-    parser.add_argument(
+    io_group.add_argument(
         "--output-json",
         type=str,
         default=None,
-        help="Output JSON path (default: <run>/evaluation_summary.json).",
+        help="Evaluation summary output path.",
     )
-    parser.add_argument("--save-viz", action="store_true", help="Save prediction panels as PNG.")
-    parser.add_argument(
+
+    viz_group = parser.add_argument_group("Visualization")
+    viz_group.add_argument(
+        "--save-viz",
+        action="store_true",
+        help="Save per-case prediction panels.",
+    )
+    viz_group.add_argument(
         "--viz-dir",
         type=str,
         default=None,
-        help="Visualization output directory (default: <run>/eval_viz).",
+        help="Visualization output directory.",
     )
-    parser.add_argument(
+    viz_group.add_argument(
         "--viz-max-cases",
         type=int,
         default=-1,
-        help="Maximum number of cases to save as visualizations (<=0 means all).",
+        help="Max number of panels to save (<=0 means all).",
     )
-    parser.add_argument(
+    viz_group.add_argument(
         "--viz-worst-k",
         type=int,
         default=0,
-        help="If >0, save worst-K by per-case macro Dice (bounded by viz-max-cases).",
+        help="If >0, save worst-K by post macro Dice (bounded by viz-max-cases).",
     )
-    parser.add_argument(
+
+    wb_group = parser.add_argument_group("Weights & Biases")
+    wb_group.add_argument(
         "--log-wandb-viz",
         action="store_true",
         help="Log evaluation panels to W&B.",
     )
-    parser.add_argument(
+    wb_group.add_argument(
         "--log-wandb-metrics",
         action="store_true",
         help="Log aggregate and per-case evaluation metrics to W&B.",
     )
+
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run_dir = Path(args.run).resolve()
-    cfg_path = run_dir / "config.yaml"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Run config not found: {cfg_path}")
-
-    cfg = load_config(str(cfg_path))
-    validate_deconver_config(cfg, for_eval=True, require_paths=True)
-
-    ckpt_path = _resolve_checkpoint(run_dir, args.checkpoint)
-    logger.info("Using checkpoint: %s", ckpt_path)
-
-    max_long_side = int(cfg.get("max_long_side", 0))
-    deconver_strides = tuple(int(x) for x in cfg.get("deconver_strides", [1, 2, 2, 2]))
-    resize_divisor = int(math.prod([s for s in deconver_strides if s > 1])) or 1
-
-    dataset = GleasonConsensusDataset(
-        data_root=cfg["data_root"],
-        consensus_root=cfg["consensus_root"],
-        image_subdirs=tuple(str(x) for x in cfg.get("image_subdirs", ["Train_imgs", "Test_imgs"])),
-        transform=None,
-        renormalize_probs=bool(cfg.get("renormalize_probs", True)),
-        enforce_background_ignore=bool(cfg.get("enforce_background_ignore", True)),
-        otsu_close_radius=int(cfg.get("otsu_close_radius", 3)),
-        otsu_min_object_size=int(cfg.get("otsu_min_object_size", 4096)),
-        otsu_min_hole_size=int(cfg.get("otsu_min_hole_size", 4096)),
-        probs_eps=float(cfg.get("probs_eps", 1e-8)),
-        load_qc_report=False,
-        max_long_side=max_long_side or None,
-        resize_divisor=resize_divisor,
+    args.viz_worst_k = validate_non_negative_int(
+        args.viz_worst_k,
+        field_name="viz_worst_k",
     )
 
+    run_dir = require_existing_dir(args.run, label="Run directory")
+    cfg_path = require_existing_file(run_dir / "config.yaml", label="Run config")
+
+    cfg = load_config(cfg_path)
+    validate_deconver_config(cfg, for_eval=True, require_paths=True)
+
+    ckpt_path = resolve_checkpoint_path(run_dir, args.checkpoint, prefer_best=True)
+
+    dataset_kwargs = consensus_dataset_kwargs_from_config(cfg)
+    dataset = GleasonConsensusDataset(**dataset_kwargs)
+
     split_manifest_path = resolve_split_manifest_path(cfg)
+    logger.info(
+        "Evaluation setup | run=%s checkpoint=%s split_manifest=%s output_json=%s",
+        run_dir,
+        ckpt_path,
+        split_manifest_path,
+        args.output_json if args.output_json is not None else (run_dir / "evaluation_summary.json"),
+    )
     test_indices = load_test_indices_from_manifest(dataset.items, split_manifest_path)
     test_ds = Subset(dataset, test_indices)
 

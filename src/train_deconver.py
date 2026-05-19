@@ -24,8 +24,21 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from tqdm import tqdm
 
-from src.config import load_config
+from src.config import (
+    consensus_dataset_kwargs_from_config,
+    consensus_train_val_transforms_from_config,
+    load_config,
+    resolve_resize_divisor,
+)
 from src.config_validation import validate_amp_runtime, validate_deconver_config
+from src.consensus_transforms import set_transform_random_state
+from src.cli_utils import (
+    ensure_output_dir,
+    require_existing_file,
+    require_non_empty_str,
+    validate_experiment_name,
+    validate_seed,
+)
 from src.eval_utils import (
     collate_consensus_batch,
     compute_multiclass_metrics_from_pred,
@@ -38,7 +51,6 @@ from src.models import build_model
 from src.utils import (
     create_run_dir,
     ensure_cuda_binary_compatibility,
-    ensure_dir,
     load_checkpoint,
     rotate_checkpoints,
     save_checkpoint,
@@ -97,6 +109,19 @@ def _seed_worker(worker_id: int) -> None:
     worker_seed = (torch.initial_seed() + worker_id) % (2**32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        return
+
+    dataset = worker_info.dataset
+    while isinstance(dataset, Subset):
+        dataset = dataset.dataset
+
+    if not bool(getattr(dataset, "_transform_seed_sync", True)):
+        return
+
+    set_transform_random_state(getattr(dataset, "transform", None), seed=int(worker_seed))
 
 
 def _is_cuda_oom(exc: RuntimeError) -> bool:
@@ -1533,37 +1558,54 @@ def _run_validation_visualizations(
     return saved
 
 
-def _resolve_resize_divisor(cfg: dict) -> int:
-    model_name = str(cfg.get("model", "deconver")).strip().lower()
-    if model_name == "deconver":
-        deconver_strides = tuple(int(x) for x in cfg.get("deconver_strides", [1, 2, 2, 2]))
-        return int(math.prod([s for s in deconver_strides if s > 1])) or 1
-    return 8
 
-
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train segmentation model on Gleason consensus labels.",
     )
-    parser.add_argument(
-        "--config", type=str, required=True, help="Path to YAML config file"
+    io_group = parser.add_argument_group("I/O")
+    io_group.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to experiment YAML config.",
     )
-    parser.add_argument(
+    io_group.add_argument(
         "--resume",
         type=str,
         default=None,
         metavar="CHECKPOINT",
-        help="Path to a .pt checkpoint to resume from",
+        help="Checkpoint path to resume from (CLI takes precedence over config resume_checkpoint).",
     )
-    parser.add_argument(
+
+    split_group = parser.add_argument_group("Split Control")
+    split_group.add_argument(
         "--new-split-manifest",
         action="store_true",
-        help="Regenerate split manifest before this run.",
+        help="Regenerate train/val/test split manifest before this run.",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    cfg = load_config(args.config)
+
+def main() -> None:
+    args = parse_args()
+
+    config_path = require_existing_file(args.config, label="Config file")
+    cfg = load_config(config_path)
     validate_deconver_config(cfg, for_eval=False, require_paths=True)
+
+    cfg["experiment_name"] = validate_experiment_name(cfg.get("experiment_name", ""))
+    cfg["base_output_dir"] = require_non_empty_str(
+        cfg.get("base_output_dir", ""),
+        field_name="base_output_dir",
+    )
+    cfg["random_seed"] = validate_seed(cfg.get("random_seed", 42), field_name="random_seed")
+
+    resume_from_cli: str | None = None
+    if args.resume is not None:
+        resume_from_cli = str(
+            require_existing_file(args.resume, label="Resume checkpoint")
+        )
 
     cfg_model = str(cfg.get("model", "deconver")).lower()
     spatial_dims = int(cfg.get("spatial_dims", 2))
@@ -1579,7 +1621,7 @@ def main() -> None:
             f"This consensus trainer requires out_channels=4, got {out_channels}."
         )
 
-    seed = int(cfg.get("random_seed", 42))
+    seed = int(cfg["random_seed"])
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -1601,38 +1643,69 @@ def main() -> None:
         logger.warning("CUDA requested in config but unavailable; falling back to CPU.")
     ensure_cuda_binary_compatibility(device)
 
-    ensure_dir(str(cfg["base_output_dir"]))
-    run_dir = create_run_dir(str(cfg["base_output_dir"]), str(cfg["experiment_name"]))
+    base_output_dir = ensure_output_dir(
+        cfg["base_output_dir"],
+        label="base_output_dir",
+    )
+    logger.info(
+        "Starting training | config=%s model=%s experiment=%s seed=%d split_mode=%s output_root=%s",
+        config_path,
+        cfg_model,
+        cfg["experiment_name"],
+        seed,
+        str(cfg.get("split_mode", "iter_80_20")),
+        base_output_dir,
+    )
+
+    run_dir = create_run_dir(str(base_output_dir), str(cfg["experiment_name"]))
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     save_metadata(run_dir, cfg)
     save_config_copy(run_dir, cfg)
-    save_latest_pointer(str(cfg["base_output_dir"]), run_dir)
+    save_latest_pointer(str(base_output_dir), run_dir)
 
-    max_long_side = int(cfg.get("max_long_side", 0))
-    resize_divisor = _resolve_resize_divisor(cfg)
+    train_transform, val_transform = consensus_train_val_transforms_from_config(cfg)
+    if val_transform is not None:
+        logger.warning(
+            "Validation transforms are disabled for this training path; ignoring val_transform."
+        )
 
-    dataset = GleasonConsensusDataset(
-        data_root=cfg["data_root"],
-        consensus_root=cfg["consensus_root"],
-        image_subdirs=tuple(
-            str(x) for x in cfg.get("image_subdirs", ["Train_imgs", "Test_imgs"])
-        ),
-        transform=None,
-        renormalize_probs=bool(cfg.get("renormalize_probs", True)),
-        enforce_background_ignore=bool(cfg.get("enforce_background_ignore", True)),
-        otsu_close_radius=int(cfg.get("otsu_close_radius", 3)),
-        otsu_min_object_size=int(cfg.get("otsu_min_object_size", 4096)),
-        otsu_min_hole_size=int(cfg.get("otsu_min_hole_size", 4096)),
-        probs_eps=float(cfg.get("probs_eps", 1e-8)),
-        load_qc_report=False,
-        max_long_side=max_long_side or None,
-        resize_divisor=resize_divisor,
-    )
-    if max_long_side > 0:
-        logger.info("Consensus loader resize enabled: max_long_side=%d px (divisor=%d)", max_long_side, resize_divisor)
+    seed_sync = bool(cfg.get("transforms_seed_sync", True))
+    if train_transform is not None and seed_sync:
+        set_transform_random_state(train_transform, seed=seed)
+    if train_transform is not None:
+        logger.info(
+            "Consensus train transforms enabled (profile=%s, seed_sync=%s).",
+            str(cfg.get("transforms_profile", "light")).strip().lower(),
+            seed_sync,
+        )
+
+    dataset_kwargs = consensus_dataset_kwargs_from_config(cfg, transform=None)
+    dataset = GleasonConsensusDataset(**dataset_kwargs)
+    setattr(dataset, "_transform_seed_sync", seed_sync)
+
+    train_dataset = dataset
+    if train_transform is not None:
+        train_dataset_kwargs = consensus_dataset_kwargs_from_config(cfg, transform=train_transform)
+        train_dataset = GleasonConsensusDataset(**train_dataset_kwargs)
+        setattr(train_dataset, "_transform_seed_sync", seed_sync)
+
+        if len(train_dataset.items) != len(dataset.items):
+            raise RuntimeError("Train dataset discovery mismatch after transform setup.")
+        if any(
+            str(train_dataset.items[i]["image_id"]) != str(dataset.items[i]["image_id"])
+            for i in range(len(dataset.items))
+        ):
+            raise RuntimeError("Train dataset item ordering mismatch after transform setup.")
+
+    if dataset_kwargs["max_long_side"] is not None:
+        logger.info(
+            "Consensus loader resize enabled: max_long_side=%d px (divisor=%d)",
+            int(dataset_kwargs["max_long_side"]),
+            resolve_resize_divisor(cfg),
+        )
 
     all_rows = _build_sample_metadata(dataset=dataset, cfg=cfg)
     enforce_val_presence = bool(cfg.get("enforce_val_class_presence", True))
@@ -1699,7 +1772,7 @@ def main() -> None:
     val_indices = [int(r["dataset_index"]) for r in val_rows]
     test_indices = [int(r["dataset_index"]) for r in test_rows]
 
-    train_ds = Subset(dataset, train_indices)
+    train_ds = Subset(train_dataset, train_indices)
     val_ds = Subset(dataset, val_indices)
     test_ds = Subset(dataset, test_indices) if test_indices else None
 
@@ -1927,7 +2000,14 @@ def main() -> None:
     es_enabled = es_patience > 0
     es_counter = 0
 
-    resume_path = args.resume or cfg.get("resume_checkpoint")
+    resume_path = resume_from_cli
+    if resume_path is None and cfg.get("resume_checkpoint"):
+        resume_path = str(
+            require_existing_file(
+                cfg["resume_checkpoint"],
+                label="Config resume_checkpoint",
+            )
+        )
     wandb_logger = WandbLogger(cfg=cfg, run_dir=run_dir, resume_checkpoint=resume_path)
     if resume_path:
         ckpt = load_checkpoint(

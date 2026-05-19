@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 
 import torch
 
-from src.config import load_config
+from src.config import consensus_dataset_kwargs_from_config, load_config
 from src.config_validation import validate_deconver_config
 from src.eval_utils import collate_consensus_batch, compute_multiclass_metrics
 from src.gleason_consensus_dataset import GleasonConsensusDataset
@@ -29,25 +28,7 @@ def main() -> int:
         print("SKIP: data paths not found")
         return 0
 
-    max_long_side = int(cfg.get("max_long_side", 0))
-    deconver_strides = tuple(int(x) for x in cfg.get("deconver_strides", [1, 2, 2, 2]))
-    resize_divisor = int(math.prod([s for s in deconver_strides if s > 1])) or 1
-
-    ds = GleasonConsensusDataset(
-        data_root=str(data_root),
-        consensus_root=str(consensus_root),
-        image_subdirs=tuple(str(x) for x in cfg.get("image_subdirs", ["Train_imgs", "Test_imgs"])),
-        transform=None,
-        renormalize_probs=bool(cfg.get("renormalize_probs", True)),
-        enforce_background_ignore=bool(cfg.get("enforce_background_ignore", True)),
-        otsu_close_radius=int(cfg.get("otsu_close_radius", 3)),
-        otsu_min_object_size=int(cfg.get("otsu_min_object_size", 4096)),
-        otsu_min_hole_size=int(cfg.get("otsu_min_hole_size", 4096)),
-        probs_eps=float(cfg.get("probs_eps", 1e-8)),
-        load_qc_report=False,
-        max_long_side=max_long_side or None,
-        resize_divisor=resize_divisor,
-    )
+    ds = GleasonConsensusDataset(**consensus_dataset_kwargs_from_config(cfg))
     if len(ds) == 0:
         print("SKIP: no consensus samples discovered")
         return 0
@@ -66,7 +47,13 @@ def main() -> int:
         ignore_mask=batch["ignore_mask"],
         include_background_in_dice=bool(cfg.get("include_background_in_dice", False)),
     )
-    print("OK: smoke test passed", {k: (None if torch.isnan(torch.tensor(v)) else round(v, 4)) for k, v in metrics.items()})
+    print(
+        "OK: smoke test passed",
+        {
+            k: (None if torch.isnan(torch.tensor(v)) else round(v, 4))
+            for k, v in metrics.items()
+        },
+    )
     return 0
 
 

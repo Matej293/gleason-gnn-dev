@@ -31,6 +31,21 @@ otsu_min_object_size: 4096
 otsu_min_hole_size: 4096
 probs_eps: 1e-8
 
+# Train-time augmentation (MONAI, train split only)
+transforms_enabled: false
+transforms_profile: light
+transforms_seed_sync: true
+# transforms_patch_size: [512, 512]
+# transforms_prob:
+#   flip_h: 0.50
+#   flip_v: 0.50
+#   rotate90: 0.20
+#   affine: 0.15
+#   crop: 0.00
+#   scale_intensity: 0.15
+#   adjust_contrast: 0.10
+#   gaussian_noise: 0.10
+
 model: unet_lite
 spatial_dims: 2
 input_channels: 3

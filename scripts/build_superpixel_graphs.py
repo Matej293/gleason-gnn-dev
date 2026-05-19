@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +10,17 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from src.config import load_config
+from src.config import consensus_dataset_kwargs_from_config, load_config
+from src.cli_utils import (
+    ensure_output_dir,
+    require_existing_dir,
+    require_existing_file,
+    resolve_checkpoint_path,
+    validate_fraction,
+    validate_non_negative_int,
+    validate_positive_int,
+)
+from src.config_validation import validate_deconver_config
 from src.eval_utils import collate_consensus_batch, resolve_split_manifest_path, safe_read_json
 from src.gleason_consensus_dataset import GleasonConsensusDataset
 from src.graph_pipeline import (
@@ -21,53 +30,114 @@ from src.graph_pipeline import (
     generate_slic_superpixels,
 )
 from src.models import build_model
+from src.model_outputs import extract_logits as _extract_logits
 from src.utils import ensure_cuda_binary_compatibility, load_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Build superpixel graph artifacts from model predictions. "
-            "Uses a trained checkpoint from a specific run directory."
-        )
+            "Build superpixel graph artifacts from model predictions using a trained segmentation checkpoint."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument(
+
+    io_group = p.add_argument_group("I/O")
+    io_group.add_argument(
         "--run",
         required=True,
         type=str,
         help="Run directory containing config.yaml and checkpoints/.",
     )
-    p.add_argument(
+    io_group.add_argument(
         "--checkpoint",
         type=str,
         default="best.pt",
-        help="Checkpoint filename in run/checkpoints or absolute path (default: best.pt).",
+        help="Checkpoint filename in run/checkpoints or absolute checkpoint path.",
     )
-    p.add_argument(
+    io_group.add_argument(
         "--split",
         choices=["train", "val", "test", "all"],
         required=True,
-        help="Which split to export graphs for.",
+        help="Dataset split to export.",
     )
-    p.add_argument("--output-dir", type=str, default="outputs/graphs")
-    p.add_argument("--num-segments", type=int, default=300)
-    p.add_argument("--compactness", type=float, default=10.0)
-    p.add_argument("--superpixel-preset", choices=["low", "med", "high"], default=None)
-    p.add_argument("--sigma", type=float, default=1.0)
-    p.add_argument("--edge-policy", choices=["touch", "knn", "touch_plus_knn"], default="touch")
-    p.add_argument("--edge-knn-k", type=int, default=2)
-    p.add_argument("--edge-knn-max-distance", type=float, default=0.0, help="0 disables distance threshold.")
-    p.add_argument("--min-majority-fraction", type=float, default=0.6)
-    p.add_argument("--tiny-superpixel-max-pixels", type=int, default=8)
-    p.add_argument("--batch-size", type=int, default=None, help="Override loader batch size.")
-    p.add_argument("--num-workers", type=int, default=None, help="Override loader worker count.")
-    p.add_argument(
+    io_group.add_argument(
+        "--output-dir",
+        type=str,
+        default="outputs/graphs",
+        help="Root directory for exported graph artifacts.",
+    )
+
+    sp_group = p.add_argument_group("Superpixel / Graph")
+    sp_group.add_argument("--num-segments", type=int, default=300)
+    sp_group.add_argument("--compactness", type=float, default=10.0)
+    sp_group.add_argument("--superpixel-preset", choices=["low", "med", "high"], default=None)
+    sp_group.add_argument("--sigma", type=float, default=1.0)
+    sp_group.add_argument("--edge-policy", choices=["touch", "knn", "touch_plus_knn"], default="touch")
+    sp_group.add_argument("--edge-knn-k", type=int, default=2)
+    sp_group.add_argument(
+        "--edge-knn-max-distance",
+        type=float,
+        default=0.0,
+        help="Maximum KNN edge distance; 0 disables distance threshold.",
+    )
+    sp_group.add_argument("--min-majority-fraction", type=float, default=0.6)
+    sp_group.add_argument("--tiny-superpixel-max-pixels", type=int, default=8)
+
+    loader_group = p.add_argument_group("Data Loader")
+    loader_group.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override loader batch size.",
+    )
+    loader_group.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override loader worker count.",
+    )
+
+    qc_group = p.add_argument_group("Safety Checks")
+    qc_group.add_argument(
         "--min-supervised-ratio",
         type=float,
         default=0.01,
         help="Fail build if supervised node ratio falls below this threshold.",
     )
     return p.parse_args()
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    args.num_segments = validate_positive_int(args.num_segments, field_name="num_segments")
+    args.edge_knn_k = validate_positive_int(args.edge_knn_k, field_name="edge_knn_k")
+    args.tiny_superpixel_max_pixels = validate_non_negative_int(
+        args.tiny_superpixel_max_pixels,
+        field_name="tiny_superpixel_max_pixels",
+    )
+    args.min_majority_fraction = validate_fraction(
+        args.min_majority_fraction,
+        field_name="min_majority_fraction",
+    )
+    args.min_supervised_ratio = validate_fraction(
+        args.min_supervised_ratio,
+        field_name="min_supervised_ratio",
+    )
+    if args.batch_size is not None:
+        args.batch_size = validate_positive_int(args.batch_size, field_name="batch_size")
+    if args.num_workers is not None:
+        args.num_workers = validate_non_negative_int(args.num_workers, field_name="num_workers")
+    args.compactness = float(args.compactness)
+    args.sigma = float(args.sigma)
+    args.edge_knn_max_distance = float(args.edge_knn_max_distance)
+    if args.compactness < 0.0:
+        raise ValueError(f"compactness must be >= 0, got {args.compactness}.")
+    if args.sigma < 0.0:
+        raise ValueError(f"sigma must be >= 0, got {args.sigma}.")
+    if args.edge_knn_max_distance < 0.0:
+        raise ValueError(
+            "edge_knn_max_distance must be >= 0; use 0 to disable threshold."
+        )
 
 
 def _resolve_superpixel_params(args: argparse.Namespace) -> tuple[int, float]:
@@ -80,36 +150,6 @@ def _resolve_superpixel_params(args: argparse.Namespace) -> tuple[int, float]:
     }
     return presets[args.superpixel_preset]
 
-
-def _resolve_resize_divisor(cfg: dict) -> int:
-    model_name = str(cfg.get("model", "deconver")).strip().lower()
-    if model_name == "deconver":
-        deconver_strides = tuple(int(x) for x in cfg.get("deconver_strides", [1, 2, 2, 2]))
-        return int(math.prod([s for s in deconver_strides if s > 1])) or 1
-    return 8
-
-
-def _resolve_checkpoint(run_dir: Path, checkpoint_arg: str) -> Path:
-    ckpt_arg = Path(checkpoint_arg)
-    if ckpt_arg.exists():
-        return ckpt_arg.resolve()
-    ckpt = run_dir / "checkpoints" / checkpoint_arg
-    if ckpt.exists():
-        return ckpt.resolve()
-    raise FileNotFoundError(f"Checkpoint not found: {checkpoint_arg}")
-
-
-def _extract_logits(out: object) -> torch.Tensor:
-    if isinstance(out, torch.Tensor):
-        return out
-    if isinstance(out, dict):
-        logits = out.get("out")
-        if isinstance(logits, torch.Tensor):
-            return logits
-        raise TypeError("Model output dict must contain tensor under key 'out'.")
-    if isinstance(out, (list, tuple)) and out and isinstance(out[0], torch.Tensor):
-        return out[0]
-    raise TypeError(f"Unsupported model output type: {type(out)!r}")
 
 
 def _select_indices(dataset: GleasonConsensusDataset, split_manifest: Path, split: str) -> list[int]:
@@ -126,14 +166,21 @@ def _select_indices(dataset: GleasonConsensusDataset, split_manifest: Path, spli
 
 def main() -> None:
     args = parse_args()
-    num_segments, compactness = _resolve_superpixel_params(args)
-    run_dir = Path(args.run).resolve()
-    cfg_path = run_dir / "config.yaml"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Run config missing: {cfg_path}")
-    cfg = load_config(str(cfg_path))
+    _validate_args(args)
 
-    ckpt_path = _resolve_checkpoint(run_dir, args.checkpoint)
+    num_segments, compactness = _resolve_superpixel_params(args)
+    run_dir = require_existing_dir(args.run, label="Run directory")
+    cfg_path = require_existing_file(run_dir / "config.yaml", label="Run config")
+    output_root = ensure_output_dir(args.output_dir, label="Graph output root")
+
+    cfg = load_config(cfg_path)
+    validate_deconver_config(
+        cfg,
+        for_eval=(args.split != "all"),
+        require_paths=True,
+    )
+
+    ckpt_path = resolve_checkpoint_path(run_dir, args.checkpoint, prefer_best=False)
     device = torch.device(
         "cuda" if torch.cuda.is_available() and cfg.get("device", "cuda") == "cuda" else "cpu"
     )
@@ -143,23 +190,27 @@ def main() -> None:
     load_checkpoint(str(ckpt_path), model=model, device=device)
     model.eval()
 
-    dataset = GleasonConsensusDataset(
-        data_root=cfg["data_root"],
-        consensus_root=cfg["consensus_root"],
-        image_subdirs=tuple(str(x) for x in cfg.get("image_subdirs", ["Train_imgs", "Test_imgs"])),
-        transform=None,
-        renormalize_probs=bool(cfg.get("renormalize_probs", True)),
-        enforce_background_ignore=bool(cfg.get("enforce_background_ignore", True)),
-        otsu_close_radius=int(cfg.get("otsu_close_radius", 3)),
-        otsu_min_object_size=int(cfg.get("otsu_min_object_size", 4096)),
-        otsu_min_hole_size=int(cfg.get("otsu_min_hole_size", 4096)),
-        probs_eps=float(cfg.get("probs_eps", 1e-8)),
-        load_qc_report=False,
-        max_long_side=int(cfg.get("max_long_side", 0)) or None,
-        resize_divisor=_resolve_resize_divisor(cfg),
-    )
+    dataset_kwargs = consensus_dataset_kwargs_from_config(cfg)
+    dataset = GleasonConsensusDataset(**dataset_kwargs)
 
     split_manifest = resolve_split_manifest_path(cfg)
+    if args.split != "all":
+        split_manifest = require_existing_file(split_manifest, label="Split manifest")
+
+    logger_msg = (
+        "Graph export setup | run=%s checkpoint=%s split=%s output_root=%s split_manifest=%s"
+    )
+    print(
+        logger_msg
+        % (
+            run_dir,
+            ckpt_path,
+            args.split,
+            output_root,
+            split_manifest,
+        )
+    )
+
     indices = _select_indices(dataset, split_manifest, args.split)
     subset = Subset(dataset, indices)
     batch_size = int(args.batch_size) if args.batch_size is not None else int(cfg.get("val_batch_size", 1))
@@ -173,7 +224,7 @@ def main() -> None:
         collate_fn=collate_consensus_batch,
     )
 
-    run_out = Path(args.output_dir).resolve() / run_dir.name / args.split
+    run_out = output_root / run_dir.name / args.split
     run_out.mkdir(parents=True, exist_ok=True)
     per_graph_stats: list[dict[str, float | int | str]] = []
 

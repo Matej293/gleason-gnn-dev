@@ -130,6 +130,57 @@ def validate_deconver_config(
             f"split_search_max_attempts must be >= 1, got {split_search_max_attempts}"
         )
 
+    transforms_enabled = bool(cfg.get("transforms_enabled", False))
+    transforms_profile = str(cfg.get("transforms_profile", "light")).strip().lower()
+    if transforms_profile not in {"light", "medium", "strong"}:
+        raise ValueError(
+            "transforms_profile must be one of ['light', 'medium', 'strong'], "
+            f"got {transforms_profile!r}"
+        )
+
+    transforms_patch = cfg.get("transforms_patch_size", None)
+    if transforms_patch is not None:
+        if not isinstance(transforms_patch, (list, tuple)) or len(transforms_patch) != 2:
+            raise ValueError("transforms_patch_size must be a 2-item list/tuple [H, W].")
+        patch_h = int(transforms_patch[0])
+        patch_w = int(transforms_patch[1])
+        if patch_h <= 0 or patch_w <= 0:
+            raise ValueError(
+                f"transforms_patch_size entries must be > 0, got [{patch_h}, {patch_w}]"
+            )
+
+    transforms_prob = cfg.get("transforms_prob", None)
+    if transforms_prob is not None:
+        if not isinstance(transforms_prob, dict):
+            raise ValueError("transforms_prob must be a mapping of op_name -> probability.")
+        allowed_prob_keys = {
+            "flip_h",
+            "flip_v",
+            "rotate90",
+            "affine",
+            "crop",
+            "scale_intensity",
+            "adjust_contrast",
+            "gaussian_noise",
+        }
+        for key, value in transforms_prob.items():
+            if key not in allowed_prob_keys:
+                raise ValueError(
+                    f"Unsupported transforms_prob key {key!r}. Supported: {sorted(allowed_prob_keys)}"
+                )
+            p = float(value)
+            if p < 0.0 or p > 1.0:
+                raise ValueError(
+                    f"transforms_prob[{key!r}] must be in [0,1], got {p}"
+                )
+
+    if transforms_enabled:
+        crop_p = float(transforms_prob.get("crop", 0.0)) if isinstance(transforms_prob, dict) else 0.0
+        if crop_p > 0.0 and transforms_patch is None:
+            raise ValueError(
+                "transforms_prob['crop'] > 0 requires transforms_patch_size=[H, W]."
+            )
+
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).strip().lower()
     if amp_dtype_str not in {"fp16", "bf16"}:
         raise ValueError(f"amp_dtype must be one of ['fp16', 'bf16'], got {amp_dtype_str!r}")
@@ -146,6 +197,38 @@ def validate_deconver_config(
         if not wandb_project:
             raise ValueError("wandb_project must be provided when W&B is enabled.")
 
+    split_mode = str(cfg.get("split_mode", "iter_80_20")).strip().lower()
+    if split_mode not in {"iter_80_20", "final_80_10_10"}:
+        raise ValueError(
+            f"split_mode must be one of ['iter_80_20', 'final_80_10_10'], got {split_mode!r}"
+        )
+
+    batch_size = int(cfg.get("batch_size", 1))
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
+    val_batch_size = int(cfg.get("val_batch_size", batch_size))
+    if val_batch_size <= 0:
+        raise ValueError(f"val_batch_size must be > 0, got {val_batch_size}")
+
+    num_workers = int(cfg.get("num_workers", 0))
+    if num_workers < 0:
+        raise ValueError(f"num_workers must be >= 0, got {num_workers}")
+
+    random_seed = int(cfg.get("random_seed", 42))
+    if random_seed < 0:
+        raise ValueError(f"random_seed must be >= 0, got {random_seed}")
+
+    exp_name = str(cfg.get("experiment_name", "")).strip()
+    if exp_name:
+        if "/" in exp_name or "\\" in exp_name:
+            raise ValueError("experiment_name must not contain path separators ('/' or '\\').")
+        if exp_name in {".", ".."}:
+            raise ValueError("experiment_name cannot be '.' or '..'.")
+
+    base_output_dir = str(cfg.get("base_output_dir", "")).strip()
+    if not base_output_dir:
+        raise ValueError("base_output_dir must be a non-empty string.")
     if require_paths:
         data_root = Path(str(cfg["data_root"]))
         consensus_root = Path(str(cfg["consensus_root"]))
