@@ -6,7 +6,7 @@ Segmentation and graph-preparation pipeline for the Gleason 2019 challenge datas
 
 This repository covers:
 
-- Segmentation training (`deconver`, `unet_lite`, `pspnet_gleason`)
+- Segmentation training (`deconver`, `unet_lite`, `pspnet`)
 - Consensus label generation (STAPLE and weighted fusion)
 - Checkpoint evaluation (raw and postprocessed metrics)
 - Superpixel graph export
@@ -29,7 +29,7 @@ pip install -r requirements.txt
 
 ## GPU compatibility (Volta / TITAN V)
 
-The provided local configs are tuned for Volta-class GPUs (for example, NVIDIA TITAN V).
+The provided training configs are tuned for Volta-class GPUs (for example, NVIDIA TITAN V).
 
 Why:
 
@@ -102,13 +102,13 @@ make audit-background-ignore
 
 ```bash
 # deconver
-make train CONFIG=configs/deconver_local.yaml
+make train CONFIG=configs/deconver.yaml
 
 # unet_lite
-make train CONFIG=configs/unet_lite_local.yaml
+make train CONFIG=configs/unet_lite.yaml
 
-# pspnet_gleason
-make train CONFIG=configs/pspnet_gleason_local.yaml
+# pspnet
+make train CONFIG=configs/pspnet.yaml
 ```
 
 4. Evaluate the segmentation run.
@@ -172,7 +172,7 @@ Conventions:
 
 ```bash
 make help
-make train CONFIG=configs/deconver_local.yaml
+make train CONFIG=configs/deconver.yaml
 make eval RUN=outputs/runs/<run_name>
 make consensus
 make consensus-weighted
@@ -183,7 +183,7 @@ make gnn-eval GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>
 ## CLI equivalents
 
 ```bash
-PYTHONPATH=. python -m src.train_deconver --config configs/deconver_local.yaml
+PYTHONPATH=. python -m src.train_deconver --config configs/deconver.yaml
 PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
 PYTHONPATH=. python scripts/build_superpixel_graphs.py --run outputs/runs/<run_name> --split test
 PYTHONPATH=. python scripts/train_gnn_node_classifier.py --graphs-root outputs/graphs/<graph_run> --model graphsage

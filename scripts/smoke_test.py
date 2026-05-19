@@ -14,7 +14,7 @@ from src.models import build_model
 
 
 def main() -> int:
-    cfg_path = Path("configs/deconver_local.yaml")
+    cfg_path = Path("configs/deconver.yaml")
     if not cfg_path.exists():
         print("FAIL: config missing", file=sys.stderr)
         return 1

@@ -2,7 +2,7 @@
 Training for Gleason consensus labels (4-class segmentation).
 
 Usage:
-    python -m src.train_deconver --config configs/deconver_local.yaml
+    python -m src.train_deconver --config configs/deconver.yaml
 """
 
 from __future__ import annotations
@@ -1003,7 +1003,7 @@ def _compute_training_loss(
     pspnet_soft_weight: float,
     pspnet_soft_term: str,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    if model_name == "pspnet_gleason" and pspnet_loss_mode == "gleason_ce":
+    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce":
         loss, stats = _gleason_ce_loss(
             logits=logits,
             hard_mask=hard_mask,
@@ -1027,7 +1027,7 @@ def _compute_training_loss(
             )
             loss = loss + (float(pspnet_aux_weight) * aux_loss)
         return loss, stats
-    if model_name == "pspnet_gleason" and pspnet_loss_mode == "gleason_ce_soft":
+    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce_soft":
         loss, stats = _gleason_ce_loss(
             logits=logits,
             hard_mask=hard_mask,
@@ -1080,7 +1080,7 @@ def _compute_training_loss(
         include_background_in_dice=include_background_in_dice,
         exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
     )
-    if model_name == "pspnet_gleason" and aux is not None:
+    if model_name == "pspnet" and aux is not None:
         aux = aux.clamp(-15.0, 15.0)
         aux_loss, _ = _consensus_loss(
             outputs=aux,
@@ -2050,9 +2050,9 @@ def main() -> None:
     logger.info("torch.compile: %s", cfg.get("use_compile", False))
     logger.info("Experiment: %s", cfg["experiment_name"])
     logger.info("Run directory: %s", run_dir)
-    if cfg_model == "pspnet_gleason":
+    if cfg_model == "pspnet":
         logger.info(
-            "Loss setup (pspnet_gleason): mode=%s aux_weight=%.3f soft_term=%s soft_weight=%.3f | confidence_mask=%s(th=%.2f)",
+            "Loss setup (pspnet): mode=%s aux_weight=%.3f soft_term=%s soft_weight=%.3f | confidence_mask=%s(th=%.2f)",
             str(cfg.get("pspnet_loss_mode", "consensus")).strip().lower(),
             float(cfg.get("pspnet_aux_weight", 0.5)),
             str(cfg.get("pspnet_soft_term", "ce")).strip().lower(),
@@ -2079,7 +2079,7 @@ def main() -> None:
         optimizer_name,
         lr_schedule,
     )
-    if cfg_model != "pspnet_gleason":
+    if cfg_model != "pspnet":
         logger.info(
             "Loss schedule: enabled=%s switch_epoch=%d warmup(soft=%.3f,dice=%.3f) final(soft=%.3f,dice=%.3f)",
             bool(cfg.get("loss_schedule_enabled", False)),
@@ -2156,7 +2156,7 @@ def main() -> None:
     pspnet_soft_weight = float(cfg.get("pspnet_soft_weight", 0.2))
     if pspnet_soft_weight < 0.0:
         raise ValueError(f"pspnet_soft_weight must be >= 0, got {pspnet_soft_weight}")
-    if cfg_model != "pspnet_gleason":
+    if cfg_model != "pspnet":
         pspnet_loss_mode = "consensus"
 
     for epoch in tqdm(range(start_epoch, epochs + 1), desc="Epochs", unit="epoch"):

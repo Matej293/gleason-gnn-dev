@@ -52,10 +52,46 @@ def _make_toy_dataset(tmp_path: Path) -> tuple[Path, Path]:
     return data_root, consensus_root
 
 
+_DEFAULT_TRANSFORM_PROFILES = {
+    "light": {
+        "flip_h": 0.50,
+        "flip_v": 0.50,
+        "rotate90": 0.20,
+        "affine": 0.15,
+        "crop": 0.00,
+        "scale_intensity": 0.15,
+        "adjust_contrast": 0.10,
+        "gaussian_noise": 0.10,
+    },
+    "medium": {
+        "flip_h": 0.50,
+        "flip_v": 0.50,
+        "rotate90": 0.30,
+        "affine": 0.25,
+        "crop": 0.00,
+        "scale_intensity": 0.20,
+        "adjust_contrast": 0.15,
+        "gaussian_noise": 0.15,
+    },
+    "strong": {
+        "flip_h": 0.50,
+        "flip_v": 0.50,
+        "rotate90": 0.40,
+        "affine": 0.35,
+        "crop": 0.00,
+        "scale_intensity": 0.25,
+        "adjust_contrast": 0.20,
+        "gaussian_noise": 0.20,
+    },
+}
+
+
 def _enabled_cfg() -> dict:
     return {
         "transforms_enabled": True,
         "transforms_profile": "light",
+        "transforms_patch_size": None,
+        "transforms_profiles": _DEFAULT_TRANSFORM_PROFILES,
         "transforms_prob": {
             "flip_h": 1.0,
             "flip_v": 1.0,
@@ -66,6 +102,13 @@ def _enabled_cfg() -> dict:
             "adjust_contrast": 0.0,
             "gaussian_noise": 0.0,
         },
+        "transforms_affine_rotate_range": [0.12],
+        "transforms_affine_translate_range": [32, 32],
+        "transforms_affine_scale_range": [0.08, 0.08],
+        "transforms_scale_intensity_factors": 0.10,
+        "transforms_adjust_contrast_gamma": [0.85, 1.15],
+        "transforms_gaussian_noise_mean": 0.0,
+        "transforms_gaussian_noise_std": 0.03,
     }
 
 
@@ -163,9 +206,11 @@ def test_transform_enabled_loss_smoke(tmp_path: Path) -> None:
 def test_transforms_disabled_keeps_interface_noop(tmp_path: Path) -> None:
     data_root, consensus_root = _make_toy_dataset(tmp_path)
     cfg = {
+        "model": "deconver",
         "data_root": str(data_root),
         "consensus_root": str(consensus_root),
         "image_subdirs": ["Train_imgs"],
+        "deconver_strides": [1, 2, 2, 2],
         "transforms_enabled": False,
         "renormalize_probs": True,
         "enforce_background_ignore": True,

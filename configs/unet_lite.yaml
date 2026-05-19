@@ -1,4 +1,4 @@
-experiment_name: unet_lite_consensus_local
+experiment_name: unet_lite_consensus
 epochs: 120
 batch_size: 12
 val_batch_size: 2
@@ -16,7 +16,7 @@ image_subdirs: [Train_imgs]
 supervised_image_subdirs: [Train_imgs]
 
 split_mode: final_80_10_10
-split_manifest_path: ./outputs/splits/gleason_consensus_split_local_80_10_10.json
+split_manifest_path: ./outputs/splits/gleason_consensus_split_80_10_10.json
 enforce_val_class_presence: true
 val_min_g3_pos_images: 1
 val_min_g4_pos_images: 1
@@ -35,16 +35,43 @@ probs_eps: 1e-8
 transforms_enabled: false
 transforms_profile: light
 transforms_seed_sync: true
-# transforms_patch_size: [512, 512]
-# transforms_prob:
-#   flip_h: 0.50
-#   flip_v: 0.50
-#   rotate90: 0.20
-#   affine: 0.15
-#   crop: 0.00
-#   scale_intensity: 0.15
-#   adjust_contrast: 0.10
-#   gaussian_noise: 0.10
+transforms_patch_size: null
+transforms_profiles:
+  light:
+    flip_h: 0.50
+    flip_v: 0.50
+    rotate90: 0.20
+    affine: 0.15
+    crop: 0.00
+    scale_intensity: 0.15
+    adjust_contrast: 0.10
+    gaussian_noise: 0.10
+  medium:
+    flip_h: 0.50
+    flip_v: 0.50
+    rotate90: 0.30
+    affine: 0.25
+    crop: 0.00
+    scale_intensity: 0.20
+    adjust_contrast: 0.15
+    gaussian_noise: 0.15
+  strong:
+    flip_h: 0.50
+    flip_v: 0.50
+    rotate90: 0.40
+    affine: 0.35
+    crop: 0.00
+    scale_intensity: 0.25
+    adjust_contrast: 0.20
+    gaussian_noise: 0.20
+transforms_prob: {}
+transforms_affine_rotate_range: [0.12]
+transforms_affine_translate_range: [32, 32]
+transforms_affine_scale_range: [0.08, 0.08]
+transforms_scale_intensity_factors: 0.10
+transforms_adjust_contrast_gamma: [0.85, 1.15]
+transforms_gaussian_noise_mean: 0.0
+transforms_gaussian_noise_std: 0.03
 
 model: unet_lite
 spatial_dims: 2
@@ -109,8 +136,8 @@ wandb_mode: online
 wandb_project: prostate-lesion-segmentation
 wandb_entity: ""
 wandb_run_name: ""
-wandb_group: unet-lite-local
-wandb_tags: [unet_lite, consensus, segmentation, local]
+wandb_group: unet-lite
+wandb_tags: [unet_lite, consensus, segmentation]
 wandb_log_config: true
 wandb_strict: false
 

@@ -42,38 +42,6 @@ SUPPORTED_PROB_KEYS: tuple[str, ...] = (
     "adjust_contrast",
     "gaussian_noise",
 )
-_PROFILE_PROBS: dict[str, dict[str, float]] = {
-    "light": {
-        "flip_h": 0.50,
-        "flip_v": 0.50,
-        "rotate90": 0.20,
-        "affine": 0.15,
-        "crop": 0.00,
-        "scale_intensity": 0.15,
-        "adjust_contrast": 0.10,
-        "gaussian_noise": 0.10,
-    },
-    "medium": {
-        "flip_h": 0.50,
-        "flip_v": 0.50,
-        "rotate90": 0.30,
-        "affine": 0.25,
-        "crop": 0.00,
-        "scale_intensity": 0.20,
-        "adjust_contrast": 0.15,
-        "gaussian_noise": 0.15,
-    },
-    "strong": {
-        "flip_h": 0.50,
-        "flip_v": 0.50,
-        "rotate90": 0.40,
-        "affine": 0.35,
-        "crop": 0.00,
-        "scale_intensity": 0.25,
-        "adjust_contrast": 0.20,
-        "gaussian_noise": 0.20,
-    },
-}
 
 
 def _to_float_tensor(x: torch.Tensor) -> torch.Tensor:
@@ -128,6 +96,12 @@ def _finalize_binary_mask(x: torch.Tensor) -> torch.Tensor:
     return (x >= 0.5).to(torch.uint8)
 
 
+def _require_cfg_key(cfg: dict[str, Any], key: str) -> Any:
+    if key not in cfg:
+        raise ValueError(f"Missing required transform config key: {key!r}")
+    return cfg[key]
+
+
 def _resolve_patch_size(raw: Any) -> tuple[int, int] | None:
     if raw is None:
         return None
@@ -140,19 +114,50 @@ def _resolve_patch_size(raw: Any) -> tuple[int, int] | None:
     return h, w
 
 
+def _resolve_numeric_sequence(raw: Any, *, key: str, expected_len: int) -> tuple[float, ...]:
+    if not isinstance(raw, (list, tuple)) or len(raw) != expected_len:
+        raise ValueError(f"{key} must be a {expected_len}-item list/tuple.")
+    return tuple(float(x) for x in raw)
+
+
 def _resolve_profile_probs(
     profile: str,
+    profiles: dict[str, Any],
     overrides: dict[str, Any] | None,
 ) -> dict[str, float]:
-    if profile not in _PROFILE_PROBS:
+    if profile not in profiles:
         raise ValueError(
-            f"Unsupported transforms_profile={profile!r}. Supported: {SUPPORTED_PROFILES}."
+            f"Unsupported transforms_profile={profile!r}. Supported: {sorted(profiles.keys())}."
         )
-    resolved = dict(_PROFILE_PROBS[profile])
+
+    selected = profiles[profile]
+    if not isinstance(selected, dict):
+        raise ValueError(f"transforms_profiles[{profile!r}] must be a mapping.")
+
+    resolved: dict[str, float] = {}
+    for key in SUPPORTED_PROB_KEYS:
+        if key not in selected:
+            raise ValueError(
+                f"transforms_profiles[{profile!r}] is missing probability key {key!r}."
+            )
+        p = float(selected[key])
+        if p < 0.0 or p > 1.0:
+            raise ValueError(
+                f"transforms_profiles[{profile!r}][{key!r}] must be in [0,1], got {p}."
+            )
+        resolved[key] = p
+
+    extra = set(selected.keys()) - set(SUPPORTED_PROB_KEYS)
+    if extra:
+        raise ValueError(
+            f"transforms_profiles[{profile!r}] has unsupported keys: {sorted(extra)}"
+        )
+
     if overrides is None:
         return resolved
     if not isinstance(overrides, dict):
         raise ValueError("transforms_prob must be a mapping of op_name -> probability.")
+
     for key, value in overrides.items():
         if key not in resolved:
             raise ValueError(
@@ -160,9 +165,7 @@ def _resolve_profile_probs(
             )
         p = float(value)
         if p < 0.0 or p > 1.0:
-            raise ValueError(
-                f"transforms_prob[{key!r}] must be in [0,1], got {p}."
-            )
+            raise ValueError(f"transforms_prob[{key!r}] must be in [0,1], got {p}.")
         resolved[key] = p
     return resolved
 
@@ -171,10 +174,45 @@ def build_consensus_train_transform(cfg: dict[str, Any]) -> Callable[[dict[str, 
     if not bool(cfg.get("transforms_enabled", False)):
         return None
 
-    profile = str(cfg.get("transforms_profile", "light")).strip().lower()
+    profile = str(_require_cfg_key(cfg, "transforms_profile")).strip().lower()
+    profiles = _require_cfg_key(cfg, "transforms_profiles")
+    if not isinstance(profiles, dict):
+        raise ValueError("transforms_profiles must be a mapping of profile_name -> probability map.")
+    if any(name not in profiles for name in SUPPORTED_PROFILES):
+        missing = [name for name in SUPPORTED_PROFILES if name not in profiles]
+        raise ValueError(f"transforms_profiles missing required profiles: {missing}")
+
     prob_overrides = cfg.get("transforms_prob", None)
-    probs = _resolve_profile_probs(profile=profile, overrides=prob_overrides)
-    patch_size = _resolve_patch_size(cfg.get("transforms_patch_size", None))
+    probs = _resolve_profile_probs(
+        profile=profile,
+        profiles=profiles,
+        overrides=prob_overrides,
+    )
+    patch_size = _resolve_patch_size(_require_cfg_key(cfg, "transforms_patch_size"))
+
+    affine_rotate_range = _resolve_numeric_sequence(
+        _require_cfg_key(cfg, "transforms_affine_rotate_range"),
+        key="transforms_affine_rotate_range",
+        expected_len=1,
+    )
+    affine_translate_range = _resolve_numeric_sequence(
+        _require_cfg_key(cfg, "transforms_affine_translate_range"),
+        key="transforms_affine_translate_range",
+        expected_len=2,
+    )
+    affine_scale_range = _resolve_numeric_sequence(
+        _require_cfg_key(cfg, "transforms_affine_scale_range"),
+        key="transforms_affine_scale_range",
+        expected_len=2,
+    )
+    scale_intensity_factors = float(_require_cfg_key(cfg, "transforms_scale_intensity_factors"))
+    adjust_contrast_gamma = _resolve_numeric_sequence(
+        _require_cfg_key(cfg, "transforms_adjust_contrast_gamma"),
+        key="transforms_adjust_contrast_gamma",
+        expected_len=2,
+    )
+    gaussian_noise_mean = float(_require_cfg_key(cfg, "transforms_gaussian_noise_mean"))
+    gaussian_noise_std = float(_require_cfg_key(cfg, "transforms_gaussian_noise_std"))
 
     transforms: list[Callable] = [
         EnsureTyped(keys=SAMPLE_KEYS, dtype=torch.float32, track_meta=False),
@@ -189,9 +227,9 @@ def build_consensus_train_transform(cfg: dict[str, Any]) -> Callable[[dict[str, 
             RandAffined(
                 keys=SAMPLE_KEYS,
                 prob=probs["affine"],
-                rotate_range=(0.12,),
-                translate_range=(32, 32),
-                scale_range=(0.08, 0.08),
+                rotate_range=affine_rotate_range,
+                translate_range=affine_translate_range,
+                scale_range=affine_scale_range,
                 mode=SPATIAL_MODES,
                 padding_mode=("zeros",) * len(SAMPLE_KEYS),
             )
@@ -214,19 +252,19 @@ def build_consensus_train_transform(cfg: dict[str, Any]) -> Callable[[dict[str, 
         [
             RandScaleIntensityd(
                 keys=("image",),
-                factors=0.10,
+                factors=scale_intensity_factors,
                 prob=probs["scale_intensity"],
             ),
             RandAdjustContrastd(
                 keys=("image",),
                 prob=probs["adjust_contrast"],
-                gamma=(0.85, 1.15),
+                gamma=adjust_contrast_gamma,
             ),
             RandGaussianNoised(
                 keys=("image",),
                 prob=probs["gaussian_noise"],
-                mean=0.0,
-                std=0.03,
+                mean=gaussian_noise_mean,
+                std=gaussian_noise_std,
             ),
             Lambdad(keys=("image",), func=_finalize_image),
             Lambdad(keys=("soft_probs",), func=_normalize_soft_probs),

@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class PSPNetGleason(nn.Module):
+class PSPNet(nn.Module):
     """SMP-backed PSPNet adapted for 2D Gleason segmentation."""
 
     def __init__(
@@ -19,7 +19,7 @@ class PSPNetGleason(nn.Module):
     ) -> None:
         super().__init__()
         if in_channels != 3:
-            raise ValueError(f"PSPNetGleason expects in_channels=3, got {in_channels}")
+            raise ValueError(f"PSPNet expects in_channels=3, got {in_channels}")
 
         resolved_weights = (
             encoder_weights
@@ -33,7 +33,7 @@ class PSPNetGleason(nn.Module):
             import segmentation_models_pytorch as smp
         except ImportError as exc:  # pragma: no cover - depends on optional dependency at runtime.
             raise ImportError(
-                "PSPNetGleason requires 'segmentation-models-pytorch'. "
+                "PSPNet requires 'segmentation-models-pytorch'. "
                 "Install dependencies from requirements.txt."
             ) from exc
 

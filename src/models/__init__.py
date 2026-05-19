@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch.nn as nn
 from src.models.unet_lite import UNetLite
-from src.models.pspnet_gleason import PSPNetGleason
+from src.models.pspnet import PSPNet
 
 _DECONVER_ROOT = Path(__file__).parent / "deconver"
 if str(_DECONVER_ROOT) not in sys.path:
@@ -37,7 +37,7 @@ def build_model(cfg: dict) -> nn.Module:
             out_channels=out_channels,
             base_channels=int(cfg.get("unet_lite_base_channels", 32)),
         )
-    if name == "pspnet_gleason":
+    if name == "pspnet":
         encoder_weights_cfg = cfg.get("pspnet_encoder_weights", None)
         if encoder_weights_cfg is None:
             encoder_weights: str | None = "imagenet" if bool(cfg.get("pspnet_pretrained_backbone", True)) else None
@@ -45,7 +45,7 @@ def build_model(cfg: dict) -> nn.Module:
             encoder_weights_str = str(encoder_weights_cfg).strip().lower()
             encoder_weights = None if encoder_weights_str == "none" else encoder_weights_str
 
-        return PSPNetGleason(
+        return PSPNet(
             in_channels=in_channels,
             out_channels=out_channels,
             use_aux=bool(cfg.get("pspnet_use_aux", True)),
@@ -56,7 +56,7 @@ def build_model(cfg: dict) -> nn.Module:
 
     if name != "deconver":
         raise ValueError(
-            f"Unsupported model {name!r}. Expected 'deconver', 'unet_lite', or 'pspnet_gleason'."
+            f"Unsupported model {name!r}. Expected 'deconver', 'unet_lite', or 'pspnet'."
         )
     if not _DECONVER_AVAILABLE:
         raise ValueError(

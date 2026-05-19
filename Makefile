@@ -11,9 +11,9 @@ GNN_RUN_DIR_PLACEHOLDER := outputs/gnn_runs/<run_dir>
 GNN_COMPARISON_DIR_PLACEHOLDER := outputs/gnn_runs/<comparison_dir>
 
 MAX_CASES ?= 64
-CONFIG ?= configs/deconver_local.yaml
+CONFIG ?= configs/deconver.yaml
 RUN ?= $(RUN_PLACEHOLDER)
-GNN_GRAPHS_ROOT ?= outputs/graphs/20260510_022358_deconver_consensus_local
+GNN_GRAPHS_ROOT ?= outputs/graphs/20260510_022358_deconver_consensus
 GNN_PROFILE ?= thesis
 GNN_SEED ?= 42
 GNN_MODEL ?= graphsage
@@ -66,7 +66,7 @@ endef
 
 help:
 	@echo "Core Targets:"
-	@echo "  make train CONFIG=configs/deconver_local.yaml"
+	@echo "  make train CONFIG=configs/deconver.yaml"
 	@echo "  make eval RUN=outputs/runs/<run_name>"
 	@echo "  make smoke"
 	@echo "  make test"

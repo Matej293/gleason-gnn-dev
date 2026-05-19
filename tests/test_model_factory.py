@@ -31,12 +31,12 @@ def test_build_unet_lite_forward_shape():
     assert tuple(y.shape) == (2, 4, 128, 128)
 
 
-def test_build_pspnet_gleason_forward_shape():
+def test_build_pspnet_forward_shape():
     torch = pytest.importorskip("torch")
     pytest.importorskip("segmentation_models_pytorch")
     model = build_model(
         {
-            "model": "pspnet_gleason",
+            "model": "pspnet",
             "spatial_dims": 2,
             "input_channels": 3,
             "out_channels": 4,
@@ -53,12 +53,12 @@ def test_build_pspnet_gleason_forward_shape():
     assert tuple(y["aux"].shape) == (1, 4, 128, 128)
 
 
-def test_build_pspnet_gleason_forward_shape_no_aux():
+def test_build_pspnet_forward_shape_no_aux():
     torch = pytest.importorskip("torch")
     pytest.importorskip("segmentation_models_pytorch")
     model = build_model(
         {
-            "model": "pspnet_gleason",
+            "model": "pspnet",
             "spatial_dims": 2,
             "input_channels": 3,
             "out_channels": 4,

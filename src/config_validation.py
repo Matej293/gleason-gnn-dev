@@ -5,10 +5,61 @@ from pathlib import Path
 import torch
 
 
+_TRANSFORM_PROB_KEYS = {
+    "flip_h",
+    "flip_v",
+    "rotate90",
+    "affine",
+    "crop",
+    "scale_intensity",
+    "adjust_contrast",
+    "gaussian_noise",
+}
+
+
 def _require_keys(cfg: dict, keys: list[str]) -> None:
     missing = [k for k in keys if k not in cfg]
     if missing:
         raise ValueError(f"Missing required config keys: {missing}")
+
+
+def _validate_transform_profile_probs(
+    *,
+    profile_name: str,
+    probs: dict,
+) -> None:
+    if not isinstance(probs, dict):
+        raise ValueError(f"transforms_profiles[{profile_name!r}] must be a mapping.")
+
+    missing = sorted(_TRANSFORM_PROB_KEYS - set(probs.keys()))
+    extra = sorted(set(probs.keys()) - _TRANSFORM_PROB_KEYS)
+    if missing:
+        raise ValueError(
+            f"transforms_profiles[{profile_name!r}] missing keys: {missing}"
+        )
+    if extra:
+        raise ValueError(
+            f"transforms_profiles[{profile_name!r}] has unsupported keys: {extra}"
+        )
+
+    for key in sorted(_TRANSFORM_PROB_KEYS):
+        p = float(probs[key])
+        if p < 0.0 or p > 1.0:
+            raise ValueError(
+                f"transforms_profiles[{profile_name!r}][{key!r}] must be in [0,1], got {p}"
+            )
+
+
+def _validate_fixed_len_numeric_sequence(
+    raw: object,
+    *,
+    key: str,
+    expected_len: int,
+) -> None:
+    if not isinstance(raw, (list, tuple)) or len(raw) != expected_len:
+        raise ValueError(f"{key} must be a {expected_len}-item list/tuple.")
+    for value in raw:
+        float(value)
 
 
 def validate_deconver_config(
@@ -26,14 +77,32 @@ def validate_deconver_config(
             "data_root",
             "consensus_root",
             "base_output_dir",
+            "image_subdirs",
+            "transforms_enabled",
+            "transforms_profile",
+            "transforms_seed_sync",
+            "transforms_patch_size",
+            "transforms_profiles",
+            "transforms_prob",
+            "transforms_affine_rotate_range",
+            "transforms_affine_translate_range",
+            "transforms_affine_scale_range",
+            "transforms_scale_intensity_factors",
+            "transforms_adjust_contrast_gamma",
+            "transforms_gaussian_noise_mean",
+            "transforms_gaussian_noise_std",
         ],
     )
 
     model_name = str(cfg.get("model", "")).strip().lower()
-    if model_name not in {"deconver", "unet_lite", "pspnet_gleason"}:
+    if model_name not in {"deconver", "unet_lite", "pspnet"}:
         raise ValueError(
-            f"Expected model in ['deconver', 'unet_lite', 'pspnet_gleason'], got {model_name!r}"
+            f"Expected model in ['deconver', 'unet_lite', 'pspnet'], got {model_name!r}"
         )
+
+    image_subdirs = cfg.get("image_subdirs")
+    if not isinstance(image_subdirs, (list, tuple)) or not image_subdirs:
+        raise ValueError("image_subdirs must be a non-empty list/tuple.")
 
     spatial_dims = int(cfg.get("spatial_dims", 2))
     if spatial_dims != 2:
@@ -46,16 +115,25 @@ def validate_deconver_config(
     input_channels = int(cfg.get("input_channels", 3))
     if input_channels <= 0:
         raise ValueError(f"input_channels must be > 0, got {input_channels}")
+
+    if model_name == "deconver":
+        deconver_strides = cfg.get("deconver_strides")
+        if not isinstance(deconver_strides, (list, tuple)) or not deconver_strides:
+            raise ValueError("deconver_strides must be a non-empty list/tuple for model='deconver'.")
+        if any(int(x) <= 0 for x in deconver_strides):
+            raise ValueError("deconver_strides entries must all be > 0.")
+
     if model_name == "unet_lite":
         base_channels = int(cfg.get("unet_lite_base_channels", 32))
         if base_channels <= 0:
             raise ValueError(
                 f"unet_lite_base_channels must be > 0, got {base_channels}"
             )
-    if model_name == "pspnet_gleason":
+
+    if model_name == "pspnet":
         if input_channels != 3:
             raise ValueError(
-                f"pspnet_gleason requires input_channels=3, got {input_channels}"
+                f"pspnet requires input_channels=3, got {input_channels}"
             )
         pspnet_loss_mode = str(cfg.get("pspnet_loss_mode", "consensus")).strip().lower()
         if pspnet_loss_mode not in {"consensus", "gleason_ce", "gleason_ce_soft"}:
@@ -130,11 +208,23 @@ def validate_deconver_config(
             f"split_search_max_attempts must be >= 1, got {split_search_max_attempts}"
         )
 
-    transforms_enabled = bool(cfg.get("transforms_enabled", False))
-    transforms_profile = str(cfg.get("transforms_profile", "light")).strip().lower()
-    if transforms_profile not in {"light", "medium", "strong"}:
+    transforms_profiles = cfg.get("transforms_profiles")
+    if not isinstance(transforms_profiles, dict):
+        raise ValueError("transforms_profiles must be a mapping of profile_name -> probability map.")
+
+    required_profiles = {"light", "medium", "strong"}
+    missing_profiles = sorted(required_profiles - set(transforms_profiles.keys()))
+    if missing_profiles:
         raise ValueError(
-            "transforms_profile must be one of ['light', 'medium', 'strong'], "
+            f"transforms_profiles missing required profiles: {missing_profiles}"
+        )
+    for profile_name, probs in transforms_profiles.items():
+        _validate_transform_profile_probs(profile_name=str(profile_name), probs=probs)
+
+    transforms_profile = str(cfg.get("transforms_profile", "")).strip().lower()
+    if transforms_profile not in transforms_profiles:
+        raise ValueError(
+            "transforms_profile must match one of transforms_profiles keys, "
             f"got {transforms_profile!r}"
         )
 
@@ -150,36 +240,56 @@ def validate_deconver_config(
             )
 
     transforms_prob = cfg.get("transforms_prob", None)
-    if transforms_prob is not None:
-        if not isinstance(transforms_prob, dict):
-            raise ValueError("transforms_prob must be a mapping of op_name -> probability.")
-        allowed_prob_keys = {
-            "flip_h",
-            "flip_v",
-            "rotate90",
-            "affine",
-            "crop",
-            "scale_intensity",
-            "adjust_contrast",
-            "gaussian_noise",
-        }
-        for key, value in transforms_prob.items():
-            if key not in allowed_prob_keys:
-                raise ValueError(
-                    f"Unsupported transforms_prob key {key!r}. Supported: {sorted(allowed_prob_keys)}"
-                )
-            p = float(value)
-            if p < 0.0 or p > 1.0:
-                raise ValueError(
-                    f"transforms_prob[{key!r}] must be in [0,1], got {p}"
-                )
-
-    if transforms_enabled:
-        crop_p = float(transforms_prob.get("crop", 0.0)) if isinstance(transforms_prob, dict) else 0.0
-        if crop_p > 0.0 and transforms_patch is None:
+    if transforms_prob is None:
+        transforms_prob = {}
+    if not isinstance(transforms_prob, dict):
+        raise ValueError("transforms_prob must be a mapping of op_name -> probability.")
+    for key, value in transforms_prob.items():
+        if key not in _TRANSFORM_PROB_KEYS:
             raise ValueError(
-                "transforms_prob['crop'] > 0 requires transforms_patch_size=[H, W]."
+                f"Unsupported transforms_prob key {key!r}. Supported: {sorted(_TRANSFORM_PROB_KEYS)}"
             )
+        p = float(value)
+        if p < 0.0 or p > 1.0:
+            raise ValueError(
+                f"transforms_prob[{key!r}] must be in [0,1], got {p}"
+            )
+
+    transforms_enabled = bool(cfg.get("transforms_enabled", False))
+    base_profile_probs = transforms_profiles[transforms_profile]
+    crop_p = float(base_profile_probs.get("crop", 0.0))
+    if "crop" in transforms_prob:
+        crop_p = float(transforms_prob["crop"])
+    if transforms_enabled and crop_p > 0.0 and transforms_patch is None:
+        raise ValueError(
+            "transforms_prob['crop'] > 0 requires transforms_patch_size=[H, W]."
+        )
+
+    _validate_fixed_len_numeric_sequence(
+        cfg.get("transforms_affine_rotate_range"),
+        key="transforms_affine_rotate_range",
+        expected_len=1,
+    )
+    _validate_fixed_len_numeric_sequence(
+        cfg.get("transforms_affine_translate_range"),
+        key="transforms_affine_translate_range",
+        expected_len=2,
+    )
+    _validate_fixed_len_numeric_sequence(
+        cfg.get("transforms_affine_scale_range"),
+        key="transforms_affine_scale_range",
+        expected_len=2,
+    )
+    _validate_fixed_len_numeric_sequence(
+        cfg.get("transforms_adjust_contrast_gamma"),
+        key="transforms_adjust_contrast_gamma",
+        expected_len=2,
+    )
+    float(cfg.get("transforms_scale_intensity_factors"))
+    float(cfg.get("transforms_gaussian_noise_mean"))
+    noise_std = float(cfg.get("transforms_gaussian_noise_std"))
+    if noise_std < 0.0:
+        raise ValueError(f"transforms_gaussian_noise_std must be >= 0, got {noise_std}")
 
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).strip().lower()
     if amp_dtype_str not in {"fp16", "bf16"}:
