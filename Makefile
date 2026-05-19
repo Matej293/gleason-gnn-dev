@@ -74,6 +74,7 @@ help:
 	@echo "  make consensus-weighted"
 	@echo "  make viz-consensus-gt [MAX_CASES=64]"
 	@echo "  make audit-background-ignore"
+	@echo "  note: canonical configs enable train-time augmentation via transforms_* YAML keys"
 	@echo ""
 	@echo "Graph/GNN Targets:"
 	@echo "  make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>"

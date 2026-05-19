@@ -29,15 +29,15 @@ split_search_max_attempts: 100
 
 renormalize_probs: true
 enforce_background_ignore: true
-max_long_side: 768
+max_long_side: 512
 otsu_close_radius: 3
 otsu_min_object_size: 4096
 otsu_min_hole_size: 4096
 probs_eps: 1e-8
 
 # Train-time augmentation (MONAI, train split only)
-transforms_enabled: false
-transforms_profile: light
+transforms_enabled: true
+transforms_profile: medium
 transforms_seed_sync: true
 transforms_patch_size: null
 transforms_profiles:
@@ -50,6 +50,8 @@ transforms_profiles:
     scale_intensity: 0.15
     adjust_contrast: 0.10
     gaussian_noise: 0.10
+    gaussian_smooth: 0.05
+    shift_intensity: 0.05
   medium:
     flip_h: 0.50
     flip_v: 0.50
@@ -59,6 +61,8 @@ transforms_profiles:
     scale_intensity: 0.20
     adjust_contrast: 0.15
     gaussian_noise: 0.15
+    gaussian_smooth: 0.10
+    shift_intensity: 0.10
   strong:
     flip_h: 0.50
     flip_v: 0.50
@@ -68,6 +72,8 @@ transforms_profiles:
     scale_intensity: 0.25
     adjust_contrast: 0.20
     gaussian_noise: 0.20
+    gaussian_smooth: 0.15
+    shift_intensity: 0.15
 transforms_prob: {}
 transforms_affine_rotate_range: [0.12]
 transforms_affine_translate_range: [32, 32]
@@ -76,6 +82,9 @@ transforms_scale_intensity_factors: 0.10
 transforms_adjust_contrast_gamma: [0.85, 1.15]
 transforms_gaussian_noise_mean: 0.0
 transforms_gaussian_noise_std: 0.03
+transforms_gaussian_smooth_sigma_x: [0.25, 1.00]
+transforms_gaussian_smooth_sigma_y: [0.25, 1.00]
+transforms_shift_intensity_offsets: [-0.08, 0.08]
 
 model: pspnet
 spatial_dims: 2

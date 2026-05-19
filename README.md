@@ -111,6 +111,8 @@ make train CONFIG=configs/unet_lite.yaml
 make train CONFIG=configs/pspnet.yaml
 ```
 
+Canonical training configs (`configs/deconver.yaml`, `configs/unet_lite.yaml`, `configs/pspnet.yaml`) enable train-time augmentation by default. Tune via `transforms_*` keys in YAML.
+
 4. Evaluate the segmentation run.
 
 ```bash

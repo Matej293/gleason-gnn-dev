@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
@@ -62,6 +63,8 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "scale_intensity": 0.15,
         "adjust_contrast": 0.10,
         "gaussian_noise": 0.10,
+        "gaussian_smooth": 0.05,
+        "shift_intensity": 0.05,
     },
     "medium": {
         "flip_h": 0.50,
@@ -72,6 +75,8 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "scale_intensity": 0.20,
         "adjust_contrast": 0.15,
         "gaussian_noise": 0.15,
+        "gaussian_smooth": 0.10,
+        "shift_intensity": 0.10,
     },
     "strong": {
         "flip_h": 0.50,
@@ -82,6 +87,8 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "scale_intensity": 0.25,
         "adjust_contrast": 0.20,
         "gaussian_noise": 0.20,
+        "gaussian_smooth": 0.15,
+        "shift_intensity": 0.15,
     },
 }
 
@@ -101,6 +108,8 @@ def _enabled_cfg() -> dict:
             "scale_intensity": 0.0,
             "adjust_contrast": 0.0,
             "gaussian_noise": 0.0,
+            "gaussian_smooth": 0.0,
+            "shift_intensity": 0.0,
         },
         "transforms_affine_rotate_range": [0.12],
         "transforms_affine_translate_range": [32, 32],
@@ -109,7 +118,20 @@ def _enabled_cfg() -> dict:
         "transforms_adjust_contrast_gamma": [0.85, 1.15],
         "transforms_gaussian_noise_mean": 0.0,
         "transforms_gaussian_noise_std": 0.03,
+        "transforms_gaussian_smooth_sigma_x": [0.25, 1.00],
+        "transforms_gaussian_smooth_sigma_y": [0.25, 1.00],
+        "transforms_shift_intensity_offsets": [-0.08, 0.08],
     }
+
+
+def _find_transform_by_name(transform: object, name: str) -> object:
+    ops = getattr(transform, "transforms", None)
+    if not isinstance(ops, (list, tuple)):
+        raise AssertionError("Expected MONAI Compose with transforms list.")
+    for op in ops:
+        if op.__class__.__name__ == name:
+            return op
+    raise AssertionError(f"Transform {name!r} not found in pipeline.")
 
 
 def test_dataset_transform_keeps_contract(tmp_path: Path) -> None:
@@ -227,3 +249,46 @@ def test_transforms_disabled_keeps_interface_noop(tmp_path: Path) -> None:
     b = ds_b[0]
     for key in ["image", "soft_probs", "hard_mask", "ignore_mask", "tissue_mask"]:
         assert torch.equal(a[key], b[key])
+
+
+def test_new_augmentation_ops_use_profile_probs_when_not_overridden() -> None:
+    cfg = _enabled_cfg()
+    cfg["transforms_prob"] = {}
+    transform = build_consensus_train_transform(cfg)
+    assert transform is not None
+
+    smooth = _find_transform_by_name(transform, "RandGaussianSmoothd")
+    shift = _find_transform_by_name(transform, "RandShiftIntensityd")
+    assert float(smooth.prob) == pytest.approx(0.05)
+    assert float(shift.prob) == pytest.approx(0.05)
+
+
+def test_new_augmentation_ops_respect_prob_overrides() -> None:
+    cfg = _enabled_cfg()
+    cfg["transforms_prob"]["gaussian_smooth"] = 1.0
+    cfg["transforms_prob"]["shift_intensity"] = 1.0
+    transform = build_consensus_train_transform(cfg)
+    assert transform is not None
+
+    smooth = _find_transform_by_name(transform, "RandGaussianSmoothd")
+    shift = _find_transform_by_name(transform, "RandShiftIntensityd")
+    assert float(smooth.prob) == pytest.approx(1.0)
+    assert float(shift.prob) == pytest.approx(1.0)
+
+
+def test_new_augmentation_ops_reject_invalid_sigma_range() -> None:
+    cfg = _enabled_cfg()
+    cfg["transforms_gaussian_smooth_sigma_x"] = [-0.1, 1.0]
+    with pytest.raises(ValueError, match="transforms_gaussian_smooth_sigma_x entries must be >= 0"):
+        build_consensus_train_transform(cfg)
+
+
+def test_new_augmentation_ops_reject_inverted_shift_offsets() -> None:
+    cfg = _enabled_cfg()
+    cfg["transforms_shift_intensity_offsets"] = [0.1, -0.1]
+    with pytest.raises(
+        ValueError,
+        match=r"transforms_shift_intensity_offsets must satisfy \[min, max\] with max >= min",
+    ):
+        build_consensus_train_transform(cfg)
+

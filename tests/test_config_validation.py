@@ -15,6 +15,8 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "scale_intensity": 0.15,
         "adjust_contrast": 0.10,
         "gaussian_noise": 0.10,
+        "gaussian_smooth": 0.05,
+        "shift_intensity": 0.05,
     },
     "medium": {
         "flip_h": 0.50,
@@ -25,6 +27,8 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "scale_intensity": 0.20,
         "adjust_contrast": 0.15,
         "gaussian_noise": 0.15,
+        "gaussian_smooth": 0.10,
+        "shift_intensity": 0.10,
     },
     "strong": {
         "flip_h": 0.50,
@@ -35,6 +39,8 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "scale_intensity": 0.25,
         "adjust_contrast": 0.20,
         "gaussian_noise": 0.20,
+        "gaussian_smooth": 0.15,
+        "shift_intensity": 0.15,
     },
 }
 
@@ -66,6 +72,9 @@ def _base_cfg() -> dict:
         "transforms_adjust_contrast_gamma": [0.85, 1.15],
         "transforms_gaussian_noise_mean": 0.0,
         "transforms_gaussian_noise_std": 0.03,
+        "transforms_gaussian_smooth_sigma_x": [0.25, 1.00],
+        "transforms_gaussian_smooth_sigma_y": [0.25, 1.00],
+        "transforms_shift_intensity_offsets": [-0.08, 0.08],
     }
 
 
@@ -160,6 +169,8 @@ def test_validate_transforms_accepts_valid_profile_and_probs() -> None:
         "scale_intensity": 0.2,
         "adjust_contrast": 0.1,
         "gaussian_noise": 0.1,
+        "gaussian_smooth": 0.1,
+        "shift_intensity": 0.1,
     }
     validate_deconver_config(cfg, for_eval=False, require_paths=False)
 
@@ -184,3 +195,28 @@ def test_validate_transforms_rejects_crop_without_patch_size() -> None:
     cfg["transforms_prob"] = {"crop": 0.1}
     with pytest.raises(ValueError):
         validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_transforms_rejects_negative_gaussian_smooth_sigma() -> None:
+    cfg = _base_cfg()
+    cfg["transforms_gaussian_smooth_sigma_x"] = [-0.1, 1.0]
+    with pytest.raises(ValueError, match="transforms_gaussian_smooth_sigma_x entries must be >= 0"):
+        validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_transforms_rejects_inverted_shift_offsets() -> None:
+    cfg = _base_cfg()
+    cfg["transforms_shift_intensity_offsets"] = [0.1, -0.1]
+    with pytest.raises(
+        ValueError,
+        match=r"transforms_shift_intensity_offsets must satisfy \[min, max\] with max >= min",
+    ):
+        validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_transforms_rejects_missing_shift_offsets_key() -> None:
+    cfg = _base_cfg()
+    cfg.pop("transforms_shift_intensity_offsets")
+    with pytest.raises(ValueError, match="Missing required config keys"):
+        validate_deconver_config(cfg, for_eval=False, require_paths=False)
+

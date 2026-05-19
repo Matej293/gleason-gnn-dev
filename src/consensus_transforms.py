@@ -11,8 +11,10 @@ from monai.transforms import (
     RandAffined,
     RandFlipd,
     RandGaussianNoised,
+    RandGaussianSmoothd,
     RandRotate90d,
     RandScaleIntensityd,
+    RandShiftIntensityd,
     RandSpatialCropd,
 )
 
@@ -41,6 +43,8 @@ SUPPORTED_PROB_KEYS: tuple[str, ...] = (
     "scale_intensity",
     "adjust_contrast",
     "gaussian_noise",
+    "gaussian_smooth",
+    "shift_intensity",
 )
 
 
@@ -213,6 +217,42 @@ def build_consensus_train_transform(cfg: dict[str, Any]) -> Callable[[dict[str, 
     )
     gaussian_noise_mean = float(_require_cfg_key(cfg, "transforms_gaussian_noise_mean"))
     gaussian_noise_std = float(_require_cfg_key(cfg, "transforms_gaussian_noise_std"))
+    gaussian_smooth_sigma_x = _resolve_numeric_sequence(
+        _require_cfg_key(cfg, "transforms_gaussian_smooth_sigma_x"),
+        key="transforms_gaussian_smooth_sigma_x",
+        expected_len=2,
+    )
+    gaussian_smooth_sigma_y = _resolve_numeric_sequence(
+        _require_cfg_key(cfg, "transforms_gaussian_smooth_sigma_y"),
+        key="transforms_gaussian_smooth_sigma_y",
+        expected_len=2,
+    )
+    shift_intensity_offsets = _resolve_numeric_sequence(
+        _require_cfg_key(cfg, "transforms_shift_intensity_offsets"),
+        key="transforms_shift_intensity_offsets",
+        expected_len=2,
+    )
+
+    if gaussian_smooth_sigma_x[0] < 0.0 or gaussian_smooth_sigma_x[1] < 0.0:
+        raise ValueError(
+            "transforms_gaussian_smooth_sigma_x entries must be >= 0."
+        )
+    if gaussian_smooth_sigma_x[1] < gaussian_smooth_sigma_x[0]:
+        raise ValueError(
+            "transforms_gaussian_smooth_sigma_x must satisfy [min, max] with max >= min."
+        )
+    if gaussian_smooth_sigma_y[0] < 0.0 or gaussian_smooth_sigma_y[1] < 0.0:
+        raise ValueError(
+            "transforms_gaussian_smooth_sigma_y entries must be >= 0."
+        )
+    if gaussian_smooth_sigma_y[1] < gaussian_smooth_sigma_y[0]:
+        raise ValueError(
+            "transforms_gaussian_smooth_sigma_y must satisfy [min, max] with max >= min."
+        )
+    if shift_intensity_offsets[1] < shift_intensity_offsets[0]:
+        raise ValueError(
+            "transforms_shift_intensity_offsets must satisfy [min, max] with max >= min."
+        )
 
     transforms: list[Callable] = [
         EnsureTyped(keys=SAMPLE_KEYS, dtype=torch.float32, track_meta=False),
@@ -265,6 +305,17 @@ def build_consensus_train_transform(cfg: dict[str, Any]) -> Callable[[dict[str, 
                 prob=probs["gaussian_noise"],
                 mean=gaussian_noise_mean,
                 std=gaussian_noise_std,
+            ),
+            RandGaussianSmoothd(
+                keys=("image",),
+                prob=probs["gaussian_smooth"],
+                sigma_x=gaussian_smooth_sigma_x,
+                sigma_y=gaussian_smooth_sigma_y,
+            ),
+            RandShiftIntensityd(
+                keys=("image",),
+                prob=probs["shift_intensity"],
+                offsets=shift_intensity_offsets,
             ),
             Lambdad(keys=("image",), func=_finalize_image),
             Lambdad(keys=("soft_probs",), func=_normalize_soft_probs),

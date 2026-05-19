@@ -14,6 +14,8 @@ _TRANSFORM_PROB_KEYS = {
     "scale_intensity",
     "adjust_contrast",
     "gaussian_noise",
+    "gaussian_smooth",
+    "shift_intensity",
 }
 
 
@@ -91,6 +93,9 @@ def validate_deconver_config(
             "transforms_adjust_contrast_gamma",
             "transforms_gaussian_noise_mean",
             "transforms_gaussian_noise_std",
+            "transforms_gaussian_smooth_sigma_x",
+            "transforms_gaussian_smooth_sigma_y",
+            "transforms_shift_intensity_offsets",
         ],
     )
 
@@ -285,11 +290,61 @@ def validate_deconver_config(
         key="transforms_adjust_contrast_gamma",
         expected_len=2,
     )
+    _validate_fixed_len_numeric_sequence(
+        cfg.get("transforms_gaussian_smooth_sigma_x"),
+        key="transforms_gaussian_smooth_sigma_x",
+        expected_len=2,
+    )
+    _validate_fixed_len_numeric_sequence(
+        cfg.get("transforms_gaussian_smooth_sigma_y"),
+        key="transforms_gaussian_smooth_sigma_y",
+        expected_len=2,
+    )
+    _validate_fixed_len_numeric_sequence(
+        cfg.get("transforms_shift_intensity_offsets"),
+        key="transforms_shift_intensity_offsets",
+        expected_len=2,
+    )
     float(cfg.get("transforms_scale_intensity_factors"))
     float(cfg.get("transforms_gaussian_noise_mean"))
     noise_std = float(cfg.get("transforms_gaussian_noise_std"))
     if noise_std < 0.0:
         raise ValueError(f"transforms_gaussian_noise_std must be >= 0, got {noise_std}")
+
+    sigma_x_min, sigma_x_max = (
+        float(cfg["transforms_gaussian_smooth_sigma_x"][0]),
+        float(cfg["transforms_gaussian_smooth_sigma_x"][1]),
+    )
+    if sigma_x_min < 0.0 or sigma_x_max < 0.0:
+        raise ValueError(
+            f"transforms_gaussian_smooth_sigma_x entries must be >= 0, got [{sigma_x_min}, {sigma_x_max}]"
+        )
+    if sigma_x_max < sigma_x_min:
+        raise ValueError(
+            "transforms_gaussian_smooth_sigma_x must satisfy [min, max] with max >= min."
+        )
+
+    sigma_y_min, sigma_y_max = (
+        float(cfg["transforms_gaussian_smooth_sigma_y"][0]),
+        float(cfg["transforms_gaussian_smooth_sigma_y"][1]),
+    )
+    if sigma_y_min < 0.0 or sigma_y_max < 0.0:
+        raise ValueError(
+            f"transforms_gaussian_smooth_sigma_y entries must be >= 0, got [{sigma_y_min}, {sigma_y_max}]"
+        )
+    if sigma_y_max < sigma_y_min:
+        raise ValueError(
+            "transforms_gaussian_smooth_sigma_y must satisfy [min, max] with max >= min."
+        )
+
+    shift_min, shift_max = (
+        float(cfg["transforms_shift_intensity_offsets"][0]),
+        float(cfg["transforms_shift_intensity_offsets"][1]),
+    )
+    if shift_max < shift_min:
+        raise ValueError(
+            "transforms_shift_intensity_offsets must satisfy [min, max] with max >= min."
+        )
 
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).strip().lower()
     if amp_dtype_str not in {"fp16", "bf16"}:
