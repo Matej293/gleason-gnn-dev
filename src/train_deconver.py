@@ -33,6 +33,7 @@ from src.config import (
     resolve_patch_size,
 )
 from src.config_validation import validate_amp_runtime, validate_deconver_config
+from src.metric_config import LEGACY_METRIC_TRACK_KEYS, resolve_metric_settings
 from src.consensus_transforms import set_transform_random_state
 from src.cli_utils import (
     ensure_output_dir,
@@ -70,30 +71,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VAL_METRIC_KEYS = (
-    "macro_dice",
-    "macro_f1",
-    "micro_f1",
-    "cohen_kappa",
-    "challenge_score",
-    "weighted_macro_dice",
-    "grade5_dice",
-    "miou",
-    "grade5_iou",
-    "dice_benign",
-    "dice_g3",
-    "dice_g4",
-    "dice_g5",
-    "iou_benign",
-    "iou_g3",
-    "iou_g4",
-    "iou_g5",
-    "iou_tumor_vs_benign",
-    "sensitivity",
-    "precision",
-    "ignored_pixel_fraction",
-    "tumor_pixels_ignored_fraction",
-)
+VAL_METRIC_KEYS = LEGACY_METRIC_TRACK_KEYS
 
 COMPOSITE_WEIGHT_KEYS = (
     "macro_dice",
@@ -1171,6 +1149,9 @@ def validate(
     pspnet_soft_weight: float,
     pspnet_soft_term: str,
     pspnet_aux_weight: float,
+    metric_track_keys: tuple[str, ...],
+    include_boundary_metrics: bool,
+    boundary_metric_cfg: dict[str, object],
 ) -> dict[str, float]:
     model.eval()
 
@@ -1178,12 +1159,12 @@ def validate(
     n_batches = 0
 
     sums = {
-        "raw": {k: 0.0 for k in VAL_METRIC_KEYS},
-        "post": {k: 0.0 for k in VAL_METRIC_KEYS},
+        "raw": {k: 0.0 for k in metric_track_keys},
+        "post": {k: 0.0 for k in metric_track_keys},
     }
     counts = {
-        "raw": {k: 0 for k in VAL_METRIC_KEYS},
-        "post": {k: 0 for k in VAL_METRIC_KEYS},
+        "raw": {k: 0 for k in metric_track_keys},
+        "post": {k: 0 for k in metric_track_keys},
     }
 
     autocast_device = "cuda" if device.type == "cuda" else "cpu"
@@ -1315,6 +1296,8 @@ def validate(
                 hard_mask=hard_rs,
                 ignore_mask=ignore_rs,
                 include_background_in_dice=include_background_in_dice,
+                include_boundary_metrics=include_boundary_metrics,
+                boundary_metric_cfg=boundary_metric_cfg,
             )
 
             loss_sum += float(loss.detach().cpu().item())
@@ -1326,22 +1309,26 @@ def validate(
                     hard_mask=hard_rs[i : i + 1],
                     ignore_mask=ignore_rs[i : i + 1],
                     include_background_in_dice=include_background_in_dice,
+                    include_boundary_metrics=include_boundary_metrics,
+                    boundary_metric_cfg=boundary_metric_cfg,
                 )
                 m_post_i = compute_multiclass_metrics_from_pred(
                     pred=pred_post[i : i + 1],
                     hard_mask=hard_rs[i : i + 1],
                     ignore_mask=ignore_rs[i : i + 1],
                     include_background_in_dice=include_background_in_dice,
+                    include_boundary_metrics=include_boundary_metrics,
+                    boundary_metric_cfg=boundary_metric_cfg,
                 )
                 for stream, metrics_i in (("raw", m_raw_i), ("post", m_post_i)):
-                    for k in VAL_METRIC_KEYS:
+                    for k in metric_track_keys:
                         if not math.isnan(metrics_i[k]):
                             sums[stream][k] += metrics_i[k]
                             counts[stream][k] += 1
 
     out_metrics = {"val_loss": (loss_sum / max(1, n_batches))}
     for stream in ("raw", "post"):
-        for k in VAL_METRIC_KEYS:
+        for k in metric_track_keys:
             c = counts[stream][k]
             out_metrics[f"val_{stream}/{k}"] = (
                 sums[stream][k] / c if c > 0 else float("nan")
@@ -1372,6 +1359,9 @@ def validate_with_oom_retry(
     pspnet_soft_weight: float,
     pspnet_soft_term: str,
     pspnet_aux_weight: float,
+    metric_track_keys: tuple[str, ...],
+    include_boundary_metrics: bool,
+    boundary_metric_cfg: dict[str, object],
 ) -> dict[str, float]:
     try:
         return validate(
@@ -1397,6 +1387,9 @@ def validate_with_oom_retry(
             pspnet_soft_weight=pspnet_soft_weight,
             pspnet_soft_term=pspnet_soft_term,
             pspnet_aux_weight=pspnet_aux_weight,
+            metric_track_keys=metric_track_keys,
+            include_boundary_metrics=include_boundary_metrics,
+            boundary_metric_cfg=boundary_metric_cfg,
         )
     except RuntimeError as exc:
         if device.type == "cuda" and _is_cuda_oom(exc):
@@ -1428,6 +1421,9 @@ def validate_with_oom_retry(
                 pspnet_soft_weight=pspnet_soft_weight,
                 pspnet_soft_term=pspnet_soft_term,
                 pspnet_aux_weight=pspnet_aux_weight,
+                metric_track_keys=metric_track_keys,
+                include_boundary_metrics=include_boundary_metrics,
+                boundary_metric_cfg=boundary_metric_cfg,
             )
         raise
 
@@ -1482,8 +1478,9 @@ def _composite_from_metrics(
 def _selected_stream_metrics(
     val_metrics: dict[str, float],
     source: str,
+    metric_keys: tuple[str, ...] = VAL_METRIC_KEYS,
 ) -> dict[str, float]:
-    return {k: val_metrics[f"val_{source}/{k}"] for k in VAL_METRIC_KEYS}
+    return {k: val_metrics[f"val_{source}/{k}"] for k in metric_keys}
 
 
 def _run_validation_visualizations(
@@ -1563,6 +1560,8 @@ def _run_validation_visualizations(
                         hard_mask=hard_rs[i : i + 1],
                         ignore_mask=ignore_rs[i : i + 1],
                         include_background_in_dice=include_background_in_dice,
+                        include_boundary_metrics=False,
+                        boundary_metric_cfg=None,
                     )
                     save_path = output_dir / f"{saved + 1:03d}_{image_id}_{suffix}.png"
                     save_case_panel(
@@ -2167,15 +2166,27 @@ def main() -> None:
     val_start_epoch = max(1, int(cfg.get("val_start_epoch", 1)))
     keep_last_n = int(cfg.get("keep_last_checkpoints", 3))
 
+    metric_settings = resolve_metric_settings(cfg)
+    val_metric_keys = tuple(metric_settings.track_keys)
+    include_boundary_metrics = bool(metric_settings.include_boundary_metrics)
+    boundary_metric_cfg: dict[str, object] = {
+        "hausdorff_variant": metric_settings.boundary.hausdorff_variant,
+        "hausdorff_percentile": float(metric_settings.boundary.hausdorff_percentile),
+        "include_background": bool(metric_settings.boundary.include_background),
+        "symmetric_asd": bool(metric_settings.boundary.symmetric_asd),
+    }
+    best_ckpt_metric_name = str(metric_settings.best_checkpoint_metric).strip() or "challenge_score"
+    if best_ckpt_metric_name != "challenge_score":
+        logger.warning(
+            "metrics.best_checkpoint_metric=%s requested, but checkpoint selection currently uses challenge_score. Falling back to challenge_score.",
+            best_ckpt_metric_name,
+        )
+        best_ckpt_metric_name = "challenge_score"
     w_macro = float(cfg.get("best_ckpt_w_macro_dice", 0.45))
     w_weighted_macro = float(cfg.get("best_ckpt_w_weighted_macro_dice", 0.15))
     w_dice_g5 = float(cfg.get("best_ckpt_w_dice_g5", 0.30))
     w_sens = float(cfg.get("best_ckpt_w_sensitivity", 0.10))
-    best_ckpt_metric_source = str(cfg.get("best_ckpt_metric_source", "raw")).strip().lower()
-    if best_ckpt_metric_source not in {"raw", "post"}:
-        raise ValueError(
-            f"best_ckpt_metric_source must be 'raw' or 'post', got {best_ckpt_metric_source!r}"
-        )
+    best_ckpt_metric_source = metric_settings.best_checkpoint_source
     nan_recovery_log_every = max(1, int(cfg.get("nan_recovery_log_every", 1)))
     viz_enabled = bool(cfg.get("viz_enabled", True))
     viz_every_n_epochs = max(1, int(cfg.get("viz_every_n_epochs", 5)))
@@ -2201,7 +2212,8 @@ def main() -> None:
         viz_prediction_source,
     )
     logger.info(
-        "Best-checkpoint metric=challenge_score | source=%s",
+        "Best-checkpoint metric=%s | source=%s",
+        best_ckpt_metric_name,
         best_ckpt_metric_source,
     )
     logger.info(
@@ -2491,14 +2503,17 @@ def main() -> None:
             pspnet_soft_weight=pspnet_soft_weight,
             pspnet_soft_term=pspnet_soft_term,
             pspnet_aux_weight=pspnet_aux_weight,
+            metric_track_keys=val_metric_keys,
+            include_boundary_metrics=include_boundary_metrics,
+            boundary_metric_cfg=boundary_metric_cfg,
         )
 
         val_log: dict[str, float] = {"val/loss": val_metrics["val_loss"]}
         for stream in ("raw", "post"):
-            for k in VAL_METRIC_KEYS:
+            for k in val_metric_keys:
                 val_log[f"val_{stream}/{k}"] = val_metrics[f"val_{stream}/{k}"]
-        raw_view = _selected_stream_metrics(val_metrics, source="raw")
-        post_view = _selected_stream_metrics(val_metrics, source="post")
+        raw_view = _selected_stream_metrics(val_metrics, source="raw", metric_keys=val_metric_keys)
+        post_view = _selected_stream_metrics(val_metrics, source="post", metric_keys=val_metric_keys)
         raw_composite = _composite_from_metrics(
             raw_view,
             w_macro=w_macro,
@@ -2560,10 +2575,10 @@ def main() -> None:
             )
 
         selected_composite = post_composite if best_ckpt_metric_source == "post" else raw_composite
-        selected_challenge_score = (
-            val_metrics["val_post/challenge_score"]
+        selected_metric = (
+            val_metrics[f"val_post/{best_ckpt_metric_name}"]
             if best_ckpt_metric_source == "post"
-            else val_metrics["val_raw/challenge_score"]
+            else val_metrics[f"val_raw/{best_ckpt_metric_name}"]
         )
         selected_macro = (
             val_metrics["val_post/macro_dice"]
@@ -2576,26 +2591,27 @@ def main() -> None:
                 {"val/composite_score": selected_composite},
                 step=epoch,
             )
-        if not math.isnan(selected_challenge_score):
+        if not math.isnan(selected_metric):
             wandb_logger.log_epoch(
-                {"val/challenge_score": selected_challenge_score},
+                {f"val/{best_ckpt_metric_name}": selected_metric},
                 step=epoch,
             )
             logger.info(
-                "Epoch %d/%d | selected_challenge_score(%s)=%.4f (best=%s) | selected_composite=%.4f",
+                "Epoch %d/%d | selected_%s(%s)=%.4f (best=%s) | selected_composite=%.4f",
                 epoch,
                 epochs,
+                best_ckpt_metric_name,
                 best_ckpt_metric_source,
-                selected_challenge_score,
+                selected_metric,
                 _fmt(best_metric),
                 selected_composite,
             )
 
         if (
-            not math.isnan(selected_challenge_score)
-            and selected_challenge_score > best_metric + es_min_delta
+            not math.isnan(selected_metric)
+            and selected_metric > best_metric + es_min_delta
         ):
-            best_metric = selected_challenge_score
+            best_metric = selected_metric
             best_val_macro_dice = selected_macro
             save_checkpoint(
                 model,
@@ -2609,16 +2625,17 @@ def main() -> None:
                 last_hd95=float("nan"),
             )
             logger.info(
-                "New best model at epoch %d (%s challenge_score=%.4f, val_macro_dice=%s) -> %s",
+                "New best model at epoch %d (%s %s=%.4f, val_macro_dice=%s) -> %s",
                 epoch,
                 best_ckpt_metric_source,
+                best_ckpt_metric_name,
                 best_metric,
                 _fmt(best_val_macro_dice),
                 checkpoint_dir / "best.pt",
             )
             es_counter = 0
         else:
-            if es_enabled and not math.isnan(selected_challenge_score):
+            if es_enabled and not math.isnan(selected_metric):
                 es_counter += 1
                 logger.info("Early stopping counter: %d / %d", es_counter, es_patience)
 

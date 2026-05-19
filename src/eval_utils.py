@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from monai.metrics import HausdorffDistanceMetric, SurfaceDistanceMetric
 from scipy.ndimage import binary_dilation, binary_fill_holes
 from skimage.measure import label
 
@@ -88,11 +91,92 @@ def collate_consensus_batch(batch: list[dict]) -> dict:
     return out
 
 
+def _nanmean(values: list[float]) -> float:
+    finite_vals = [float(v) for v in values if math.isfinite(float(v))]
+    return float(sum(finite_vals) / len(finite_vals)) if finite_vals else float("nan")
+
+
+def _nanmean_tensor(values: torch.Tensor) -> float:
+    if values.ndim != 1:
+        values = values.view(-1)
+    vals = [float(x) for x in values.detach().cpu().tolist() if math.isfinite(float(x))]
+    return float(sum(vals) / len(vals)) if vals else float("nan")
+
+
+def _compute_boundary_metrics(
+    pred: torch.Tensor,
+    hard_mask: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    num_classes: int,
+    include_background: bool,
+    hausdorff_percentile: float,
+    symmetric_asd: bool,
+) -> dict[str, float]:
+    pred_valid = pred.long().clone()
+    hard_valid = hard_mask.long().clone()
+    pred_valid[~valid] = 0
+    hard_valid[~valid] = 0
+
+    pred_oh = F.one_hot(pred_valid.clamp(0, num_classes - 1), num_classes=num_classes)
+    true_oh = F.one_hot(hard_valid.clamp(0, num_classes - 1), num_classes=num_classes)
+    pred_oh = pred_oh.permute(0, 3, 1, 2).float()
+    true_oh = true_oh.permute(0, 3, 1, 2).float()
+
+    hd95_metric = HausdorffDistanceMetric(
+        include_background=include_background,
+        percentile=hausdorff_percentile,
+        reduction="none",
+    )
+    asd_metric = SurfaceDistanceMetric(
+        include_background=include_background,
+        symmetric=symmetric_asd,
+        reduction="none",
+    )
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module=r"monai\\..*")
+        warnings.filterwarnings("ignore", category=FutureWarning, module=r"monai\\..*")
+        hd95_vals = hd95_metric(pred_oh, true_oh).detach().cpu()
+        asd_vals = asd_metric(pred_oh, true_oh).detach().cpu()
+
+    if hd95_vals.ndim == 1:
+        hd95_vals = hd95_vals.unsqueeze(0)
+    if asd_vals.ndim == 1:
+        asd_vals = asd_vals.unsqueeze(0)
+
+    class_to_channel = {1: 1, 2: 2, 3: 3} if include_background else {1: 0, 2: 1, 3: 2}
+
+    out: dict[str, float] = {}
+    hd95_lesion: list[float] = []
+    asd_lesion: list[float] = []
+    for class_id, suffix in ((1, "g3"), (2, "g4"), (3, "g5")):
+        ch = class_to_channel[class_id]
+
+        hd95_c = float("nan")
+        if ch < hd95_vals.shape[1]:
+            hd95_c = _nanmean_tensor(hd95_vals[:, ch])
+        out[f"hd95_{suffix}"] = hd95_c
+        hd95_lesion.append(hd95_c)
+
+        asd_c = float("nan")
+        if ch < asd_vals.shape[1]:
+            asd_c = _nanmean_tensor(asd_vals[:, ch])
+        out[f"asd_{suffix}"] = asd_c
+        asd_lesion.append(asd_c)
+
+    out["hd95_mean"] = _nanmean(hd95_lesion)
+    out["asd_mean"] = _nanmean(asd_lesion)
+    return out
+
+
 def compute_multiclass_metrics(
     logits: torch.Tensor,
     hard_mask: torch.Tensor,
     ignore_mask: torch.Tensor,
     include_background_in_dice: bool,
+    include_boundary_metrics: bool = True,
+    boundary_metric_cfg: Mapping[str, object] | None = None,
 ) -> dict[str, float]:
     pred = logits.argmax(dim=1)
     return compute_multiclass_metrics_from_pred(
@@ -100,6 +184,8 @@ def compute_multiclass_metrics(
         hard_mask=hard_mask,
         ignore_mask=ignore_mask,
         include_background_in_dice=include_background_in_dice,
+        include_boundary_metrics=include_boundary_metrics,
+        boundary_metric_cfg=boundary_metric_cfg,
     )
 
 
@@ -108,6 +194,8 @@ def compute_multiclass_metrics_from_pred(
     hard_mask: torch.Tensor,
     ignore_mask: torch.Tensor,
     include_background_in_dice: bool,
+    include_boundary_metrics: bool = True,
+    boundary_metric_cfg: Mapping[str, object] | None = None,
 ) -> dict[str, float]:
     valid = ignore_mask == 0
     valid_n = int(valid.sum().item())
@@ -118,6 +206,7 @@ def compute_multiclass_metrics_from_pred(
     tp_per_class: list[float] = []
     fp_per_class: list[float] = []
     fn_per_class: list[float] = []
+    # TODO: Benchmark MONAI/scikit-learn parity for Dice/IoU/F1/Kappa before replacing legacy metrics.
     for c in range(num_classes):
         p = (pred == c) & valid
         t = (hard_mask == c) & valid
@@ -207,14 +296,14 @@ def compute_multiclass_metrics_from_pred(
     iou_tumor = (tp + 1e-6) / (tp + fp + fn + 1e-6) if (tp + fp + fn) > 0 else float("nan")
 
     ignored_fraction = float((~valid).float().mean().item())
-    tumor_pixels = (hard_mask > 0)
+    tumor_pixels = hard_mask > 0
     tumor_ignored_den = float(tumor_pixels.sum().item())
     tumor_ignored_num = float((tumor_pixels & (~valid)).sum().item())
     tumor_ignored_fraction = (
         (tumor_ignored_num / tumor_ignored_den) if tumor_ignored_den > 0 else float("nan")
     )
 
-    return {
+    metrics = {
         "macro_dice": macro_dice,
         "macro_f1": macro_f1,
         "micro_f1": micro_f1,
@@ -239,6 +328,45 @@ def compute_multiclass_metrics_from_pred(
         "tumor_pixels_ignored_fraction": tumor_ignored_fraction,
     }
 
+    if include_boundary_metrics:
+        boundary_cfg = boundary_metric_cfg if isinstance(boundary_metric_cfg, Mapping) else {}
+        hausdorff_variant = str(boundary_cfg.get("hausdorff_variant", "hd95")).strip().lower()
+        if hausdorff_variant != "hd95":
+            hausdorff_variant = "hd95"
+        hausdorff_percentile = float(boundary_cfg.get("hausdorff_percentile", 95.0))
+        if hausdorff_percentile <= 0.0 or hausdorff_percentile > 100.0:
+            hausdorff_percentile = 95.0
+        include_background = bool(boundary_cfg.get("include_background", False))
+        symmetric_asd = bool(boundary_cfg.get("symmetric_asd", True))
+
+        if valid_n > 0:
+            metrics.update(
+                _compute_boundary_metrics(
+                    pred=pred,
+                    hard_mask=hard_mask,
+                    valid=valid,
+                    num_classes=num_classes,
+                    include_background=include_background,
+                    hausdorff_percentile=hausdorff_percentile,
+                    symmetric_asd=symmetric_asd,
+                )
+            )
+        else:
+            metrics.update(
+                {
+                    "hd95_mean": float("nan"),
+                    "hd95_g3": float("nan"),
+                    "hd95_g4": float("nan"),
+                    "hd95_g5": float("nan"),
+                    "asd_mean": float("nan"),
+                    "asd_g3": float("nan"),
+                    "asd_g4": float("nan"),
+                    "asd_g5": float("nan"),
+                }
+            )
+
+    return metrics
+
 
 def postprocess_predictions(
     pred: torch.Tensor,
@@ -259,7 +387,7 @@ def postprocess_predictions(
     if tissue_mask is not None and tissue_mask.shape != out.shape:
         raise ValueError("tissue_mask and pred must have the same shape when provided.")
 
-    valid = (ignore_mask == 0)
+    valid = ignore_mask == 0
     if tissue_mask is not None:
         valid = valid & (tissue_mask > 0)
     out[~valid] = 0

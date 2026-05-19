@@ -4,6 +4,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    from src.metric_config import validate_metrics_config
+except Exception:  # pragma: no cover - fallback for scripts importing src modules directly.
+    from metric_config import validate_metrics_config
+
 
 _TRANSFORM_PROB_KEYS = {
     "flip_h",
@@ -235,6 +240,8 @@ def validate_deconver_config(
         raise ValueError(
             f"split_search_max_attempts must be >= 1, got {split_search_max_attempts}"
         )
+
+    validate_metrics_config(cfg)
 
     transforms_profiles = cfg.get("transforms_profiles")
     if not isinstance(transforms_profiles, dict):

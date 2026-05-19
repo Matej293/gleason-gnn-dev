@@ -44,6 +44,14 @@ def test_multiclass_metrics_keys_and_ranges():
         "precision",
         "ignored_pixel_fraction",
         "tumor_pixels_ignored_fraction",
+        "hd95_mean",
+        "hd95_g3",
+        "hd95_g4",
+        "hd95_g5",
+        "asd_mean",
+        "asd_g3",
+        "asd_g4",
+        "asd_g5",
     ):
         assert k in m
     assert 0.0 <= m["macro_dice"] <= 1.0
@@ -104,6 +112,14 @@ def test_absent_class_metrics_return_nan_and_are_excluded_from_macro():
     assert math.isnan(float(m["dice_g4"]))
     assert math.isnan(float(m["dice_g5"]))
     assert math.isnan(float(m["macro_dice"]))
+    assert math.isnan(float(m["hd95_g3"]))
+    assert math.isnan(float(m["hd95_g4"]))
+    assert math.isnan(float(m["hd95_g5"]))
+    assert math.isnan(float(m["hd95_mean"]))
+    assert math.isnan(float(m["asd_g3"]))
+    assert math.isnan(float(m["asd_g4"]))
+    assert math.isnan(float(m["asd_g5"]))
+    assert math.isnan(float(m["asd_mean"]))
 
 
 def test_postprocess_improves_metrics_when_raw_predicts_outside_tissue():
@@ -196,3 +212,49 @@ def test_weighted_macro_reflects_imbalanced_support():
     assert 0.0 <= macro <= 1.0
     assert 0.0 <= weighted <= 1.0
     assert weighted != macro
+
+
+def test_challenge_score_matches_formula_identity():
+    pred = torch.zeros((1, 8, 8), dtype=torch.long)
+    hard = torch.zeros((1, 8, 8), dtype=torch.long)
+    ignore = torch.zeros((1, 8, 8), dtype=torch.uint8)
+
+    hard[:, 1:5, 1:5] = 1
+    pred[:, 2:6, 2:6] = 1
+
+    m = compute_multiclass_metrics_from_pred(
+        pred=pred,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        include_background_in_dice=False,
+    )
+    expected = float(m["cohen_kappa"] + ((m["macro_f1"] + m["micro_f1"]) / 2.0))
+    assert abs(float(m["challenge_score"]) - expected) < 1e-8
+
+
+def test_boundary_metrics_improve_with_better_overlap():
+    hard = torch.zeros((1, 16, 16), dtype=torch.long)
+    hard[:, 4:12, 4:12] = 1
+    ignore = torch.zeros((1, 16, 16), dtype=torch.uint8)
+
+    pred_perfect = hard.clone()
+    pred_shifted = torch.zeros_like(hard)
+    pred_shifted[:, 6:14, 6:14] = 1
+
+    m_perfect = compute_multiclass_metrics_from_pred(
+        pred=pred_perfect,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        include_background_in_dice=False,
+    )
+    m_shifted = compute_multiclass_metrics_from_pred(
+        pred=pred_shifted,
+        hard_mask=hard,
+        ignore_mask=ignore,
+        include_background_in_dice=False,
+    )
+
+    assert float(m_perfect["hd95_g3"]) <= float(m_shifted["hd95_g3"])
+    assert float(m_perfect["asd_g3"]) <= float(m_shifted["asd_g3"])
+    assert float(m_perfect["hd95_mean"]) <= float(m_shifted["hd95_mean"])
+    assert float(m_perfect["asd_mean"]) <= float(m_shifted["asd_mean"])

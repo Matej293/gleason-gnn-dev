@@ -130,6 +130,47 @@ best_ckpt_w_weighted_macro_dice: 0.15
 best_ckpt_w_dice_g5: 0.30
 best_ckpt_w_sensitivity: 0.10
 best_ckpt_metric_source: raw
+
+metrics:
+  track_keys:
+    - macro_dice
+    - macro_f1
+    - micro_f1
+    - cohen_kappa
+    - challenge_score
+    - weighted_macro_dice
+    - grade5_dice
+    - miou
+    - grade5_iou
+    - dice_benign
+    - dice_g3
+    - dice_g4
+    - dice_g5
+    - iou_benign
+    - iou_g3
+    - iou_g4
+    - iou_g5
+    - iou_tumor_vs_benign
+    - sensitivity
+    - precision
+    - ignored_pixel_fraction
+    - tumor_pixels_ignored_fraction
+    - hd95_mean
+    - hd95_g3
+    - hd95_g4
+    - hd95_g5
+    - asd_mean
+    - asd_g3
+    - asd_g4
+    - asd_g5
+  best_checkpoint_metric: challenge_score
+  best_checkpoint_source: raw
+  include_boundary_metrics: true
+  boundary:
+    hausdorff_variant: hd95
+    hausdorff_percentile: 95
+    include_background: false
+    symmetric_asd: true
 nan_recovery_log_every: 1
 
 early_stopping_patience: 60

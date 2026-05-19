@@ -39,6 +39,7 @@ from cli_utils import (  # noqa: E402
     validate_non_negative_int,
 )
 from config_validation import validate_deconver_config  # noqa: E402
+from metric_config import resolve_metric_settings  # noqa: E402
 from eval_utils import (  # noqa: E402
     collate_consensus_batch,
     compute_multiclass_metrics_from_pred,
@@ -61,30 +62,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-METRIC_KEYS = [
-    "macro_dice",
-    "macro_f1",
-    "micro_f1",
-    "cohen_kappa",
-    "challenge_score",
-    "grade5_dice",
-    "miou",
-    "grade5_iou",
-    "dice_benign",
-    "dice_g3",
-    "dice_g4",
-    "dice_g5",
-    "iou_benign",
-    "iou_g3",
-    "iou_g4",
-    "iou_g5",
-    "iou_tumor_vs_benign",
-    "sensitivity",
-    "precision",
-    "ignored_pixel_fraction",
-    "tumor_pixels_ignored_fraction",
-]
 
 
 def _sliding_window_logits(
@@ -140,16 +117,17 @@ def _aggregate_loo_from_qc_reports(
 def _aggregate_per_case_metrics(
     per_case: list[dict[str, object]],
     prefix: str,
+    metric_keys: tuple[str, ...],
 ) -> dict[str, float]:
-    sums = {k: 0.0 for k in METRIC_KEYS}
-    counts = {k: 0 for k in METRIC_KEYS}
+    sums = {k: 0.0 for k in metric_keys}
+    counts = {k: 0 for k in metric_keys}
     for row in per_case:
-        for k in METRIC_KEYS:
+        for k in metric_keys:
             v = row.get(f"{prefix}_{k}")
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 sums[k] += float(v)
                 counts[k] += 1
-    return {k: (sums[k] / counts[k]) if counts[k] > 0 else float("nan") for k in METRIC_KEYS}
+    return {k: (sums[k] / counts[k]) if counts[k] > 0 else float("nan") for k in metric_keys}
 
 
 
@@ -232,6 +210,15 @@ def main() -> None:
     cfg = load_config(cfg_path)
     validate_deconver_config(cfg, for_eval=True, require_paths=True)
 
+    metric_settings = resolve_metric_settings(cfg)
+    metric_keys = tuple(metric_settings.track_keys)
+    include_boundary_metrics = bool(metric_settings.include_boundary_metrics)
+    boundary_metric_cfg: dict[str, object] = {
+        "hausdorff_variant": metric_settings.boundary.hausdorff_variant,
+        "hausdorff_percentile": float(metric_settings.boundary.hausdorff_percentile),
+        "include_background": bool(metric_settings.boundary.include_background),
+        "symmetric_asd": bool(metric_settings.boundary.symmetric_asd),
+    }
     patch_size = resolve_patch_size(cfg)
     patch_overlap = resolve_patch_overlap(cfg)
 
@@ -312,58 +299,29 @@ def main() -> None:
                     hard_mask=hard_mask[i : i + 1],
                     ignore_mask=ignore_mask[i : i + 1],
                     include_background_in_dice=include_background_in_dice,
+                    include_boundary_metrics=include_boundary_metrics,
+                    boundary_metric_cfg=boundary_metric_cfg,
                 )
                 sample_metrics_post = compute_multiclass_metrics_from_pred(
                     pred=pred_post[i : i + 1],
                     hard_mask=hard_mask[i : i + 1],
                     ignore_mask=ignore_mask[i : i + 1],
                     include_background_in_dice=include_background_in_dice,
+                    include_boundary_metrics=include_boundary_metrics,
+                    boundary_metric_cfg=boundary_metric_cfg,
                 )
                 valid_pixels = int(valid[i].sum().item())
                 pred_pos = int(((pred_post[i] > 0) & valid[i]).sum().item())
                 gt_pos = int(((hard_mask[i] > 0) & valid[i]).sum().item())
-                per_case.append(
-                    {
-                        "image_id": image_id,
-                        "raw_macro_dice": json_float(sample_metrics_raw["macro_dice"]),
-                        "raw_grade5_dice": json_float(sample_metrics_raw["grade5_dice"]),
-                        "raw_miou": json_float(sample_metrics_raw["miou"]),
-                        "raw_grade5_iou": json_float(sample_metrics_raw["grade5_iou"]),
-                        "raw_dice_benign": json_float(sample_metrics_raw["dice_benign"]),
-                        "raw_dice_g3": json_float(sample_metrics_raw["dice_g3"]),
-                        "raw_dice_g4": json_float(sample_metrics_raw["dice_g4"]),
-                        "raw_dice_g5": json_float(sample_metrics_raw["dice_g5"]),
-                        "raw_iou_benign": json_float(sample_metrics_raw["iou_benign"]),
-                        "raw_iou_g3": json_float(sample_metrics_raw["iou_g3"]),
-                        "raw_iou_g4": json_float(sample_metrics_raw["iou_g4"]),
-                        "raw_iou_g5": json_float(sample_metrics_raw["iou_g5"]),
-                        "raw_iou_tumor_vs_benign": json_float(sample_metrics_raw["iou_tumor_vs_benign"]),
-                        "raw_sensitivity": json_float(sample_metrics_raw["sensitivity"]),
-                        "raw_precision": json_float(sample_metrics_raw["precision"]),
-                        "raw_ignored_pixel_fraction": json_float(sample_metrics_raw["ignored_pixel_fraction"]),
-                        "raw_tumor_pixels_ignored_fraction": json_float(sample_metrics_raw["tumor_pixels_ignored_fraction"]),
-                        "post_macro_dice": json_float(sample_metrics_post["macro_dice"]),
-                        "post_grade5_dice": json_float(sample_metrics_post["grade5_dice"]),
-                        "post_miou": json_float(sample_metrics_post["miou"]),
-                        "post_grade5_iou": json_float(sample_metrics_post["grade5_iou"]),
-                        "post_dice_benign": json_float(sample_metrics_post["dice_benign"]),
-                        "post_dice_g3": json_float(sample_metrics_post["dice_g3"]),
-                        "post_dice_g4": json_float(sample_metrics_post["dice_g4"]),
-                        "post_dice_g5": json_float(sample_metrics_post["dice_g5"]),
-                        "post_iou_benign": json_float(sample_metrics_post["iou_benign"]),
-                        "post_iou_g3": json_float(sample_metrics_post["iou_g3"]),
-                        "post_iou_g4": json_float(sample_metrics_post["iou_g4"]),
-                        "post_iou_g5": json_float(sample_metrics_post["iou_g5"]),
-                        "post_iou_tumor_vs_benign": json_float(sample_metrics_post["iou_tumor_vs_benign"]),
-                        "post_sensitivity": json_float(sample_metrics_post["sensitivity"]),
-                        "post_precision": json_float(sample_metrics_post["precision"]),
-                        "post_ignored_pixel_fraction": json_float(sample_metrics_post["ignored_pixel_fraction"]),
-                        "post_tumor_pixels_ignored_fraction": json_float(sample_metrics_post["tumor_pixels_ignored_fraction"]),
-                        "valid_pixels": valid_pixels,
-                        "pred_positive_pixels": pred_pos,
-                        "gt_positive_pixels": gt_pos,
-                    }
-                )
+
+                row: dict[str, object] = {"image_id": image_id}
+                for key in metric_keys:
+                    row[f"raw_{key}"] = json_float(float(sample_metrics_raw.get(key, float("nan"))))
+                    row[f"post_{key}"] = json_float(float(sample_metrics_post.get(key, float("nan"))))
+                row["valid_pixels"] = valid_pixels
+                row["pred_positive_pixels"] = pred_pos
+                row["gt_positive_pixels"] = gt_pos
+                per_case.append(row)
                 viz_candidates.append(
                     {
                         "image_id": image_id,
@@ -376,8 +334,16 @@ def main() -> None:
                     }
                 )
 
-    aggregate_raw = _aggregate_per_case_metrics(per_case=per_case, prefix="raw")
-    aggregate_post = _aggregate_per_case_metrics(per_case=per_case, prefix="post")
+    aggregate_raw = _aggregate_per_case_metrics(
+        per_case=per_case,
+        prefix="raw",
+        metric_keys=metric_keys,
+    )
+    aggregate_post = _aggregate_per_case_metrics(
+        per_case=per_case,
+        prefix="post",
+        metric_keys=metric_keys,
+    )
     aggregate_raw["num_test_samples"] = float(len(test_indices))
     aggregate_post["num_test_samples"] = float(len(test_indices))
     if bool(cfg.get("eval_leave_one_rater_out", False)):
@@ -387,25 +353,24 @@ def main() -> None:
 
     logger.info(
         "Aggregate (raw) | macro_dice=%s miou=%s grade5_dice=%s grade5_iou=%s sens=%s prec=%s | test_samples=%d",
-        fmt_metric(aggregate_raw["macro_dice"]),
-        fmt_metric(aggregate_raw["miou"]),
-        fmt_metric(aggregate_raw["grade5_dice"]),
-        fmt_metric(aggregate_raw["grade5_iou"]),
-        fmt_metric(aggregate_raw["sensitivity"]),
-        fmt_metric(aggregate_raw["precision"]),
+        fmt_metric(aggregate_raw.get("macro_dice", float("nan"))),
+        fmt_metric(aggregate_raw.get("miou", float("nan"))),
+        fmt_metric(aggregate_raw.get("grade5_dice", float("nan"))),
+        fmt_metric(aggregate_raw.get("grade5_iou", float("nan"))),
+        fmt_metric(aggregate_raw.get("sensitivity", float("nan"))),
+        fmt_metric(aggregate_raw.get("precision", float("nan"))),
         len(test_indices),
     )
     logger.info(
         "Aggregate (post) | macro_dice=%s miou=%s grade5_dice=%s grade5_iou=%s sens=%s prec=%s | test_samples=%d",
-        fmt_metric(aggregate_post["macro_dice"]),
-        fmt_metric(aggregate_post["miou"]),
-        fmt_metric(aggregate_post["grade5_dice"]),
-        fmt_metric(aggregate_post["grade5_iou"]),
-        fmt_metric(aggregate_post["sensitivity"]),
-        fmt_metric(aggregate_post["precision"]),
+        fmt_metric(aggregate_post.get("macro_dice", float("nan"))),
+        fmt_metric(aggregate_post.get("miou", float("nan"))),
+        fmt_metric(aggregate_post.get("grade5_dice", float("nan"))),
+        fmt_metric(aggregate_post.get("grade5_iou", float("nan"))),
+        fmt_metric(aggregate_post.get("sensitivity", float("nan"))),
+        fmt_metric(aggregate_post.get("precision", float("nan"))),
         len(test_indices),
     )
-
     summary = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "run_dir": str(run_dir),

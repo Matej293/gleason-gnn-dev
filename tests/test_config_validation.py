@@ -231,3 +231,53 @@ def test_validate_rejects_invalid_patch_min_tissue_fraction() -> None:
     cfg["patch_min_tissue_fraction"] = 1.01
     with pytest.raises(ValueError, match=r"patch_min_tissue_fraction must be in \[0\.0, 1\.0\]"):
         validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_metrics_block_accepts_supported_keys() -> None:
+    cfg = _base_cfg()
+    cfg["metrics"] = {
+        "track_keys": ["macro_dice", "challenge_score", "weighted_macro_dice", "hd95_mean", "asd_mean"],
+        "best_checkpoint_metric": "challenge_score",
+        "best_checkpoint_source": "raw",
+        "include_boundary_metrics": True,
+        "boundary": {
+            "hausdorff_variant": "hd95",
+            "hausdorff_percentile": 95,
+            "include_background": False,
+            "symmetric_asd": True,
+        },
+    }
+    validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_metrics_block_rejects_unsupported_track_key() -> None:
+    cfg = _base_cfg()
+    cfg["metrics"] = {
+        "track_keys": ["macro_dice", "not_a_metric"],
+        "best_checkpoint_metric": "challenge_score",
+    }
+    with pytest.raises(ValueError, match="metrics.track_keys contains unsupported keys"):
+        validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_metrics_block_rejects_missing_challenge_score_for_challenge_selection() -> None:
+    cfg = _base_cfg()
+    cfg["metrics"] = {
+        "track_keys": ["macro_dice", "weighted_macro_dice"],
+        "best_checkpoint_metric": "challenge_score",
+    }
+    with pytest.raises(ValueError, match="must contain 'challenge_score'"):
+        validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_metrics_block_rejects_invalid_boundary_percentile() -> None:
+    cfg = _base_cfg()
+    cfg["metrics"] = {
+        "track_keys": ["macro_dice", "challenge_score"],
+        "best_checkpoint_metric": "challenge_score",
+        "boundary": {
+            "hausdorff_percentile": 120,
+        },
+    }
+    with pytest.raises(ValueError, match="hausdorff_percentile"):
+        validate_deconver_config(cfg, for_eval=False, require_paths=False)
