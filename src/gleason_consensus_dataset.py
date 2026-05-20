@@ -276,19 +276,10 @@ class SlidingWindowPatchDataset(Dataset):
                 raise IndexError(f"source index out of range: {source_index}")
 
             item = self.base_dataset.items[source_index]
-            tissue_mask = None
-            if self.patch_tissue_filter_enabled:
-                sample = self.base_dataset[source_index]
-                tissue_mask = sample.get("tissue_mask", None)
-                if tissue_mask is None:
-                    raise ValueError(
-                        "SlidingWindowPatchDataset requires 'tissue_mask' from base_dataset samples "
-                        "when patch_tissue_filter_enabled=True."
-                    )
-
-            image_path = Path(str(item["image_path"]))
-            with Image.open(image_path) as img:
-                width, height = img.size
+            height, width, tissue_mask = self._load_image_geometry_and_tissue(
+                source_index=source_index,
+                item=item,
+            )
 
             slices = dense_patch_slices(
                 image_size=(int(height), int(width)),
@@ -319,6 +310,44 @@ class SlidingWindowPatchDataset(Dataset):
                 )
 
         return patch_items
+
+    def _load_image_geometry_and_tissue(
+        self,
+        *,
+        source_index: int,
+        item: dict[str, object],
+    ) -> tuple[int, int, torch.Tensor | None]:
+        image_path = Path(str(item["image_path"]))
+
+        if self.patch_tissue_filter_enabled and self.base_dataset.transform is None:
+            with Image.open(image_path) as img:
+                image_rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
+            height, width = int(image_rgb.shape[0]), int(image_rgb.shape[1])
+            tissue_mask_np = build_tissue_mask_from_image(
+                image_rgb,
+                close_radius=self.base_dataset.otsu_close_radius,
+                min_object_size=self.base_dataset.otsu_min_object_size,
+                min_hole_size=self.base_dataset.otsu_min_hole_size,
+            )
+            tissue_mask = torch.from_numpy(tissue_mask_np.astype(np.uint8, copy=False))
+            return height, width, tissue_mask
+
+        with Image.open(image_path) as img:
+            width, height = img.size
+
+        if not self.patch_tissue_filter_enabled:
+            return int(height), int(width), None
+
+        sample = self.base_dataset[source_index]
+        tissue_mask = sample.get("tissue_mask", None)
+        if tissue_mask is None:
+            raise ValueError(
+                "SlidingWindowPatchDataset requires 'tissue_mask' from base_dataset samples "
+                "when patch_tissue_filter_enabled=True."
+            )
+        if not isinstance(tissue_mask, torch.Tensor):
+            tissue_mask = torch.as_tensor(tissue_mask)
+        return int(height), int(width), tissue_mask
 
     def __len__(self) -> int:
         return len(self.patch_items)

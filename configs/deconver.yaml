@@ -4,7 +4,7 @@ batch_size: 1
 val_batch_size: 1
 learning_rate: 2e-4
 weight_decay: 1e-5
-num_workers: 2
+num_workers: 8
 device: cuda
 base_output_dir: ./outputs/runs
 random_seed: 42

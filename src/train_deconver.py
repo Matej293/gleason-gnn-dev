@@ -15,6 +15,7 @@ import math
 import multiprocessing as mp
 import random
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -1817,6 +1818,8 @@ def main() -> None:
     val_indices = [int(r["dataset_index"]) for r in val_rows]
     test_indices = [int(r["dataset_index"]) for r in test_rows]
 
+    logger.info("Building train patch index across %d images...", len(train_indices))
+    patch_build_start = time.perf_counter()
     train_ds = SlidingWindowPatchDataset(
         base_dataset=dataset,
         source_indices=train_indices,
@@ -1825,6 +1828,12 @@ def main() -> None:
         patch_tissue_filter_enabled=patch_tissue_filter_enabled,
         patch_min_tissue_fraction=patch_min_tissue_fraction,
         transform=train_transform,
+    )
+    patch_build_seconds = float(time.perf_counter() - patch_build_start)
+    logger.info(
+        "Train patch index ready in %.2fs (%d patches kept).",
+        patch_build_seconds,
+        len(train_ds),
     )
     setattr(train_ds, "_transform_seed_sync", seed_sync)
 
@@ -2669,6 +2678,7 @@ def main() -> None:
         "train_patch_kept_count": int(train_ds.kept_patches),
         "train_patch_skipped_count": int(train_ds.skipped_patches),
         "train_patch_keep_ratio": float(train_ds.keep_ratio),
+        "train_patch_index_build_seconds": float(patch_build_seconds),
     }
     summary_path = run_dir / "training_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:

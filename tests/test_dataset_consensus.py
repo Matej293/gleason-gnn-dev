@@ -222,3 +222,44 @@ def test_sliding_window_patch_dataset_rejects_invalid_patch_min_tissue_fraction(
             overlap=0.5,
             patch_min_tissue_fraction=1.01,
         )
+
+def test_patch_index_build_skips_prob_loading_without_base_transform(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    consensus_root = tmp_path / "consensus"
+    _write_case(
+        data_root=data_root,
+        consensus_root=consensus_root,
+        case_id="case001",
+        height=64,
+        width=64,
+    )
+
+    ds = GleasonConsensusDataset(data_root=data_root, consensus_root=consensus_root)
+
+    import src.gleason_consensus_dataset as dataset_mod
+
+    monkeypatch.setattr(
+        dataset_mod,
+        "build_tissue_mask_from_image",
+        lambda image_rgb, close_radius=3, min_object_size=4096, min_hole_size=4096: np.ones(
+            image_rgb.shape[:2],
+            dtype=np.uint8,
+        ),
+    )
+
+    def _fail_load_probs(self, path, image_id):
+        raise AssertionError("_load_probs should not be called during patch-index precompute")
+
+    monkeypatch.setattr(GleasonConsensusDataset, "_load_probs", _fail_load_probs)
+
+    patch_ds = SlidingWindowPatchDataset(
+        base_dataset=ds,
+        source_indices=[0],
+        patch_size=(32, 32),
+        overlap=0.5,
+        patch_tissue_filter_enabled=True,
+        patch_min_tissue_fraction=0.0,
+    )
+
+    assert len(patch_ds) > 0
+
