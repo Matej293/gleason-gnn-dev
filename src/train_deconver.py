@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -85,6 +86,13 @@ COMPOSITE_WEIGHT_KEYS = (
 def _fmt(v: float) -> str:
     return f"{v:.4f}" if not math.isnan(v) else "n/a"
 
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 def _seed_worker(worker_id: int) -> None:
     worker_seed = (torch.initial_seed() + worker_id) % (2**32)
@@ -1818,6 +1826,10 @@ def main() -> None:
     val_indices = [int(r["dataset_index"]) for r in val_rows]
     test_indices = [int(r["dataset_index"]) for r in test_rows]
 
+    split_manifest_hash = _sha256_file(split_manifest_path)
+    train_image_ids = [str(r["image_id"]) for r in train_rows]
+    patch_cache_dir = Path(str(cfg.get("base_output_dir", "./outputs/runs"))).parent / "cache" / "patch_index"
+
     logger.info("Building train patch index across %d images...", len(train_indices))
     patch_build_start = time.perf_counter()
     train_ds = SlidingWindowPatchDataset(
@@ -1828,6 +1840,13 @@ def main() -> None:
         patch_tissue_filter_enabled=patch_tissue_filter_enabled,
         patch_min_tissue_fraction=patch_min_tissue_fraction,
         transform=train_transform,
+        cache_dir=patch_cache_dir,
+        cache_key_extra={
+            "split_mode": split_mode,
+            "split_manifest_path": str(split_manifest_path.resolve()),
+            "split_manifest_sha256": split_manifest_hash,
+            "train_image_ids": train_image_ids,
+        },
     )
     patch_build_seconds = float(time.perf_counter() - patch_build_start)
     logger.info(
@@ -1835,6 +1854,18 @@ def main() -> None:
         patch_build_seconds,
         len(train_ds),
     )
+    if train_ds.cache_path is not None:
+        cache_state = "hit" if train_ds.cache_used else "miss"
+        logger.info(
+            "Patch-index cache %s | key=%s | path=%s",
+            cache_state,
+            train_ds.cache_key,
+            train_ds.cache_path,
+        )
+    if train_ds.cache_used and train_ds.cache_load_seconds > 0.0:
+        logger.info("Patch-index cache load time: %.2fs", train_ds.cache_load_seconds)
+    elif (not train_ds.cache_used) and train_ds.cache_write_seconds > 0.0:
+        logger.info("Patch-index cache write time: %.2fs", train_ds.cache_write_seconds)
     setattr(train_ds, "_transform_seed_sync", seed_sync)
 
     val_ds = Subset(dataset, val_indices)
@@ -2679,6 +2710,11 @@ def main() -> None:
         "train_patch_skipped_count": int(train_ds.skipped_patches),
         "train_patch_keep_ratio": float(train_ds.keep_ratio),
         "train_patch_index_build_seconds": float(patch_build_seconds),
+        "train_patch_index_cache_used": bool(train_ds.cache_used),
+        "train_patch_index_cache_path": str(train_ds.cache_path) if train_ds.cache_path is not None else "",
+        "train_patch_index_cache_key": str(train_ds.cache_key),
+        "train_patch_index_cache_load_seconds": float(train_ds.cache_load_seconds),
+        "train_patch_index_cache_write_seconds": float(train_ds.cache_write_seconds),
     }
     summary_path = run_dir / "training_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+import time
 from pathlib import Path
-from typing import Callable
+import sys
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -10,6 +15,11 @@ from PIL import Image
 from skimage.filters import threshold_otsu
 from skimage.morphology import closing, disk, remove_small_holes, remove_small_objects
 from torch.utils.data import Dataset
+from tqdm import tqdm
+
+
+logger = logging.getLogger(__name__)
+PATCH_INDEX_CACHE_SCHEMA_VERSION = 1
 
 
 def build_tissue_mask_from_image(
@@ -217,6 +227,9 @@ class SlidingWindowPatchDataset(Dataset):
         patch_tissue_filter_enabled: bool = True,
         patch_min_tissue_fraction: float = 0.0,
         transform: Callable | None = None,
+        cache_dir: str | Path | None = None,
+        cache_key_extra: dict[str, object] | None = None,
+        cache_rebuild: bool = False,
     ) -> None:
         if not isinstance(base_dataset, GleasonConsensusDataset):
             raise TypeError("base_dataset must be a GleasonConsensusDataset instance.")
@@ -251,27 +264,223 @@ class SlidingWindowPatchDataset(Dataset):
             max(1, int(round(self.patch_size[1] * (1.0 - self.overlap)))),
         )
 
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.cache_key_extra = cache_key_extra or {}
+        self.cache_rebuild = bool(cache_rebuild)
+        self.cache_used = False
+        self.cache_path: Path | None = None
+        self.cache_key = ""
+        self.cache_load_seconds = 0.0
+        self.cache_write_seconds = 0.0
+
         self.total_candidate_patches = 0
         self.kept_patches = 0
         self.skipped_patches = 0
         self.keep_ratio = 0.0
 
-        self.patch_items = self._build_patch_items()
+        self.patch_items = self._load_or_build_patch_items()
+        self._refresh_patch_stats()
+
+        if not self.patch_items:
+            raise RuntimeError("No sliding-window patches were generated.")
+
+
+    def _refresh_patch_stats(self) -> None:
         self.kept_patches = len(self.patch_items)
-        self.skipped_patches = self.total_candidate_patches - self.kept_patches
+        self.skipped_patches = max(0, self.total_candidate_patches - self.kept_patches)
         self.keep_ratio = (
             float(self.kept_patches) / float(self.total_candidate_patches)
             if self.total_candidate_patches > 0
             else 0.0
         )
 
-        if not self.patch_items:
-            raise RuntimeError("No sliding-window patches were generated.")
+    def _load_or_build_patch_items(self) -> list[dict[str, object]]:
+        payload = self._cache_payload()
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        self.cache_key = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+        cache_paths = self._resolve_cache_paths(self.cache_key)
+        if cache_paths is not None:
+            cache_npz, cache_meta = cache_paths
+            self.cache_path = cache_npz
+            if not self.cache_rebuild:
+                load_start = time.perf_counter()
+                loaded = self._try_load_cache(cache_npz=cache_npz, cache_meta=cache_meta)
+                self.cache_load_seconds = float(time.perf_counter() - load_start)
+                if loaded is not None:
+                    self.cache_used = True
+                    patch_items, total_candidates = loaded
+                    self.total_candidate_patches = int(total_candidates)
+                    return patch_items
+
+        self.cache_used = False
+        patch_items = self._build_patch_items()
+        if self.total_candidate_patches < len(patch_items):
+            self.total_candidate_patches = len(patch_items)
+
+        if cache_paths is not None:
+            cache_npz, cache_meta = cache_paths
+            write_start = time.perf_counter()
+            self._write_cache(
+                cache_npz=cache_npz,
+                cache_meta=cache_meta,
+                patch_items=patch_items,
+                payload=payload,
+            )
+            self.cache_write_seconds = float(time.perf_counter() - write_start)
+
+        return patch_items
+
+    def _cache_payload(self) -> dict[str, object]:
+        source_image_ids = [
+            str(self.base_dataset.items[int(i)]["image_id"])
+            for i in self.source_indices
+            if 0 <= int(i) < len(self.base_dataset.items)
+        ]
+        extra = self._to_json_safe(self.cache_key_extra)
+        if not isinstance(extra, dict):
+            extra = {"value": extra}
+        return {
+            "schema": PATCH_INDEX_CACHE_SCHEMA_VERSION,
+            "source_indices": [int(i) for i in self.source_indices],
+            "source_image_ids": source_image_ids,
+            "patch_size": [int(self.patch_size[0]), int(self.patch_size[1])],
+            "overlap": float(self.overlap),
+            "scan_interval": [int(self.scan_interval[0]), int(self.scan_interval[1])],
+            "patch_tissue_filter_enabled": bool(self.patch_tissue_filter_enabled),
+            "patch_min_tissue_fraction": float(self.patch_min_tissue_fraction),
+            "dataset": {
+                "data_root": str(self.base_dataset.data_root),
+                "consensus_root": str(self.base_dataset.consensus_root),
+                "image_subdirs": [str(x) for x in self.base_dataset.image_subdirs],
+                "otsu_close_radius": int(self.base_dataset.otsu_close_radius),
+                "otsu_min_object_size": int(self.base_dataset.otsu_min_object_size),
+                "otsu_min_hole_size": int(self.base_dataset.otsu_min_hole_size),
+            },
+            "fast_tissue_precompute": bool(
+                self.patch_tissue_filter_enabled and self.base_dataset.transform is None
+            ),
+            "cache_key_extra": extra,
+        }
+
+    @classmethod
+    def _to_json_safe(cls, value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): cls._to_json_safe(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+        if isinstance(value, (list, tuple, set)):
+            return [cls._to_json_safe(v) for v in value]
+        return str(value)
+
+    def _resolve_cache_paths(self, cache_key: str) -> tuple[Path, Path] | None:
+        if self.cache_dir is None:
+            return None
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("Patch-index cache disabled: cannot create %s (%s)", self.cache_dir, exc)
+            return None
+        cache_npz = self.cache_dir / f"patch_index_{cache_key}.npz"
+        cache_meta = self.cache_dir / f"patch_index_{cache_key}.json"
+        return cache_npz, cache_meta
+
+    def _try_load_cache(
+        self,
+        *,
+        cache_npz: Path,
+        cache_meta: Path,
+    ) -> tuple[list[dict[str, object]], int] | None:
+        if not cache_npz.exists() or not cache_meta.exists():
+            return None
+        try:
+            meta = json.loads(cache_meta.read_text(encoding="utf-8"))
+            if int(meta.get("schema", -1)) != PATCH_INDEX_CACHE_SCHEMA_VERSION:
+                return None
+            with np.load(cache_npz) as payload:
+                source_indices = payload["source_index"].astype(np.int64, copy=False)
+                y0 = payload["y0"].astype(np.int64, copy=False)
+                y1 = payload["y1"].astype(np.int64, copy=False)
+                x0 = payload["x0"].astype(np.int64, copy=False)
+                x1 = payload["x1"].astype(np.int64, copy=False)
+
+            n = int(source_indices.shape[0])
+            if not (y0.shape[0] == y1.shape[0] == x0.shape[0] == x1.shape[0] == n):
+                raise ValueError("Patch-index cache arrays have mismatched lengths.")
+
+            patch_items: list[dict[str, object]] = []
+            for i in range(n):
+                source_index = int(source_indices[i])
+                item = self.base_dataset.items[source_index]
+                patch_items.append(
+                    {
+                        "source_index": source_index,
+                        "image_id": str(item["image_id"]),
+                        "y_slice": slice(int(y0[i]), int(y1[i])),
+                        "x_slice": slice(int(x0[i]), int(x1[i])),
+                    }
+                )
+
+            total_candidates = int(meta.get("total_candidate_patches", n))
+            if total_candidates < n:
+                total_candidates = n
+            return patch_items, total_candidates
+        except Exception as exc:
+            logger.warning("Ignoring invalid patch-index cache at %s (%s)", cache_npz, exc)
+            return None
+
+    def _write_cache(
+        self,
+        *,
+        cache_npz: Path,
+        cache_meta: Path,
+        patch_items: list[dict[str, object]],
+        payload: dict[str, object],
+    ) -> None:
+        try:
+            source_index = np.asarray(
+                [int(p["source_index"]) for p in patch_items],
+                dtype=np.int32,
+            )
+            y0 = np.asarray([int(p["y_slice"].start) for p in patch_items], dtype=np.int32)
+            y1 = np.asarray([int(p["y_slice"].stop) for p in patch_items], dtype=np.int32)
+            x0 = np.asarray([int(p["x_slice"].start) for p in patch_items], dtype=np.int32)
+            x1 = np.asarray([int(p["x_slice"].stop) for p in patch_items], dtype=np.int32)
+
+            tmp_npz = cache_npz.with_name(cache_npz.name + ".tmp")
+            with tmp_npz.open("wb") as f:
+                np.savez_compressed(f, source_index=source_index, y0=y0, y1=y1, x0=x0, x1=x1)
+            tmp_npz.replace(cache_npz)
+
+            meta = {
+                "schema": PATCH_INDEX_CACHE_SCHEMA_VERSION,
+                "cache_key": self.cache_key,
+                "total_candidate_patches": int(self.total_candidate_patches),
+                "kept_patches": int(len(patch_items)),
+                "payload": payload,
+            }
+            tmp_meta = cache_meta.with_name(cache_meta.name + ".tmp")
+            with tmp_meta.open("w", encoding="utf-8") as f:
+                json.dump(meta, f, sort_keys=True, indent=2)
+                f.write("\n")
+            tmp_meta.replace(cache_meta)
+        except Exception as exc:
+            logger.warning("Failed to write patch-index cache at %s (%s)", cache_npz, exc)
 
     def _build_patch_items(self) -> list[dict[str, object]]:
         patch_items: list[dict[str, object]] = []
 
-        for source_index in self.source_indices:
+        source_iter = tqdm(
+            self.source_indices,
+            desc="Patch index",
+            unit="img",
+            leave=False,
+            disable=not sys.stderr.isatty(),
+        )
+
+        for source_index in source_iter:
             if source_index < 0 or source_index >= len(self.base_dataset.items):
                 raise IndexError(f"source index out of range: {source_index}")
 

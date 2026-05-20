@@ -263,3 +263,134 @@ def test_patch_index_build_skips_prob_loading_without_base_transform(tmp_path, m
 
     assert len(patch_ds) > 0
 
+def test_patch_index_cache_roundtrip_hits_on_second_build(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    consensus_root = tmp_path / "consensus"
+    cache_dir = tmp_path / "cache"
+    _write_case(
+        data_root=data_root,
+        consensus_root=consensus_root,
+        case_id="case001",
+        height=96,
+        width=96,
+    )
+
+    ds = GleasonConsensusDataset(data_root=data_root, consensus_root=consensus_root)
+
+    first = SlidingWindowPatchDataset(
+        base_dataset=ds,
+        source_indices=[0],
+        patch_size=(32, 32),
+        overlap=0.5,
+        patch_tissue_filter_enabled=False,
+        cache_dir=cache_dir,
+    )
+    assert first.cache_used is False
+    assert first.cache_path is not None
+    assert first.cache_path.exists()
+    meta_path = first.cache_path.with_suffix(".json")
+    assert meta_path.exists()
+
+    import src.gleason_consensus_dataset as dataset_mod
+
+    def _fail_build(self):
+        raise AssertionError("cache hit should bypass _build_patch_items")
+
+    monkeypatch.setattr(dataset_mod.SlidingWindowPatchDataset, "_build_patch_items", _fail_build)
+
+    second = SlidingWindowPatchDataset(
+        base_dataset=ds,
+        source_indices=[0],
+        patch_size=(32, 32),
+        overlap=0.5,
+        patch_tissue_filter_enabled=False,
+        cache_dir=cache_dir,
+    )
+    assert second.cache_used is True
+    assert len(second) == len(first)
+
+
+def test_patch_index_cache_rebuild_forces_recompute(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    consensus_root = tmp_path / "consensus"
+    cache_dir = tmp_path / "cache"
+    _write_case(
+        data_root=data_root,
+        consensus_root=consensus_root,
+        case_id="case001",
+        height=96,
+        width=96,
+    )
+
+    ds = GleasonConsensusDataset(data_root=data_root, consensus_root=consensus_root)
+
+    SlidingWindowPatchDataset(
+        base_dataset=ds,
+        source_indices=[0],
+        patch_size=(32, 32),
+        overlap=0.5,
+        patch_tissue_filter_enabled=False,
+        cache_dir=cache_dir,
+    )
+
+    import src.gleason_consensus_dataset as dataset_mod
+
+    call_count = {"n": 0}
+    original = dataset_mod.SlidingWindowPatchDataset._build_patch_items
+
+    def _counting_build(self):
+        call_count["n"] += 1
+        return original(self)
+
+    monkeypatch.setattr(dataset_mod.SlidingWindowPatchDataset, "_build_patch_items", _counting_build)
+
+    rebuilt = SlidingWindowPatchDataset(
+        base_dataset=ds,
+        source_indices=[0],
+        patch_size=(32, 32),
+        overlap=0.5,
+        patch_tissue_filter_enabled=False,
+        cache_dir=cache_dir,
+        cache_rebuild=True,
+    )
+    assert rebuilt.cache_used is False
+    assert call_count["n"] == 1
+    assert len(rebuilt) > 0
+
+
+def test_patch_index_cache_corruption_falls_back_to_recompute(tmp_path):
+    data_root = tmp_path / "data"
+    consensus_root = tmp_path / "consensus"
+    cache_dir = tmp_path / "cache"
+    _write_case(
+        data_root=data_root,
+        consensus_root=consensus_root,
+        case_id="case001",
+        height=96,
+        width=96,
+    )
+
+    ds = GleasonConsensusDataset(data_root=data_root, consensus_root=consensus_root)
+
+    first = SlidingWindowPatchDataset(
+        base_dataset=ds,
+        source_indices=[0],
+        patch_size=(32, 32),
+        overlap=0.5,
+        patch_tissue_filter_enabled=False,
+        cache_dir=cache_dir,
+    )
+    assert first.cache_path is not None
+    first.cache_path.write_bytes(b"not-an-npz")
+
+    recovered = SlidingWindowPatchDataset(
+        base_dataset=ds,
+        source_indices=[0],
+        patch_size=(32, 32),
+        overlap=0.5,
+        patch_tissue_filter_enabled=False,
+        cache_dir=cache_dir,
+    )
+    assert recovered.cache_used is False
+    assert len(recovered) == len(first)
+
