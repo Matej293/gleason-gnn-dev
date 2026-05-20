@@ -7,14 +7,14 @@ import pytest
 import torch
 from PIL import Image
 
-from src.config import (
+from src.common.config import (
     consensus_dataset_kwargs_from_config,
     consensus_train_val_transforms_from_config,
 )
-from src.consensus_transforms import build_consensus_train_transform
-from src.eval_utils import collate_consensus_batch
-from src.gleason_consensus_dataset import GleasonConsensusDataset
-from src.train_deconver import _consensus_loss
+from src.data.consensus_transforms import build_consensus_train_transform
+from src.eval.eval_utils import collate_consensus_batch
+from src.data.gleason_consensus_dataset import GleasonConsensusDataset
+from src.trainers.segmentation import _consensus_loss
 
 
 def _make_toy_dataset(tmp_path: Path) -> tuple[Path, Path]:

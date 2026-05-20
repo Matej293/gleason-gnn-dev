@@ -5,7 +5,7 @@ import pytest
 import torch
 from PIL import Image
 
-from src.gleason_consensus_dataset import GleasonConsensusDataset, SlidingWindowPatchDataset
+from src.data.gleason_consensus_dataset import GleasonConsensusDataset, SlidingWindowPatchDataset
 
 def _write_case(
     *,
@@ -236,7 +236,7 @@ def test_patch_index_build_skips_prob_loading_without_base_transform(tmp_path, m
 
     ds = GleasonConsensusDataset(data_root=data_root, consensus_root=consensus_root)
 
-    import src.gleason_consensus_dataset as dataset_mod
+    import src.data.gleason_consensus_dataset as dataset_mod
 
     monkeypatch.setattr(
         dataset_mod,
@@ -291,7 +291,7 @@ def test_patch_index_cache_roundtrip_hits_on_second_build(tmp_path, monkeypatch)
     meta_path = first.cache_path.with_suffix(".json")
     assert meta_path.exists()
 
-    import src.gleason_consensus_dataset as dataset_mod
+    import src.data.gleason_consensus_dataset as dataset_mod
 
     def _fail_build(self):
         raise AssertionError("cache hit should bypass _build_patch_items")
@@ -333,7 +333,7 @@ def test_patch_index_cache_rebuild_forces_recompute(tmp_path, monkeypatch):
         cache_dir=cache_dir,
     )
 
-    import src.gleason_consensus_dataset as dataset_mod
+    import src.data.gleason_consensus_dataset as dataset_mod
 
     call_count = {"n": 0}
     original = dataset_mod.SlidingWindowPatchDataset._build_patch_items

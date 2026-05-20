@@ -147,8 +147,8 @@ def _compute_boundary_metrics(
     )
 
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=UserWarning, module=r"monai\\..*")
-        warnings.filterwarnings("ignore", category=FutureWarning, module=r"monai\\..*")
+        warnings.filterwarnings("ignore", category=UserWarning, module=r"monai\..*")
+        warnings.filterwarnings("ignore", category=FutureWarning, module=r"monai\..*")
         hd95_vals = hd95_metric(pred_oh, true_oh).detach().cpu()
         asd_vals = asd_metric(pred_oh, true_oh).detach().cpu()
 

@@ -3,7 +3,7 @@
 Evaluate a Deconver checkpoint on Gleason consensus labels.
 
 Usage:
-  PYTHONPATH=. python scripts/evaluate_checkpoint.py \
+  PYTHONPATH=. python -m src.cli.evaluate_checkpoint \
       --run outputs/runs/<run_name>
 """
 
@@ -13,7 +13,6 @@ import argparse
 import json
 import logging
 import math
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -22,10 +21,13 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-_SRC = Path(__file__).parent.parent / "src"
-sys.path.insert(0, str(_SRC))
-
-from config import (  # noqa: E402
+from src.common.cli_utils import (
+    require_existing_dir,
+    require_existing_file,
+    resolve_checkpoint_path,
+    validate_non_negative_int,
+)
+from src.common.config import (
     consensus_dataset_kwargs_from_config,
     consensus_train_val_transforms_from_config,
     load_config,
@@ -33,15 +35,12 @@ from config import (  # noqa: E402
     resolve_resized_sliding_window_overlap,
     resolve_resized_sliding_window_patch_size,
 )
-from cli_utils import (  # noqa: E402
-    require_existing_dir,
-    require_existing_file,
-    resolve_checkpoint_path,
-    validate_non_negative_int,
-)
-from config_validation import validate_deconver_config  # noqa: E402
-from metric_config import resolve_metric_settings  # noqa: E402
-from eval_utils import (  # noqa: E402
+from src.common.config_validation import validate_deconver_config
+from src.common.model_outputs import extract_logits as _extract_logits
+from src.common.utils import ensure_cuda_binary_compatibility, load_checkpoint
+from src.common.wandb_logger import WandbLogger
+from src.data.gleason_consensus_dataset import GleasonConsensusDataset
+from src.eval.eval_utils import (
     collate_consensus_batch,
     compute_multiclass_metrics_from_pred,
     fmt_metric,
@@ -50,13 +49,9 @@ from eval_utils import (  # noqa: E402
     postprocess_predictions,
     resolve_split_manifest_path,
 )
-from gleason_consensus_dataset import GleasonConsensusDataset  # noqa: E402
-from models import build_model  # noqa: E402
-from model_outputs import extract_logits as _extract_logits  # noqa: E402
-from utils import ensure_cuda_binary_compatibility, load_checkpoint  # noqa: E402
-from visualization import render_case_panel, save_case_panel  # noqa: E402
-from wandb_logger import WandbLogger  # noqa: E402
-
+from src.eval.metric_config import resolve_metric_settings
+from src.models import build_model
+from src.viz.visualization import render_case_panel, save_case_panel
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

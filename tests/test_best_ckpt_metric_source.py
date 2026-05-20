@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.train_deconver import _resolve_training_best_checkpoint_source
+from src.trainers.segmentation import _resolve_training_best_checkpoint_source
 
 
 def test_training_best_checkpoint_source_accepts_raw() -> None:

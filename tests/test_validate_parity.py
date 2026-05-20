@@ -6,9 +6,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from src.eval_utils import collate_consensus_batch, compute_multiclass_metrics_from_pred
-from src.metric_config import LEGACY_METRIC_TRACK_KEYS
-from src.train_deconver import _compute_training_loss, _infer_logits, _resize_targets_for_logits, validate
+from src.eval.eval_utils import collate_consensus_batch, compute_multiclass_metrics_from_pred
+from src.eval.metric_config import LEGACY_METRIC_TRACK_KEYS
+from src.trainers.segmentation import _compute_training_loss, _infer_logits, _resize_targets_for_logits, validate
 
 
 class _FixedLogitsModel(torch.nn.Module):

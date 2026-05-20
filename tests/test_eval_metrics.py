@@ -7,7 +7,7 @@ import torch
 from scipy.ndimage import binary_dilation, binary_fill_holes
 from skimage.measure import label
 
-from src.eval_utils import (
+from src.eval.eval_utils import (
     compute_multiclass_metrics,
     compute_multiclass_metrics_from_pred,
     postprocess_predictions,

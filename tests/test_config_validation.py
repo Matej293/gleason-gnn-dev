@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.config_validation import validate_deconver_config
+from src.common.config_validation import validate_deconver_config
 
 _DEFAULT_TRANSFORM_PROFILES = {
     "light": {

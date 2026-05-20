@@ -35,7 +35,7 @@ def test_generate_consensus_gt_viz_script_smoke(tmp_path: Path) -> None:
     out_dir = tmp_path / "viz_out"
     cmd = [
         sys.executable,
-        "scripts/generate_consensus_gt_viz.py",
+        "-m", "src.cli.generate_consensus_gt_viz",
         "--data-root",
         str(data_root),
         "--consensus-root",

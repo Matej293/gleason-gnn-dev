@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from src.visualization import CLASS_COLORS, CLASS_LABELS, colorize_mask
+from src.viz.visualization import CLASS_COLORS, CLASS_LABELS, colorize_mask
 
 
 IGNORE_COLOR = np.asarray((0, 255, 255), dtype=np.float32)

@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from src.gleason_consensus_dataset import (
+from src.data.gleason_consensus_dataset import (
     GleasonConsensusDataset,
     build_tissue_mask_from_image,
     clean_ignore_mask,

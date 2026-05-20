@@ -100,6 +100,6 @@ def consensus_dataset_kwargs_from_config(
 def consensus_train_val_transforms_from_config(
     cfg: dict[str, Any],
 ) -> tuple[Callable | None, Callable | None]:
-    from src.consensus_transforms import build_consensus_train_val_transforms
+    from src.data.consensus_transforms import build_consensus_train_val_transforms
 
     return build_consensus_train_val_transforms(cfg)

@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.gnn.models import NodeMLP
+from src.pipelines.gnn.models import NodeMLP
 
 
 def _write_graph_case(case_dir: Path, offset: float = 0.0) -> None:
@@ -114,7 +114,7 @@ def test_payload_validation_error_when_missing_per_case_arrays(tmp_path: Path) -
     (cmp_dir / "baseline_comparison.json").write_text(json.dumps(bad), encoding="utf-8")
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_baseline_comparison.py",
+        "-m", "src.cli.visualize_gnn_baseline_comparison",
         "--comparison-dir",
         str(cmp_dir),
         "--graphs-root",
@@ -137,7 +137,7 @@ def test_run_resolver_picks_nearest_timestamp(tmp_path: Path) -> None:
     out_dir = tmp_path / "viz_out"
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_baseline_comparison.py",
+        "-m", "src.cli.visualize_gnn_baseline_comparison",
         "--comparison-dir",
         str(cmp_dir),
         "--graphs-root",
@@ -161,7 +161,7 @@ def test_generates_combined_figures_and_case_montages(tmp_path: Path) -> None:
     out_dir = tmp_path / "viz_out"
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_baseline_comparison.py",
+        "-m", "src.cli.visualize_gnn_baseline_comparison",
         "--comparison-dir",
         str(cmp_dir),
         "--graphs-root",
@@ -191,7 +191,7 @@ def test_missing_best_pt_for_one_model_fails(tmp_path: Path) -> None:
     (bad_run / "best.pt").unlink()
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_baseline_comparison.py",
+        "-m", "src.cli.visualize_gnn_baseline_comparison",
         "--comparison-dir",
         str(cmp_dir),
         "--graphs-root",
@@ -213,7 +213,7 @@ def test_case_count_mismatch_fails(tmp_path: Path) -> None:
     (cmp_dir / "baseline_comparison.json").write_text(json.dumps(payload), encoding="utf-8")
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_baseline_comparison.py",
+        "-m", "src.cli.visualize_gnn_baseline_comparison",
         "--comparison-dir",
         str(cmp_dir),
         "--graphs-root",

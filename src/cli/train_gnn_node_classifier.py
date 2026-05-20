@@ -6,9 +6,9 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from src.gnn.data import load_graph_splits
-from src.gnn.metrics import json_safe
-from src.gnn.train import TrainConfig, run_training
+from src.pipelines.gnn.data import load_graph_splits
+from src.pipelines.gnn.metrics import json_safe
+from src.pipelines.gnn.train import TrainConfig, run_training
 
 
 PROFILES = {

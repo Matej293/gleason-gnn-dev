@@ -2,7 +2,7 @@
 Training for Gleason consensus labels (4-class segmentation).
 
 Usage:
-    python -m src.train_deconver --config configs/deconver.yaml
+    python -m src.cli.train --config configs/deconver.yaml
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from tqdm import tqdm
 
-from src.config import (
+from src.common.config import (
     consensus_dataset_kwargs_from_config,
     consensus_train_val_transforms_from_config,
     load_config,
@@ -32,17 +32,17 @@ from src.config import (
     resolve_resized_sliding_window_overlap,
     resolve_resized_sliding_window_patch_size,
 )
-from src.config_validation import validate_amp_runtime, validate_deconver_config
-from src.metric_config import BOUNDARY_METRIC_KEYS, LEGACY_METRIC_TRACK_KEYS, resolve_metric_settings
-from src.consensus_transforms import set_transform_random_state
-from src.cli_utils import (
+from src.common.config_validation import validate_amp_runtime, validate_deconver_config
+from src.eval.metric_config import BOUNDARY_METRIC_KEYS, LEGACY_METRIC_TRACK_KEYS, resolve_metric_settings
+from src.data.consensus_transforms import set_transform_random_state
+from src.common.cli_utils import (
     ensure_output_dir,
     require_existing_file,
     require_non_empty_str,
     validate_experiment_name,
     validate_seed,
 )
-from src.eval_utils import (
+from src.eval.eval_utils import (
     build_confusion_matrix,
     collate_consensus_batch,
     compute_multiclass_metrics_from_pred,
@@ -50,9 +50,9 @@ from src.eval_utils import (
     resolve_split_manifest_path,
     safe_read_json,
 )
-from src.gleason_consensus_dataset import GleasonConsensusDataset
+from src.data.gleason_consensus_dataset import GleasonConsensusDataset
 from src.models import build_model
-from src.utils import (
+from src.common.utils import (
     create_run_dir,
     ensure_cuda_binary_compatibility,
     load_checkpoint,
@@ -62,8 +62,11 @@ from src.utils import (
     save_latest_pointer,
     save_metadata,
 )
-from src.visualization import render_case_panel, save_case_panel
-from src.wandb_logger import WandbLogger
+from src.viz.visualization import render_case_panel, save_case_panel
+from src.common.wandb_logger import WandbLogger
+from src.trainers.interfaces import EpochStats, LossOutputs, RunContext, TrainBatch
+from src.trainers import data_utils as _data_utils
+from src.trainers import loss_utils as _loss_utils
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1766,6 +1769,45 @@ def _run_validation_visualizations(
     return saved
 
 
+# Internal refactor compatibility shims: keep public helper names stable while
+# routing logic through extracted modules.
+_seed_worker = _data_utils.seed_worker
+_resolve_dataloader_context = _data_utils.resolve_dataloader_context
+_infer_qc_flags = _data_utils.infer_qc_flags
+_infer_qc_weight = _data_utils.infer_qc_weight
+_case_flags_from_hard_mask = _data_utils.case_flags_from_hard_mask
+_build_sample_metadata = _data_utils.build_sample_metadata
+_split_class_presence_summary = _data_utils.split_class_presence_summary
+_log_split_class_presence = _data_utils.log_split_class_presence
+_val_min_class_presence_from_cfg = _data_utils.val_min_class_presence_from_cfg
+_val_presence_shortfalls = _data_utils.val_presence_shortfalls
+_split_two_way_stratified = _data_utils.split_two_way_stratified
+_build_split_rows = _data_utils.build_split_rows
+_loo_consensus_mean_from_rows = _data_utils.loo_consensus_mean_from_rows
+_write_split_manifest = _data_utils.write_split_manifest
+_load_hard_case_weight_map = _data_utils.load_hard_case_weight_map
+_build_train_sampler = _data_utils.build_train_sampler
+_pick_fixed_val_viz_ids = _data_utils.pick_fixed_val_viz_ids
+_post_min_component_sizes_from_cfg = _data_utils.post_min_component_sizes_from_cfg
+_resolve_training_best_checkpoint_source = _data_utils.resolve_training_best_checkpoint_source
+
+_resolve_epoch_lambda_weights = _loss_utils.resolve_epoch_lambda_weights
+_resize_targets_for_logits = _loss_utils.resize_targets_for_logits
+_make_valid_mask = _loss_utils.make_valid_mask
+_soft_loss_map = _loss_utils.soft_loss_map
+_hard_dice_per_class = _loss_utils.hard_dice_per_class
+_hard_dice_valid_class_mask = _loss_utils.hard_dice_valid_class_mask
+_nanmean_tensor = _loss_utils.nanmean_tensor
+_build_scale_loss_context = _loss_utils.build_scale_loss_context
+_single_scale_loss_from_context = _loss_utils.single_scale_loss_from_context
+_single_scale_loss = _loss_utils.single_scale_loss
+_consensus_loss = _loss_utils.consensus_loss
+_gleason_ce_loss_from_context = _loss_utils.gleason_ce_loss_from_context
+_gleason_ce_loss = _loss_utils.gleason_ce_loss
+_soft_target_term_loss_from_context = _loss_utils.soft_target_term_loss_from_context
+_soft_target_term_loss = _loss_utils.soft_target_term_loss
+_compute_training_loss = _loss_utils.compute_training_loss
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1819,7 +1861,7 @@ def main() -> None:
     spatial_dims = int(cfg.get("spatial_dims", 2))
     if spatial_dims != 2:
         raise ValueError(
-            f"train_deconver requires spatial_dims=2, got {spatial_dims}"
+            f"train requires spatial_dims=2, got {spatial_dims}"
         )
 
     # Requested class mapping: 0=benign, 1=G3, 2=G4, 3=G5.
@@ -1869,6 +1911,13 @@ def main() -> None:
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    run_context = RunContext(
+        run_dir=run_dir,
+        checkpoint_dir=checkpoint_dir,
+        split_manifest_copy_path=run_dir / "train_val_split_manifest.json",
+        summary_path=run_dir / "training_summary.json",
+    )
 
     save_metadata(run_dir, cfg)
     save_config_copy(run_dir, cfg)
@@ -1967,7 +2016,7 @@ def main() -> None:
                 )
         logger.info("Using existing split manifest at %s", split_manifest_path)
 
-    split_manifest_copy_path = run_dir / "train_val_split_manifest.json"
+    split_manifest_copy_path = run_context.split_manifest_copy_path
     shutil.copy2(split_manifest_path, split_manifest_copy_path)
 
     train_indices = [int(r["dataset_index"]) for r in train_rows]
@@ -2438,11 +2487,7 @@ def main() -> None:
             base_lambda_dice=lambda_dice,
         )
         model.train()
-        epoch_loss = 0.0
-        epoch_soft = 0.0
-        epoch_hard = 0.0
-        epoch_valid_frac = 0.0
-        epoch_optimizer_steps = 0
+        epoch_stats = EpochStats()
 
         batch_bar = tqdm(
             train_loader, desc=f"Train {epoch}/{epochs}", leave=False, unit="batch"
@@ -2458,17 +2503,25 @@ def main() -> None:
                 device=device,
                 dtype=torch.float32,
             )
+            train_batch = TrainBatch(
+                images=images,
+                soft_probs=soft_probs,
+                hard_mask=hard_mask,
+                ignore_mask=ignore_mask,
+                image_ids=image_ids,
+                sample_weights=sample_w,
+            )
 
             optimizer.zero_grad(set_to_none=True)
 
             recovered_with_fp32 = False
             try:
                 loss, stats = _forward_train_batch_loss(
-                    images,
-                    batch_hard_mask=hard_mask,
-                    batch_soft_probs=soft_probs,
-                    batch_ignore_mask=ignore_mask,
-                    batch_sample_w=sample_w,
+                    train_batch.images,
+                    batch_hard_mask=train_batch.hard_mask,
+                    batch_soft_probs=train_batch.soft_probs,
+                    batch_ignore_mask=train_batch.ignore_mask,
+                    batch_sample_w=train_batch.sample_weights,
                     epoch_soft_weight=epoch_lambda_soft,
                     epoch_dice_weight=epoch_lambda_dice,
                     force_fp32=False,
@@ -2547,31 +2600,39 @@ def main() -> None:
                 optimizer_stepped = scaler.get_scale() >= prev_scale
 
             if optimizer_stepped:
-                epoch_optimizer_steps += 1
+                epoch_stats.mark_optimizer_step()
             if scheduler_step_per_batch and optimizer_stepped:
                 scheduler.step()
 
-            loss_item = float(loss.detach().cpu().item())
-            epoch_loss += loss_item
-            epoch_soft += float(stats["soft_loss"])
-            epoch_hard += float(stats["hard_dice_loss"])
-            epoch_valid_frac += float(stats["valid_fraction"])
+            loss_out = LossOutputs(
+                loss=loss,
+                soft_loss=float(stats["soft_loss"]),
+                hard_dice_loss=float(stats["hard_dice_loss"]),
+                valid_fraction=float(stats["valid_fraction"]),
+            )
+            loss_item = float(loss_out.loss.detach().cpu().item())
+            epoch_stats.add(
+                loss=loss_item,
+                soft_loss=loss_out.soft_loss,
+                hard_dice_loss=loss_out.hard_dice_loss,
+                valid_fraction=loss_out.valid_fraction,
+            )
             batch_bar.set_postfix(
                 loss=f"{loss_item:.4f}",
-                soft=f"{stats['soft_loss']:.4f}",
-                dice=f"{stats['hard_dice_loss']:.4f}",
+                soft=f"{loss_out.soft_loss:.4f}",
+                dice=f"{loss_out.hard_dice_loss:.4f}",
             )
 
-            del images, soft_probs, hard_mask, ignore_mask, sample_w, loss
+            del images, soft_probs, hard_mask, ignore_mask, sample_w, train_batch, loss
 
-        if not scheduler_step_per_batch and epoch_optimizer_steps > 0:
+        if not scheduler_step_per_batch and epoch_stats.optimizer_steps > 0:
             scheduler.step()
 
-        nb = max(1, len(train_loader))
-        avg_loss = epoch_loss / nb
-        avg_soft = epoch_soft / nb
-        avg_hard = epoch_hard / nb
-        avg_valid = epoch_valid_frac / nb
+        epoch_avg = epoch_stats.averages(len(train_loader))
+        avg_loss = epoch_avg["loss"]
+        avg_soft = epoch_avg["soft_loss"]
+        avg_hard = epoch_avg["hard_dice_loss"]
+        avg_valid = epoch_avg["valid_fraction"]
         current_lr = scheduler.get_last_lr()[0]
 
         wandb_logger.log_epoch(
@@ -2795,7 +2856,7 @@ def main() -> None:
         "val_sample_count": int(len(val_ds)),
         "test_sample_count": int(len(test_ds) if test_ds is not None else 0),
     }
-    summary_path = run_dir / "training_summary.json"
+    summary_path = run_context.summary_path
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(training_summary, f, indent=2)
         f.write("\n")

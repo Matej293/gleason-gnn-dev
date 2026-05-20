@@ -7,13 +7,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.graph_pipeline.graph_build import build_edges, build_touch_adjacency_edges
-from src.graph_pipeline.node_features import compute_node_features
-from src.graph_pipeline.node_labels import assign_majority_node_labels
+from src.pipelines.graph.graph_build import build_edges, build_touch_adjacency_edges
+from src.pipelines.graph.node_features import compute_node_features
+from src.pipelines.graph.node_labels import assign_majority_node_labels
 
 
 def _load_build_graphs_module():
-    mod_path = Path(__file__).resolve().parents[1] / "scripts" / "build_superpixel_graphs.py"
+    mod_path = Path(__file__).resolve().parents[1] / "src" / "cli" / "build_superpixel_graphs.py"
     spec = importlib.util.spec_from_file_location("build_superpixel_graphs", mod_path)
     if spec is None or spec.loader is None:
         raise RuntimeError("Failed loading build_superpixel_graphs.py")

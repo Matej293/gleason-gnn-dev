@@ -13,9 +13,9 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from src.gnn.data import GraphSample, feature_index_map
-from src.gnn.metrics import CLASS_NAMES, CaseEval, aggregate_case_metrics, json_safe
-from src.gnn.models import GATNet, GCNNet, GraphSAGENet, NodeMLP
+from src.pipelines.gnn.data import GraphSample, feature_index_map
+from src.pipelines.gnn.metrics import CLASS_NAMES, CaseEval, aggregate_case_metrics, json_safe
+from src.pipelines.gnn.models import GATNet, GCNNet, GraphSAGENet, NodeMLP
 
 
 @dataclass

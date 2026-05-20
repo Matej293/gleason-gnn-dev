@@ -10,9 +10,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from src.gnn.baselines import seg_only_predict
-from src.gnn.metrics import CaseEval, aggregate_case_metrics, json_safe
-from src.gnn.viz_runtime import (
+from src.pipelines.gnn.baselines import seg_only_predict
+from src.pipelines.gnn.metrics import CaseEval, aggregate_case_metrics, json_safe
+from src.pipelines.gnn.viz_runtime import (
     apply_norm_x as _apply_norm_x,
     build_model_from_metadata as _build_model_from_metadata,
     labels_to_map as _labels_to_map,
@@ -20,7 +20,7 @@ from src.gnn.viz_runtime import (
     resolve_norm_stats as _resolve_norm_stats,
     seg_prob_idx_from_meta as _seg_prob_idx_from_meta,
 )
-from src.graph_pipeline.viz_helpers import (
+from src.pipelines.graph.viz_helpers import (
     extract_node_centroids,
     extract_superpixel_boundaries,
     unique_undirected_edges,

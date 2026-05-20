@@ -10,8 +10,8 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from src.config import consensus_dataset_kwargs_from_config, load_config
-from src.cli_utils import (
+from src.common.config import consensus_dataset_kwargs_from_config, load_config
+from src.common.cli_utils import (
     ensure_output_dir,
     require_existing_dir,
     require_existing_file,
@@ -20,18 +20,18 @@ from src.cli_utils import (
     validate_non_negative_int,
     validate_positive_int,
 )
-from src.config_validation import validate_deconver_config
-from src.eval_utils import collate_consensus_batch, resolve_split_manifest_path, safe_read_json
-from src.gleason_consensus_dataset import GleasonConsensusDataset
-from src.graph_pipeline import (
+from src.common.config_validation import validate_deconver_config
+from src.eval.eval_utils import collate_consensus_batch, resolve_split_manifest_path, safe_read_json
+from src.data.gleason_consensus_dataset import GleasonConsensusDataset
+from src.pipelines.graph import (
     assign_majority_node_labels,
     build_edges,
     compute_node_features,
     generate_slic_superpixels,
 )
 from src.models import build_model
-from src.model_outputs import extract_logits as _extract_logits
-from src.utils import ensure_cuda_binary_compatibility, load_checkpoint
+from src.common.model_outputs import extract_logits as _extract_logits
+from src.common.utils import ensure_cuda_binary_compatibility, load_checkpoint
 
 
 def parse_args() -> argparse.Namespace:

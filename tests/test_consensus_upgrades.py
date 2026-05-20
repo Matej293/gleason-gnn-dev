@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from src.consensus_builder.pipeline import ConsensusConfig, ConsensusMaskBuilder
-from src.consensus_builder.postprocess import (
+from src.pipelines.consensus.pipeline import ConsensusConfig, ConsensusMaskBuilder
+from src.pipelines.consensus.postprocess import (
     boundary_disagreement_penalty,
     make_ignore_mask_with_threshold,
     refine_hard_mask_classes,

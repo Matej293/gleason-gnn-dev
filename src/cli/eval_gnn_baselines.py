@@ -9,10 +9,10 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
-from src.gnn.baselines import seg_only_predict
-from src.gnn.data import load_graph_splits
-from src.gnn.metrics import CLASS_NAMES, CaseEval, aggregate_case_metrics, json_safe
-from src.gnn.train import TrainConfig, run_training
+from src.pipelines.gnn.baselines import seg_only_predict
+from src.pipelines.gnn.data import load_graph_splits
+from src.pipelines.gnn.metrics import CLASS_NAMES, CaseEval, aggregate_case_metrics, json_safe
+from src.pipelines.gnn.train import TrainConfig, run_training
 
 SPLITS = ("train", "val", "test")
 METHODS = ("mlp", "graphsage", "gcn", "gat")

@@ -1,4 +1,4 @@
-.PHONY: help train eval smoke test consensus consensus-weighted viz-consensus-gt audit-background-ignore gnn-build gnn-build-all gnn-eval gnn-train gnn-train-all gnn-viz gnn-viz-best gnn-compare-viz
+.PHONY: help train eval smoke test lint typecheck test-cov consensus consensus-weighted viz-consensus-gt audit-background-ignore gnn-build gnn-build-all gnn-eval gnn-train gnn-train-all gnn-viz gnn-viz-best gnn-compare-viz
 .DEFAULT_GOAL := help
 
 PYTHON ?= python
@@ -56,19 +56,22 @@ GNN_WANDB_RUN_NAME ?=
 GNN_WANDB_TAGS ?=
 GNN_WANDB_LOG_MAX_CASE_IMAGES ?= 24
 
-TRAIN_MODULE := src.train_deconver
-TRAIN_FILE := src/train_deconver.py
-EVAL_CHECKPOINT_SCRIPT := scripts/evaluate_checkpoint.py
-SMOKE_SCRIPT := scripts/smoke_test.py
-BUILD_CONSENSUS_SCRIPT := scripts/build_consensus.py
-VIZ_CONSENSUS_SCRIPT := scripts/generate_consensus_gt_viz.py
-AUDIT_BACKGROUND_IGNORE_SCRIPT := scripts/audit_background_ignore.py
-BUILD_SUPERPIXEL_GRAPHS_SCRIPT := scripts/build_superpixel_graphs.py
-EVAL_GNN_BASELINES_SCRIPT := scripts/eval_gnn_baselines.py
-TRAIN_GNN_SCRIPT := scripts/train_gnn_node_classifier.py
-VIZ_GNN_SCRIPT := scripts/visualize_gnn_predictions.py
-SELECT_BEST_GNN_SCRIPT := scripts/select_best_gnn_run.py
-VIZ_GNN_COMPARISON_SCRIPT := scripts/visualize_gnn_baseline_comparison.py
+TRAIN_MODULE := src.cli.train
+TRAIN_FILE := src/cli/train.py
+EVAL_CHECKPOINT_MODULE := src.cli.evaluate_checkpoint
+SMOKE_MODULE := src.cli.smoke_test
+BUILD_CONSENSUS_MODULE := src.cli.build_consensus
+VIZ_CONSENSUS_MODULE := src.cli.generate_consensus_gt_viz
+AUDIT_BACKGROUND_IGNORE_MODULE := src.cli.audit_background_ignore
+BUILD_SUPERPIXEL_GRAPHS_MODULE := src.cli.build_superpixel_graphs
+EVAL_GNN_BASELINES_MODULE := src.cli.eval_gnn_baselines
+TRAIN_GNN_MODULE := src.cli.train_gnn_node_classifier
+VIZ_GNN_MODULE := src.cli.visualize_gnn_predictions
+SELECT_BEST_GNN_MODULE := src.cli.select_best_gnn_run
+VIZ_GNN_COMPARISON_MODULE := src.cli.visualize_gnn_baseline_comparison
+
+GNN_BUILD_COMMON_ARGS := --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) --edge-policy $(GNN_EDGE_POLICY) --edge-knn-k $(GNN_EDGE_KNN_K) --edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE)
+GNN_BUILD_OPTIONAL_ARGS := $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) $(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),)
 
 define require_non_placeholder
 @if [ -z "$($(1))" ] || [ "$($(1))" = "$(2)" ]; then echo "Usage: $(3)"; exit 1; fi
@@ -102,17 +105,17 @@ help:
 	@echo ""
 	@echo "Command Entry Files:"
 	@echo "  train                -> $(TRAIN_FILE)"
-	@echo "  eval                 -> $(EVAL_CHECKPOINT_SCRIPT)"
-	@echo "  smoke                -> $(SMOKE_SCRIPT)"
-	@echo "  consensus            -> $(BUILD_CONSENSUS_SCRIPT)"
-	@echo "  viz-consensus-gt     -> $(VIZ_CONSENSUS_SCRIPT)"
-	@echo "  audit-background-ignore -> $(AUDIT_BACKGROUND_IGNORE_SCRIPT)"
-	@echo "  gnn-build*           -> $(BUILD_SUPERPIXEL_GRAPHS_SCRIPT)"
-	@echo "  gnn-eval             -> $(EVAL_GNN_BASELINES_SCRIPT)"
-	@echo "  gnn-train*           -> $(TRAIN_GNN_SCRIPT)"
-	@echo "  gnn-viz*             -> $(VIZ_GNN_SCRIPT)"
-	@echo "  gnn-viz-best         -> $(SELECT_BEST_GNN_SCRIPT) + $(VIZ_GNN_SCRIPT)"
-	@echo "  gnn-compare-viz      -> $(VIZ_GNN_COMPARISON_SCRIPT)"
+	@echo "  eval                 -> $(EVAL_CHECKPOINT_MODULE)"
+	@echo "  smoke                -> $(SMOKE_MODULE)"
+	@echo "  consensus            -> $(BUILD_CONSENSUS_MODULE)"
+	@echo "  viz-consensus-gt     -> $(VIZ_CONSENSUS_MODULE)"
+	@echo "  audit-background-ignore -> $(AUDIT_BACKGROUND_IGNORE_MODULE)"
+	@echo "  gnn-build*           -> $(BUILD_SUPERPIXEL_GRAPHS_MODULE)"
+	@echo "  gnn-eval             -> $(EVAL_GNN_BASELINES_MODULE)"
+	@echo "  gnn-train*           -> $(TRAIN_GNN_MODULE)"
+	@echo "  gnn-viz*             -> $(VIZ_GNN_MODULE)"
+	@echo "  gnn-viz-best         -> $(SELECT_BEST_GNN_MODULE) + $(VIZ_GNN_MODULE)"
+	@echo "  gnn-compare-viz      -> $(VIZ_GNN_COMPARISON_MODULE)"
 	@echo ""
 	@echo "Key Variables:"
 	@echo "  PYTHON=$(PYTHON)"
@@ -127,19 +130,37 @@ train:
 
 eval:
 	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),make eval RUN=outputs/runs/<run_name>)
-	$(PY) $(EVAL_CHECKPOINT_SCRIPT) --run $(RUN) --save-viz --log-wandb-viz --log-wandb-metrics
+	$(PY) -m $(EVAL_CHECKPOINT_MODULE) --run $(RUN) --save-viz --log-wandb-viz --log-wandb-metrics
 
 smoke:
-	$(PY) $(SMOKE_SCRIPT)
+	$(PY) -m $(SMOKE_MODULE)
 
 test:
 	$(PYTEST) -q tests
 
+lint:
+	$(PY) -m compileall src scripts tests
+
+typecheck:
+	@if command -v mypy >/dev/null 2>&1; then \
+		PYTHONPATH=$(PYTHONPATH_ROOT) mypy src tests; \
+	else \
+		echo "mypy not installed; skipping typecheck target"; \
+	fi
+
+test-cov:
+	@if $(PYTEST) --help | rg -q -- "--cov"; then \
+		$(PYTEST) -q tests --cov=src --cov-report=term-missing; \
+	else \
+		echo "pytest-cov not installed; running tests without coverage"; \
+		$(PYTEST) -q tests; \
+	fi
+
 consensus:
-	$(PY) $(BUILD_CONSENSUS_SCRIPT) --dataset-root data --output-root data/consensus
+	$(PY) -m $(BUILD_CONSENSUS_MODULE) --dataset-root data --output-root data/consensus
 
 consensus-weighted:
-	$(PY) $(BUILD_CONSENSUS_SCRIPT) \
+	$(PY) -m $(BUILD_CONSENSUS_MODULE) \
 	--dataset-root data \
 	--output-root data/consensus \
 	--consensus-fusion-mode weighted \
@@ -158,28 +179,28 @@ consensus-weighted:
 	--workers 8
 
 viz-consensus-gt:
-	$(PY) $(VIZ_CONSENSUS_SCRIPT) --max-cases $(MAX_CASES)
+	$(PY) -m $(VIZ_CONSENSUS_MODULE) --max-cases $(MAX_CASES)
 
 audit-background-ignore:
-	$(PY) $(AUDIT_BACKGROUND_IGNORE_SCRIPT)
+	$(PY) -m $(AUDIT_BACKGROUND_IGNORE_MODULE)
 
 gnn-build:
 	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>)
 	$(call require_non_empty,SPLIT,make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>)
-	$(PY) $(BUILD_SUPERPIXEL_GRAPHS_SCRIPT) --run $(RUN) --split $(SPLIT) --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) --edge-policy $(GNN_EDGE_POLICY) --edge-knn-k $(GNN_EDGE_KNN_K) --edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE) $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) $(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),)
+	$(PY) -m $(BUILD_SUPERPIXEL_GRAPHS_MODULE) --run $(RUN) --split $(SPLIT) $(GNN_BUILD_COMMON_ARGS) $(GNN_BUILD_OPTIONAL_ARGS)
 
 gnn-build-all:
 	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),make gnn-build-all RUN=outputs/runs/<run_name> [GNN_BUILD_SPLITS='train val test'])
 	@for SPLIT in $(GNN_BUILD_SPLITS); do \
 	echo "Building graph split: $$SPLIT"; \
-	$(PY) $(BUILD_SUPERPIXEL_GRAPHS_SCRIPT) --run $(RUN) --split $$SPLIT --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) --edge-policy $(GNN_EDGE_POLICY) --edge-knn-k $(GNN_EDGE_KNN_K) --edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE) $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) $(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),) || exit 1; \
+	$(PY) -m $(BUILD_SUPERPIXEL_GRAPHS_MODULE) --run $(RUN) --split $$SPLIT $(GNN_BUILD_COMMON_ARGS) $(GNN_BUILD_OPTIONAL_ARGS) || exit 1; \
 	done
 
 gnn-eval:
-	$(PY) $(EVAL_GNN_BASELINES_SCRIPT) --graphs-root $(GNN_GRAPHS_ROOT) --profile $(GNN_PROFILE) --seed $(GNN_SEED)
+	$(PY) -m $(EVAL_GNN_BASELINES_MODULE) --graphs-root $(GNN_GRAPHS_ROOT) --profile $(GNN_PROFILE) --seed $(GNN_SEED)
 
 gnn-train:
-	$(PY) $(TRAIN_GNN_SCRIPT) \
+	$(PY) -m $(TRAIN_GNN_MODULE) \
 	--graphs-root $(GNN_GRAPHS_ROOT) \
 	--model $(GNN_MODEL) \
 	--profile $(GNN_PROFILE) \
@@ -201,7 +222,7 @@ gnn-train:
 gnn-train-all:
 	@for MODEL in $(GNN_MODELS); do \
 	echo "Training $$MODEL"; \
-	$(PY) $(TRAIN_GNN_SCRIPT) \
+	$(PY) -m $(TRAIN_GNN_MODULE) \
 	--graphs-root $(GNN_GRAPHS_ROOT) \
 	--model $$MODEL \
 	--profile $(GNN_PROFILE) \
@@ -229,22 +250,22 @@ gnn-train-all:
 
 gnn-viz:
 	$(call require_non_placeholder,GNN_RUN_DIR,$(GNN_RUN_DIR_PLACEHOLDER),make gnn-viz GNN_RUN_DIR=outputs/gnn_runs/<run_dir> [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>])
-	$(PY) $(VIZ_GNN_SCRIPT) --graphs-root $(GNN_GRAPHS_ROOT) --run-dir $(GNN_RUN_DIR) --split $(GNN_VIZ_SPLIT) --seed $(GNN_SEED)
+	$(PY) -m $(VIZ_GNN_MODULE) --graphs-root $(GNN_GRAPHS_ROOT) --run-dir $(GNN_RUN_DIR) --split $(GNN_VIZ_SPLIT) --seed $(GNN_SEED)
 
 gnn-viz-best:
 	@for MODEL in $(GNN_MODELS); do \
-	BEST_RUN="$$($(PY) $(SELECT_BEST_GNN_SCRIPT) --model "$$MODEL" --name-prefix "$(GNN_TRAIN_NAME)" --runs-root "$(GNN_RUNS_ROOT)")"; \
+	BEST_RUN="$$($(PY) -m $(SELECT_BEST_GNN_MODULE) --model "$$MODEL" --name-prefix "$(GNN_TRAIN_NAME)" --runs-root "$(GNN_RUNS_ROOT)")"; \
 	if [ -z "$$BEST_RUN" ]; then \
 	echo "No run found for $$MODEL with prefix '$(GNN_TRAIN_NAME)' - skipping."; \
 	continue; \
 	fi; \
 	echo "Best $$MODEL run: $$BEST_RUN"; \
-	$(PY) $(VIZ_GNN_SCRIPT) --graphs-root $(GNN_GRAPHS_ROOT) --run-dir "$$BEST_RUN" --split $(GNN_VIZ_SPLIT) --seed $(GNN_SEED) --parity-check $(GNN_PARITY_CHECK) --max-cases -1 || exit 1; \
+	$(PY) -m $(VIZ_GNN_MODULE) --graphs-root $(GNN_GRAPHS_ROOT) --run-dir "$$BEST_RUN" --split $(GNN_VIZ_SPLIT) --seed $(GNN_SEED) --parity-check $(GNN_PARITY_CHECK) --max-cases -1 || exit 1; \
 	done
 
 gnn-compare-viz:
 	$(call require_non_placeholder,GNN_COMPARISON_DIR,$(GNN_COMPARISON_DIR_PLACEHOLDER),make gnn-compare-viz GNN_COMPARISON_DIR=outputs/gnn_runs/<comparison_dir> [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>])
-	$(PY) $(VIZ_GNN_COMPARISON_SCRIPT) \
+	$(PY) -m $(VIZ_GNN_COMPARISON_MODULE) \
 	--comparison-dir $(GNN_COMPARISON_DIR) \
 	--graphs-root $(GNN_GRAPHS_ROOT) \
 	--gnn-runs-root $(GNN_RUNS_ROOT) \

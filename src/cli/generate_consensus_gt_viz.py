@@ -12,8 +12,8 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from src.consensus_overlay_viz import save_gt_overlay_png, save_gt_panel_png
-from src.gleason_consensus_dataset import GleasonConsensusDataset
+from src.viz.consensus_overlay_viz import save_gt_overlay_png, save_gt_panel_png
+from src.data.gleason_consensus_dataset import GleasonConsensusDataset
 
 _PIL_RESAMPLING = getattr(Image, "Resampling", Image)
 

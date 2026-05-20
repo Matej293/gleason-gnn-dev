@@ -15,7 +15,7 @@ This repository covers:
 ## Repository structure
 
 - `src/`: training, datasets, model code, consensus, graph pipeline, GNN modules
-- `scripts/`: runnable CLI entry points
+- `src/cli/`: runnable module entry points
 - `configs/`: training/evaluation configs
 - `tests/`: `pytest` test suite
 - `data/`: dataset and consensus outputs (local only)
@@ -33,29 +33,29 @@ pip install -r requirements.txt
 
 | Make target | Command entry file |
 | --- | --- |
-| `make train` | `src/train_deconver.py` (module: `src.train_deconver`) |
-| `make eval` | `scripts/evaluate_checkpoint.py` |
-| `make smoke` | `scripts/smoke_test.py` |
+| `make train` | `src.cli.train` |
+| `make eval` | `src.cli.evaluate_checkpoint` |
+| `make smoke` | `src.cli.smoke_test` |
 | `make test` | `tests/` (via `pytest`) |
-| `make consensus` / `make consensus-weighted` | `scripts/build_consensus.py` |
-| `make viz-consensus-gt` | `scripts/generate_consensus_gt_viz.py` |
-| `make audit-background-ignore` | `scripts/audit_background_ignore.py` |
-| `make gnn-build` / `make gnn-build-all` | `scripts/build_superpixel_graphs.py` |
-| `make gnn-eval` | `scripts/eval_gnn_baselines.py` |
-| `make gnn-train` / `make gnn-train-all` | `scripts/train_gnn_node_classifier.py` |
-| `make gnn-viz` | `scripts/visualize_gnn_predictions.py` |
-| `make gnn-viz-best` | `scripts/select_best_gnn_run.py` + `scripts/visualize_gnn_predictions.py` |
-| `make gnn-compare-viz` | `scripts/visualize_gnn_baseline_comparison.py` |
+| `make consensus` / `make consensus-weighted` | `src.cli.build_consensus` |
+| `make viz-consensus-gt` | `src.cli.generate_consensus_gt_viz` |
+| `make audit-background-ignore` | `src.cli.audit_background_ignore` |
+| `make gnn-build` / `make gnn-build-all` | `src.cli.build_superpixel_graphs` |
+| `make gnn-eval` | `src.cli.eval_gnn_baselines` |
+| `make gnn-train` / `make gnn-train-all` | `src.cli.train_gnn_node_classifier` |
+| `make gnn-viz` | `src.cli.visualize_gnn_predictions` |
+| `make gnn-viz-best` | `src.cli.select_best_gnn_run` + `src.cli.visualize_gnn_predictions` |
+| `make gnn-compare-viz` | `src.cli.visualize_gnn_baseline_comparison` |
 
 ### Main filenames across the codebase
 
-- Training loop and loss logic: `src/train_deconver.py`
-- Dataset loading: `src/gleason_consensus_dataset.py`
+- Training loop and loss logic: `src/trainers/segmentation.py`
+- Dataset loading: `src/data/gleason_consensus_dataset.py`
 - Model factory: `src/models/__init__.py`
-- Consensus modules: `src/consensus_builder/`
-- Graph export pipeline: `src/graph_pipeline/`
-- GNN models/training core: `src/gnn/`
-- Runtime scripts: `scripts/`
+- Consensus modules: `src/pipelines/consensus/`
+- Graph export pipeline: `src/pipelines/graph/`
+- GNN models/training core: `src/pipelines/gnn/`
+- Runtime CLI modules: `src/cli/`
 - Experiment configs: `configs/deconver.yaml`, `configs/unet_lite.yaml`, `configs/pspnet.yaml`
 
 ## GPU compatibility (Volta / TITAN V)
@@ -216,11 +216,11 @@ make gnn-eval GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>
 ## CLI equivalents
 
 ```bash
-PYTHONPATH=. python -m src.train_deconver --config configs/deconver.yaml
-PYTHONPATH=. python scripts/evaluate_checkpoint.py --run outputs/runs/<run_name>
-PYTHONPATH=. python scripts/build_superpixel_graphs.py --run outputs/runs/<run_name> --split test
-PYTHONPATH=. python scripts/train_gnn_node_classifier.py --graphs-root outputs/graphs/<graph_run> --model graphsage
-PYTHONPATH=. python scripts/eval_gnn_baselines.py --graphs-root outputs/graphs/<graph_run>
+PYTHONPATH=. python -m src.cli.train --config configs/deconver.yaml
+PYTHONPATH=. python -m src.cli.evaluate_checkpoint --run outputs/runs/<run_name>
+PYTHONPATH=. python -m src.cli.build_superpixel_graphs --run outputs/runs/<run_name> --split test
+PYTHONPATH=. python -m src.cli.train_gnn_node_classifier --graphs-root outputs/graphs/<graph_run> --model graphsage
+PYTHONPATH=. python -m src.cli.eval_gnn_baselines --graphs-root outputs/graphs/<graph_run>
 ```
 
 ## Evaluation output
@@ -237,7 +237,7 @@ PYTHONPATH=. python scripts/eval_gnn_baselines.py --graphs-root outputs/graphs/<
 Weighted consensus entry point:
 
 ```bash
-PYTHONPATH=. python scripts/build_consensus.py \
+PYTHONPATH=. python -m src.cli.build_consensus \
   --dataset-root data \
   --output-root data/consensus \
   --consensus-fusion-mode weighted

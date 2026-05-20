@@ -8,7 +8,7 @@ import numpy as np
 import yaml
 from PIL import Image
 
-from src.eval_utils import resolve_split_manifest_path, safe_read_json
+from src.eval.eval_utils import resolve_split_manifest_path, safe_read_json
 
 
 def parse_args() -> argparse.Namespace:

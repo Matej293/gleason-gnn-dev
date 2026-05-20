@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 try:
-    from src.metric_config import validate_metrics_config
+    from src.eval.metric_config import validate_metrics_config
 except Exception:  # pragma: no cover - fallback for scripts importing src modules directly.
     from metric_config import validate_metrics_config
 

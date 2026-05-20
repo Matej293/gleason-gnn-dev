@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.utils import load_checkpoint, save_checkpoint
+from src.common.utils import load_checkpoint, save_checkpoint
 
 
 def test_checkpoint_roundtrip(tmp_path):

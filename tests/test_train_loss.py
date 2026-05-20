@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from src.train_deconver import (
+from src.trainers.segmentation import (
     _compute_training_loss,
     _hard_dice_per_class,
     _hard_dice_valid_class_mask,

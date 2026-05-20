@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from src.consensus_overlay_viz import (
+from src.viz.consensus_overlay_viz import (
     render_gt_overlay,
     render_gt_panel,
     save_gt_overlay_png,

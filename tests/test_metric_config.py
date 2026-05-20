@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.metric_config import BOUNDARY_METRIC_KEYS, LEGACY_METRIC_TRACK_KEYS, resolve_metric_settings
+from src.eval.metric_config import BOUNDARY_METRIC_KEYS, LEGACY_METRIC_TRACK_KEYS, resolve_metric_settings
 
 
 def test_resolve_metric_settings_defaults_for_legacy_config() -> None:

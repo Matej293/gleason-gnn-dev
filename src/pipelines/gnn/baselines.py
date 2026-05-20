@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.gnn.data import feature_index_map
+from src.pipelines.gnn.data import feature_index_map
 
 
 def seg_only_predict(x: torch.Tensor) -> torch.Tensor:

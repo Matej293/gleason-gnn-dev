@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
@@ -7,11 +8,11 @@ import numpy as np
 import pytest
 import torch
 
-from src.gnn.baselines import seg_only_predict
-from src.gnn.data import feature_index_map, load_graph_splits
-from src.gnn.metrics import aggregate_case_metrics, json_safe
-from src.gnn.models import NodeMLP
-from src.gnn.train import TrainConfig, apply_class_mask_to_logits, run_training, train_supported_classes
+from src.pipelines.gnn.baselines import seg_only_predict
+from src.pipelines.gnn.data import feature_index_map, load_graph_splits
+from src.pipelines.gnn.metrics import aggregate_case_metrics, json_safe
+from src.pipelines.gnn.models import NodeMLP
+from src.pipelines.gnn.train import TrainConfig, apply_class_mask_to_logits, run_training, train_supported_classes
 
 
 def _write_graph(path: Path, n: int = 4, feat_dim: int = 22, y: np.ndarray | None = None) -> None:
@@ -62,7 +63,7 @@ def test_seg_only_predict_uses_expected_feature_slice() -> None:
 
 
 def test_metric_aggregation_toy_case() -> None:
-    from src.gnn.metrics import CaseEval
+    from src.pipelines.gnn.metrics import CaseEval
 
     cases = [CaseEval("a", np.array([0, 1, 2, 3]), np.array([0, 1, 2, 0]))]
     _, per_case_mean, cm, _ = aggregate_case_metrics(cases)
@@ -105,10 +106,9 @@ def test_train_mlp_end_to_end(tmp_path: Path) -> None:
     assert "predicted_class_counts" in payload["split_metrics"]["test"]
 
 
+@pytest.mark.filterwarnings("ignore:`torch_geometric.distributed` has been deprecated.*:DeprecationWarning")
 def test_train_graphsage_end_to_end_or_skip(tmp_path: Path) -> None:
-    try:
-        import torch_geometric  # noqa: F401
-    except ImportError:
+    if importlib.util.find_spec("torch_geometric") is None:
         pytest.skip("torch_geometric not installed")
 
     root = _make_graph_root(tmp_path)

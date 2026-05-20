@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from src.config import (
+from src.common.config import (
     consensus_dataset_kwargs_from_config,
     consensus_train_val_transforms_from_config,
     load_config,
@@ -14,10 +14,10 @@ from src.config import (
     resolve_resized_sliding_window_overlap,
     resolve_resized_sliding_window_patch_size,
 )
-from src.config_validation import validate_deconver_config
-from src.eval_utils import collate_consensus_batch, compute_multiclass_metrics
-from src.gleason_consensus_dataset import GleasonConsensusDataset
-from src.model_outputs import extract_logits
+from src.common.config_validation import validate_deconver_config
+from src.eval.eval_utils import collate_consensus_batch, compute_multiclass_metrics
+from src.data.gleason_consensus_dataset import GleasonConsensusDataset
+from src.common.model_outputs import extract_logits
 from src.models import build_model
 
 

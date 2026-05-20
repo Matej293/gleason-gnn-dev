@@ -10,11 +10,11 @@ import numpy as np
 import pytest
 import torch
 
-from src.gnn.models import GATNet, GCNNet, NodeMLP
+from src.pipelines.gnn.models import GATNet, GCNNet, NodeMLP
 
 
 def _load_viz_module():
-    mod_path = Path(__file__).resolve().parents[1] / "scripts" / "visualize_gnn_predictions.py"
+    mod_path = Path(__file__).resolve().parents[1] / "src" / "cli" / "visualize_gnn_predictions.py"
     spec = importlib.util.spec_from_file_location("visualize_gnn_predictions", mod_path)
     if spec is None or spec.loader is None:
         raise RuntimeError("Failed loading visualize_gnn_predictions.py")
@@ -241,7 +241,7 @@ def test_normalization_stats_required_when_enabled(tmp_path: Path) -> None:
 
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_predictions.py",
+        "-m", "src.cli.visualize_gnn_predictions",
         "--graphs-root",
         str(graphs_root),
         "--run-dir",
@@ -278,7 +278,7 @@ def test_visualize_script_writes_outputs_and_summary_with_parity(tmp_path: Path)
     out_root = tmp_path / "viz_out"
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_predictions.py",
+        "-m", "src.cli.visualize_gnn_predictions",
         "--graphs-root",
         str(graphs_root),
         "--run-dir",
@@ -337,7 +337,7 @@ def test_parity_mismatch_fails_fast(tmp_path: Path) -> None:
     out_root = tmp_path / "viz_out"
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_predictions.py",
+        "-m", "src.cli.visualize_gnn_predictions",
         "--graphs-root",
         str(graphs_root),
         "--run-dir",
@@ -367,7 +367,7 @@ def test_visualize_can_disable_parity_check(tmp_path: Path) -> None:
     out_root = tmp_path / "viz_out"
     cmd = [
         sys.executable,
-        "scripts/visualize_gnn_predictions.py",
+        "-m", "src.cli.visualize_gnn_predictions",
         "--graphs-root",
         str(graphs_root),
         "--run-dir",

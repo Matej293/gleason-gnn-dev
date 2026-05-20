@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.gnn.models import GATNet, GCNNet, GraphSAGENet, NodeMLP
+from src.pipelines.gnn.models import GATNet, GCNNet, GraphSAGENet, NodeMLP
 
 
 def seg_prob_idx_from_meta(meta: dict) -> tuple[int, int]:
