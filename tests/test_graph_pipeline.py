@@ -107,3 +107,26 @@ def test_extract_logits_supports_tensor_dict_and_sequence() -> None:
     assert mod._extract_logits(t) is t
     assert mod._extract_logits({"out": t}) is t
     assert mod._extract_logits([t]) is t
+
+
+def test_build_touch_adjacency_edges_ignores_background_label_minus_one() -> None:
+    sp = np.array(
+        [
+            [-1, -1, 5],
+            [-1, 9, 5],
+        ],
+        dtype=np.int32,
+    )
+    edge_index = build_touch_adjacency_edges(sp)
+    edges = set((int(a), int(b)) for a, b in edge_index.T.tolist())
+    assert edges == {(5, 9), (9, 5)}
+
+
+def test_compute_node_features_supports_non_contiguous_superpixel_ids() -> None:
+    img = np.zeros((2, 3, 3), dtype=np.uint8)
+    sp = np.array([[2, 2, 7], [2, 7, 7]], dtype=np.int32)
+    probs = np.zeros((4, 2, 3), dtype=np.float32)
+    probs[1, :, :] = 1.0
+    node_ids, feats = compute_node_features(img, sp, probs)
+    assert node_ids.tolist() == [2, 7]
+    assert feats.shape == (2, 22)

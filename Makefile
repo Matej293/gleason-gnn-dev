@@ -13,6 +13,7 @@ GNN_COMPARISON_DIR_PLACEHOLDER := outputs/gnn_runs/<comparison_dir>
 MAX_CASES ?= 64
 CONFIG ?= configs/deconver.yaml
 RUN ?= $(RUN_PLACEHOLDER)
+EVAL_ARGS ?= --include-boundary-metrics
 GNN_GRAPHS_ROOT ?= outputs/graphs/20260510_022358_deconver_consensus
 GNN_PROFILE ?= thesis
 GNN_SEED ?= 42
@@ -31,6 +32,7 @@ GNN_EPOCHS ?=
 GNN_PATIENCE ?=
 GNN_BUILD_BATCH_SIZE ?= 4
 GNN_BUILD_NUM_WORKERS ?= 8
+GNN_BUILD_INFERENCE_MODE ?= resized_sliding_window
 GNN_CHECKPOINT ?=
 GNN_SUPERPIXEL_PRESET ?=
 GNN_NUM_SEGMENTS ?= 300
@@ -70,7 +72,7 @@ VIZ_GNN_MODULE := src.cli.visualize_gnn_predictions
 SELECT_BEST_GNN_MODULE := src.cli.select_best_gnn_run
 VIZ_GNN_COMPARISON_MODULE := src.cli.visualize_gnn_baseline_comparison
 
-GNN_BUILD_COMMON_ARGS := --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) --edge-policy $(GNN_EDGE_POLICY) --edge-knn-k $(GNN_EDGE_KNN_K) --edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE)
+GNN_BUILD_COMMON_ARGS := --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --inference-mode $(GNN_BUILD_INFERENCE_MODE) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) --edge-policy $(GNN_EDGE_POLICY) --edge-knn-k $(GNN_EDGE_KNN_K) --edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE)
 GNN_BUILD_OPTIONAL_ARGS := $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) $(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),)
 
 define require_non_placeholder
@@ -84,7 +86,7 @@ endef
 help:
 	@echo "Core Targets:"
 	@echo "  make train CONFIG=configs/deconver.yaml"
-	@echo "  make eval RUN=outputs/runs/<run_name>"
+	@echo "  make eval RUN=outputs/runs/<run_name> [EVAL_ARGS='']"
 	@echo "  make smoke"
 	@echo "  make test"
 	@echo "  make consensus"
@@ -130,7 +132,7 @@ train:
 
 eval:
 	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),make eval RUN=outputs/runs/<run_name>)
-	$(PY) -m $(EVAL_CHECKPOINT_MODULE) --run $(RUN) --save-viz --log-wandb-viz --log-wandb-metrics
+	$(PY) -m $(EVAL_CHECKPOINT_MODULE) --run $(RUN) --save-viz --log-wandb-viz --log-wandb-metrics $(EVAL_ARGS)
 
 smoke:
 	$(PY) -m $(SMOKE_MODULE)

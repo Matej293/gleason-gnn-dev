@@ -3,28 +3,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-
-KEY_METRICS = [
-    "macro_dice",
-    "miou",
-    "sensitivity",
-    "precision",
-    "dice_benign",
-    "dice_g3",
-    "dice_g4",
-    "dice_g5",
-    "iou_benign",
-    "iou_g3",
-    "iou_g4",
-    "iou_g5",
+SUPPLEMENTAL_METRICS = (
     "num_test_samples",
-]
+    "mean_loo_dice_multiclass",
+    "num_loo_entries",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,9 +54,52 @@ def _fmt(v: object) -> str:
     return str(v)
 
 
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _resolve_comparison_metric_keys(summary_a: dict, summary_b: dict) -> list[str]:
+    tracked_a = summary_a.get("tracked_metric_keys")
+    tracked_b = summary_b.get("tracked_metric_keys")
+
+    if isinstance(tracked_a, list) and tracked_a:
+        return [str(x) for x in tracked_a if str(x)]
+    if isinstance(tracked_b, list) and tracked_b:
+        return [str(x) for x in tracked_b if str(x)]
+
+    agg_a = summary_a.get("aggregate", {})
+    agg_b = summary_b.get("aggregate", {})
+    if not isinstance(agg_a, dict) or not isinstance(agg_b, dict):
+        return []
+    keys = [
+        key
+        for key in sorted(set(agg_a.keys()) & set(agg_b.keys()))
+        if key not in SUPPLEMENTAL_METRICS
+        and _is_finite_number(agg_a.get(key))
+        and _is_finite_number(agg_b.get(key))
+    ]
+    return keys
+
+
+def _resolve_metric_rows(summary_a: dict, summary_b: dict) -> list[str]:
+    rows = list(_resolve_comparison_metric_keys(summary_a, summary_b))
+    agg_a = summary_a.get("aggregate", {})
+    agg_b = summary_b.get("aggregate", {})
+    if not isinstance(agg_a, dict) or not isinstance(agg_b, dict):
+        return rows
+
+    for key in SUPPLEMENTAL_METRICS:
+        if key in rows:
+            continue
+        if key in agg_a and key in agg_b:
+            rows.append(key)
+    return rows
+
+
 def _summary_page(pdf: PdfPages, run_a: Path, run_b: Path, s_a: dict, s_b: dict) -> None:
     a_agg = s_a.get("aggregate", {})
     b_agg = s_b.get("aggregate", {})
+    metric_rows = _resolve_metric_rows(s_a, s_b)
 
     fig = plt.figure(figsize=(11.69, 8.27), dpi=120)  # A4 landscape
     ax = fig.add_axes([0.04, 0.04, 0.92, 0.92])
@@ -84,7 +117,7 @@ def _summary_page(pdf: PdfPages, run_a: Path, run_b: Path, s_a: dict, s_b: dict)
         "-" * 78,
     ]
 
-    for k in KEY_METRICS:
+    for k in metric_rows:
         av = a_agg.get(k)
         bv = b_agg.get(k)
         delta = None

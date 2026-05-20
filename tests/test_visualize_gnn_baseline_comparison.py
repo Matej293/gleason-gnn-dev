@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 
 from src.pipelines.gnn.models import NodeMLP
+
+
+def _subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    env["WANDB_MODE"] = "disabled"
+    env["WANDB_DISABLED"] = "true"
+    if extra:
+        env.update(extra)
+    return env
 
 
 def _write_graph_case(case_dir: Path, offset: float = 0.0) -> None:
@@ -121,10 +130,17 @@ def test_payload_validation_error_when_missing_per_case_arrays(tmp_path: Path) -
         str(graphs_root),
         "--gnn-runs-root",
         str(runs_root),
+        "--no-log-wandb",
         "--output-versioning",
         "overwrite",
     ]
-    proc = subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], text=True, capture_output=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        env=_subprocess_env(),
+    )
     assert proc.returncode != 0
     assert "per_case_arrays" in (proc.stderr + proc.stdout)
 
@@ -150,8 +166,9 @@ def test_run_resolver_picks_nearest_timestamp(tmp_path: Path) -> None:
         "overwrite",
         "--max-cases",
         "2",
+        "--no-log-wandb",
     ]
-    subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True)
+    subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True, env=_subprocess_env())
     summary = json.loads((out_dir / "comparison_viz_summary.json").read_text(encoding="utf-8"))
     assert summary["resolved_run_dirs"]["mlp"].endswith("20260101_000001_baseline_mlp")
 
@@ -174,8 +191,9 @@ def test_generates_combined_figures_and_case_montages(tmp_path: Path) -> None:
         "overwrite",
         "--max-cases",
         "3",
+        "--no-log-wandb",
     ]
-    subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True)
+    subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True, env=_subprocess_env())
     assert (out_dir / "leaderboard_test_macro_f1.png").exists()
     assert (out_dir / "macro_f1_by_split.png").exists()
     assert (out_dir / "delta_vs_seg_only_test.png").exists()
@@ -198,10 +216,17 @@ def test_missing_best_pt_for_one_model_fails(tmp_path: Path) -> None:
         str(graphs_root),
         "--gnn-runs-root",
         str(runs_root),
+        "--no-log-wandb",
         "--output-versioning",
         "overwrite",
     ]
-    proc = subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], text=True, capture_output=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        env=_subprocess_env(),
+    )
     assert proc.returncode != 0
     assert "Missing checkpoint" in (proc.stderr + proc.stdout)
 
@@ -220,9 +245,61 @@ def test_case_count_mismatch_fails(tmp_path: Path) -> None:
         str(graphs_root),
         "--gnn-runs-root",
         str(runs_root),
+        "--no-log-wandb",
         "--output-versioning",
         "overwrite",
     ]
-    proc = subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], text=True, capture_output=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        env=_subprocess_env(),
+    )
     assert proc.returncode != 0
     assert "Case count mismatch" in (proc.stderr + proc.stdout)
+
+
+def test_wandb_not_initialized_when_disabled_env(tmp_path: Path) -> None:
+    graphs_root, runs_root, cmp_dir = _write_minimal_setup(tmp_path, num_cases=1)
+    out_dir = tmp_path / "viz_out"
+    marker = tmp_path / "wandb_init_marker.txt"
+    stub_dir = tmp_path / "stub_mods"
+    stub_dir.mkdir(parents=True, exist_ok=True)
+    (stub_dir / "wandb.py").write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "def init(*args, **kwargs):\n"
+        "    Path(os.environ['WANDB_INIT_MARKER']).write_text('init-called', encoding='utf-8')\n"
+        "    raise RuntimeError('wandb.init should not be called in tests')\n",
+        encoding="utf-8",
+    )
+    pythonpath = str(stub_dir)
+    if os.environ.get("PYTHONPATH"):
+        pythonpath = f"{pythonpath}{os.pathsep}{os.environ['PYTHONPATH']}"
+    cmd = [
+        sys.executable,
+        "-m", "src.cli.visualize_gnn_baseline_comparison",
+        "--comparison-dir",
+        str(cmp_dir),
+        "--graphs-root",
+        str(graphs_root),
+        "--gnn-runs-root",
+        str(runs_root),
+        "--output-dir",
+        str(out_dir),
+        "--output-versioning",
+        "overwrite",
+        "--max-cases",
+        "1",
+        "--no-log-wandb",
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        env=_subprocess_env({"PYTHONPATH": pythonpath, "WANDB_INIT_MARKER": str(marker)}),
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert not marker.exists()

@@ -4,13 +4,21 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from src.common.config import consensus_dataset_kwargs_from_config, load_config
+from src.common.config import (
+    consensus_dataset_kwargs_from_config,
+    consensus_train_val_transforms_from_config,
+    load_config,
+    resolve_inference_mode,
+    resolve_resized_sliding_window_overlap,
+    resolve_resized_sliding_window_patch_size,
+)
 from src.common.cli_utils import (
     ensure_output_dir,
     require_existing_dir,
@@ -97,6 +105,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override loader worker count.",
     )
+    loader_group.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=1,
+        help="Batches prefetched per worker when num_workers > 0.",
+    )
+    loader_group.add_argument(
+        "--pin-memory-mode",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Pin-memory behavior for DataLoader: auto uses CUDA availability.",
+    )
+
+    io_group.add_argument(
+        "--inference-mode",
+        choices=["config", "resized_full", "resized_sliding_window"],
+        default="config",
+        help="Inference mode override for graph export. Use config to respect run config.",
+    )
 
     qc_group = p.add_argument_group("Safety Checks")
     qc_group.add_argument(
@@ -127,6 +154,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.batch_size = validate_positive_int(args.batch_size, field_name="batch_size")
     if args.num_workers is not None:
         args.num_workers = validate_non_negative_int(args.num_workers, field_name="num_workers")
+    if args.prefetch_factor is not None:
+        args.prefetch_factor = validate_positive_int(args.prefetch_factor, field_name="prefetch_factor")
     args.compactness = float(args.compactness)
     args.sigma = float(args.sigma)
     args.edge_knn_max_distance = float(args.edge_knn_max_distance)
@@ -164,6 +193,59 @@ def _select_indices(dataset: GleasonConsensusDataset, split_manifest: Path, spli
     return [i for i, item in enumerate(dataset.items) if str(item.get("image_id", "")) in ids]
 
 
+def _resolve_graph_inference_mode(cfg: dict, override: str) -> str:
+    mode_override = str(override).strip().lower()
+    if mode_override == "config":
+        return resolve_inference_mode(cfg)
+    if mode_override in {"resized_full", "resized_sliding_window"}:
+        return mode_override
+    raise ValueError(
+        f"Unsupported inference mode override: {override!r}. "
+        "Expected one of: config, resized_full, resized_sliding_window."
+    )
+
+
+def _infer_logits(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    inference_mode: str,
+    resized_sliding_window_patch_size: tuple[int, int],
+    resized_sliding_window_overlap: float,
+) -> torch.Tensor:
+    mode = str(inference_mode).strip().lower()
+    if mode == "resized_full":
+        if images.ndim != 4:
+            raise ValueError(f"Expected images shape [B,C,H,W], got {tuple(images.shape)}")
+        h, w = int(images.shape[-2]), int(images.shape[-1])
+        multiple = 32
+        pad_h = (multiple - (h % multiple)) % multiple
+        pad_w = (multiple - (w % multiple)) % multiple
+        x = images
+        if pad_h > 0 or pad_w > 0:
+            x = torch.nn.functional.pad(images, (0, pad_w, 0, pad_h), mode="replicate")
+        logits = _extract_logits(model(x))
+        if pad_h > 0 or pad_w > 0:
+            logits = logits[..., :h, :w]
+        return logits
+    if mode == "resized_sliding_window":
+        from monai.inferers import sliding_window_inference
+
+        def _predictor(window: torch.Tensor) -> torch.Tensor:
+            return _extract_logits(model(window))
+
+        return sliding_window_inference(
+            inputs=images,
+            roi_size=resized_sliding_window_patch_size,
+            sw_batch_size=1,
+            predictor=_predictor,
+            overlap=resized_sliding_window_overlap,
+        )
+    raise ValueError(
+        "Unsupported inference_mode: "
+        f"{inference_mode!r}. Expected 'resized_full' or 'resized_sliding_window'."
+    )
+
+
 def main() -> None:
     args = parse_args()
     _validate_args(args)
@@ -180,6 +262,10 @@ def main() -> None:
         require_paths=True,
     )
 
+    inference_mode = _resolve_graph_inference_mode(cfg, args.inference_mode)
+    resized_sliding_window_patch_size = resolve_resized_sliding_window_patch_size(cfg)
+    resized_sliding_window_overlap = resolve_resized_sliding_window_overlap(cfg)
+
     ckpt_path = resolve_checkpoint_path(run_dir, args.checkpoint, prefer_best=False)
     device = torch.device(
         "cuda" if torch.cuda.is_available() and cfg.get("device", "cuda") == "cuda" else "cpu"
@@ -190,7 +276,17 @@ def main() -> None:
     load_checkpoint(str(ckpt_path), model=model, device=device)
     model.eval()
 
-    dataset_kwargs = consensus_dataset_kwargs_from_config(cfg)
+    use_amp_cfg = bool(cfg.get("use_amp", False))
+    amp_dtype_name = str(cfg.get("amp_dtype", "fp16")).strip().lower()
+    amp_dtype = torch.bfloat16 if amp_dtype_name in {"bf16", "bfloat16"} else torch.float16
+    amp_enabled = device.type == "cuda" and use_amp_cfg
+    print(
+        "Graph export precision | amp_enabled=%s amp_dtype=%s"
+        % (amp_enabled, amp_dtype_name if amp_enabled else "n/a")
+    )
+
+    _, val_transform = consensus_train_val_transforms_from_config(cfg)
+    dataset_kwargs = consensus_dataset_kwargs_from_config(cfg, transform=val_transform)
     dataset = GleasonConsensusDataset(**dataset_kwargs)
 
     split_manifest = resolve_split_manifest_path(cfg)
@@ -198,7 +294,8 @@ def main() -> None:
         split_manifest = require_existing_file(split_manifest, label="Split manifest")
 
     logger_msg = (
-        "Graph export setup | run=%s checkpoint=%s split=%s output_root=%s split_manifest=%s"
+        "Graph export setup | run=%s checkpoint=%s split=%s output_root=%s split_manifest=%s "
+        "inference_mode=%s sw_patch=(%d,%d) sw_overlap=%.2f"
     )
     print(
         logger_msg
@@ -208,6 +305,10 @@ def main() -> None:
             args.split,
             output_root,
             split_manifest,
+            inference_mode,
+            resized_sliding_window_patch_size[0],
+            resized_sliding_window_patch_size[1],
+            resized_sliding_window_overlap,
         )
     )
 
@@ -215,18 +316,29 @@ def main() -> None:
     subset = Subset(dataset, indices)
     batch_size = int(args.batch_size) if args.batch_size is not None else int(cfg.get("val_batch_size", 1))
     num_workers = int(args.num_workers) if args.num_workers is not None else int(cfg.get("num_workers", 0))
-    loader = DataLoader(
-        subset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=collate_consensus_batch,
-    )
+    pin_memory_mode = str(args.pin_memory_mode).strip().lower()
+    pin_memory = torch.cuda.is_available() if pin_memory_mode == "auto" else (pin_memory_mode == "on")
+    loader_kwargs: dict[str, object] = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "collate_fn": collate_consensus_batch,
+    }
+    if num_workers > 0 and args.prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
+    loader = DataLoader(subset, **loader_kwargs)
 
     run_out = output_root / run_dir.name / args.split
     run_out.mkdir(parents=True, exist_ok=True)
     per_graph_stats: list[dict[str, float | int | str]] = []
+    counts = {"benign": 0, "g3": 0, "g4": 0, "g5": 0}
+    supervised_counts = {"benign": 0, "g3": 0, "g4": 0, "g5": 0}
+    supervised = 0
+    total_nodes = 0
+    invalid = 0
+    isolated = 0
+    feature_dim = None
 
     with torch.inference_mode():
         for batch in tqdm(loader, desc="Build checkpoint graphs", unit="batch"):
@@ -236,9 +348,22 @@ def main() -> None:
             tissue_mask = batch["tissue_mask"]
             image_ids = [str(x) for x in batch["image_id"]]
 
-            out = model(images)
-            logits = _extract_logits(out)
-            probs = torch.softmax(logits.float(), dim=1).detach().cpu()
+            amp_ctx = (
+                torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled)
+                if device.type == "cuda"
+                else nullcontext()
+            )
+            with amp_ctx:
+                logits = _infer_logits(
+                    model=model,
+                    images=images,
+                    inference_mode=inference_mode,
+                    resized_sliding_window_patch_size=resized_sliding_window_patch_size,
+                    resized_sliding_window_overlap=resized_sliding_window_overlap,
+                )
+                logits = logits.clamp(-15.0, 15.0)
+                probs_batch = torch.softmax(logits, dim=1)
+            probs = probs_batch.detach().cpu().to(torch.float32)
 
             for i, image_id in enumerate(image_ids):
                 image_rgb = (batch["image"][i].numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
@@ -266,7 +391,6 @@ def main() -> None:
                     superpixels=sp,
                     seg_probs=probs[i].numpy().astype(np.float32),
                 )
-                feature_version = "v2" if x.shape[1] >= 22 else "v1"
                 valid_sp = sp[sp >= 0]
                 counts_sp = np.bincount(valid_sp) if valid_sp.size else np.zeros((0,), dtype=np.int64)
                 num_nodes = int(node_ids.shape[0])
@@ -283,6 +407,21 @@ def main() -> None:
                     }
                 )
 
+                feature_dim = int(x.shape[1])
+                y_i = y.astype(np.int64, copy=False)
+                tm_i = train_mask.astype(np.bool_, copy=False)
+                for cls_idx, cls_name in enumerate(["benign", "g3", "g4", "g5"]):
+                    cls_mask = y_i == cls_idx
+                    counts[cls_name] += int(np.count_nonzero(cls_mask))
+                    supervised_counts[cls_name] += int(np.count_nonzero(cls_mask & tm_i))
+                supervised += int(np.count_nonzero(tm_i))
+                total_nodes += int(y_i.shape[0])
+                invalid += int(np.count_nonzero((y_i < 0) | (y_i > 3)))
+                deg = np.zeros((x.shape[0],), dtype=np.int64)
+                if edge_index.size:
+                    deg += np.bincount(edge_index[0], minlength=x.shape[0])
+                isolated += int(np.count_nonzero(deg == 0))
+
                 out_dir = run_out / image_id
                 out_dir.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(
@@ -294,31 +433,6 @@ def main() -> None:
                     train_mask=train_mask.astype(np.uint8),
                     superpixels=sp.astype(np.int32),
                 )
-
-    counts = {"benign": 0, "g3": 0, "g4": 0, "g5": 0}
-    supervised_counts = {"benign": 0, "g3": 0, "g4": 0, "g5": 0}
-    supervised = 0
-    total_nodes = 0
-    invalid = 0
-    isolated = 0
-    feature_dim = None
-    for graph_path in sorted(run_out.glob("*/graph_data.npz")):
-        d = np.load(graph_path)
-        y = d["y"].astype(np.int64)
-        tm = d["train_mask"].astype(np.bool_)
-        ei = d["edge_index"]
-        x = d["x"]
-        feature_dim = int(x.shape[1])
-        for i,k in enumerate(["benign","g3","g4","g5"]):
-            counts[k] += int((y == i).sum())
-            supervised_counts[k] += int(((y == i) & tm).sum())
-        supervised += int(tm.sum())
-        total_nodes += int(y.shape[0])
-        invalid += int(((y < 0) | (y > 3)).sum())
-        deg = np.zeros((x.shape[0],), dtype=np.int64)
-        if ei.size:
-            deg += np.bincount(ei[0], minlength=x.shape[0])
-        isolated += int((deg == 0).sum())
 
     node_counts = np.array([int(r["num_nodes"]) for r in per_graph_stats], dtype=np.int64)
     edge_counts = np.array([int(r["num_edges_undirected"]) for r in per_graph_stats], dtype=np.int64)
@@ -358,9 +472,18 @@ def main() -> None:
             "tiny_superpixel_max_pixels": int(args.tiny_superpixel_max_pixels),
             "batch_size": batch_size,
             "num_workers": num_workers,
+            "prefetch_factor": int(args.prefetch_factor) if args.prefetch_factor is not None else None,
+            "pin_memory_mode": pin_memory_mode,
+            "pin_memory": bool(pin_memory),
             "edge_policy": args.edge_policy,
             "edge_knn_k": int(args.edge_knn_k),
             "edge_knn_max_distance": float(args.edge_knn_max_distance),
+            "inference_mode": inference_mode,
+            "resized_sliding_window_patch_size": [
+                int(resized_sliding_window_patch_size[0]),
+                int(resized_sliding_window_patch_size[1]),
+            ],
+            "resized_sliding_window_overlap": float(resized_sliding_window_overlap),
         },
         "superpixel_params": {
             "num_segments": num_segments,

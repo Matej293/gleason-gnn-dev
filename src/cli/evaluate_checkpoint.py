@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import math
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -49,7 +50,7 @@ from src.eval.eval_utils import (
     postprocess_predictions,
     resolve_split_manifest_path,
 )
-from src.eval.metric_config import resolve_metric_settings
+from src.eval.metric_config import BOUNDARY_METRIC_KEYS, resolve_metric_settings
 from src.models import build_model
 from src.viz.visualization import render_case_panel, save_case_panel
 logging.basicConfig(
@@ -59,6 +60,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+SUPPLEMENTAL_AGG_KEYS = (
+    "num_test_samples",
+    "mean_loo_dice_multiclass",
+    "num_loo_entries",
+)
+
+
+LOG_METRIC_PRIORITY = (
+    "macro_dice",
+    "challenge_score",
+    "miou",
+    "weighted_macro_dice",
+    "grade5_dice",
+    "grade5_iou",
+    "sensitivity",
+    "precision",
+    "hd95_mean",
+    "asd_mean",
+)
 
 def _infer_logits(
     model: torch.nn.Module,
@@ -149,6 +170,102 @@ def _aggregate_per_case_metrics(
     return {k: (sums[k] / counts[k]) if counts[k] > 0 else float("nan") for k in metric_keys}
 
 
+def _finalize_aggregate_metrics(
+    aggregate: Mapping[str, float | int],
+    tracked_metric_keys: tuple[str, ...],
+) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key in tracked_metric_keys:
+        raw_value = aggregate.get(key, float("nan"))
+        out[key] = float(raw_value) if isinstance(raw_value, (int, float)) else float("nan")
+    for key in SUPPLEMENTAL_AGG_KEYS:
+        if key not in aggregate:
+            continue
+        raw_value = aggregate.get(key)
+        out[key] = float(raw_value) if isinstance(raw_value, (int, float)) else float("nan")
+    return out
+
+
+def _select_metrics_for_aggregate_log(
+    tracked_metric_keys: tuple[str, ...],
+    max_metrics: int = 6,
+) -> tuple[str, ...]:
+    selected: list[str] = []
+    tracked_set = set(tracked_metric_keys)
+    for key in LOG_METRIC_PRIORITY:
+        if key in tracked_set and key not in selected:
+            selected.append(key)
+        if len(selected) >= max_metrics:
+            return tuple(selected)
+    for key in tracked_metric_keys:
+        if key not in selected:
+            selected.append(key)
+        if len(selected) >= max_metrics:
+            break
+    return tuple(selected)
+
+
+def _format_aggregate_log_line(
+    *,
+    aggregate_label: str,
+    aggregate_values: Mapping[str, float | int],
+    tracked_metric_keys: tuple[str, ...],
+) -> str:
+    show_keys = _select_metrics_for_aggregate_log(tracked_metric_keys)
+    metric_parts = [
+        f"{key}={fmt_metric(float(aggregate_values.get(key, float('nan'))))}"
+        for key in show_keys
+    ]
+    test_samples = aggregate_values.get("num_test_samples", float("nan"))
+    test_samples_str = fmt_metric(float(test_samples)) if isinstance(test_samples, (int, float)) else "n/a"
+    return (
+        f"Aggregate ({aggregate_label}) | "
+        + " ".join(metric_parts)
+        + f" | num_test_samples={test_samples_str}"
+    )
+
+
+
+def _effective_metric_keys(
+    tracked_metric_keys: tuple[str, ...],
+    *,
+    include_boundary_metrics: bool,
+) -> tuple[str, ...]:
+    if not include_boundary_metrics:
+        return tracked_metric_keys
+    seen = set(tracked_metric_keys)
+    return tuple(tracked_metric_keys) + tuple(
+        key for key in BOUNDARY_METRIC_KEYS if key not in seen
+    )
+
+
+def _build_evaluation_summary(
+    *,
+    run_dir: Path,
+    checkpoint_path: Path,
+    cfg: Mapping[str, object],
+    split_manifest_path: Path,
+    tracked_metric_keys: tuple[str, ...],
+    include_boundary_metrics: bool,
+    aggregate_raw: Mapping[str, float | int],
+    aggregate_post: Mapping[str, float | int],
+    per_case: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "run_dir": str(run_dir),
+        "checkpoint": str(checkpoint_path),
+        "data_root": str(cfg["data_root"]),
+        "consensus_root": str(cfg["consensus_root"]),
+        "split_manifest_path": str(split_manifest_path),
+        "tracked_metric_keys": list(tracked_metric_keys),
+        "include_boundary_metrics": include_boundary_metrics,
+        "aggregate": {k: json_float(float(v)) for k, v in aggregate_post.items()},
+        "aggregate_raw": {k: json_float(float(v)) for k, v in aggregate_raw.items()},
+        "aggregate_post": {k: json_float(float(v)) for k, v in aggregate_post.items()},
+        "per_case": per_case,
+    }
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -212,6 +329,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log aggregate and per-case evaluation metrics to W&B.",
     )
+    parser.add_argument(
+        "--include-boundary-metrics",
+        action="store_true",
+        help="Force-enable boundary metrics (HD95/ASD) for this evaluation run only.",
+    )
 
     return parser.parse_args()
 
@@ -230,8 +352,15 @@ def main() -> None:
     validate_deconver_config(cfg, for_eval=True, require_paths=True)
 
     metric_settings = resolve_metric_settings(cfg)
-    metric_keys = tuple(metric_settings.track_keys)
-    include_boundary_metrics = bool(metric_settings.include_boundary_metrics)
+    include_boundary_metrics = bool(metric_settings.include_boundary_metrics) or bool(
+        args.include_boundary_metrics
+    )
+    metric_keys = _effective_metric_keys(
+        tuple(metric_settings.track_keys),
+        include_boundary_metrics=include_boundary_metrics,
+    )
+    if args.include_boundary_metrics and not bool(metric_settings.include_boundary_metrics):
+        logger.info("Boundary metrics forced on for eval via --include-boundary-metrics.")
     boundary_metric_cfg: dict[str, object] = {
         "hausdorff_variant": metric_settings.boundary.hausdorff_variant,
         "hausdorff_percentile": float(metric_settings.boundary.hausdorff_percentile),
@@ -374,39 +503,34 @@ def main() -> None:
         loo = _aggregate_loo_from_qc_reports(dataset, test_indices)
         aggregate_raw.update(loo)
         aggregate_post.update(loo)
+    aggregate_raw = _finalize_aggregate_metrics(aggregate_raw, tracked_metric_keys=metric_keys)
+    aggregate_post = _finalize_aggregate_metrics(aggregate_post, tracked_metric_keys=metric_keys)
 
     logger.info(
-        "Aggregate (raw) | macro_dice=%s miou=%s grade5_dice=%s grade5_iou=%s sens=%s prec=%s | test_samples=%d",
-        fmt_metric(aggregate_raw.get("macro_dice", float("nan"))),
-        fmt_metric(aggregate_raw.get("miou", float("nan"))),
-        fmt_metric(aggregate_raw.get("grade5_dice", float("nan"))),
-        fmt_metric(aggregate_raw.get("grade5_iou", float("nan"))),
-        fmt_metric(aggregate_raw.get("sensitivity", float("nan"))),
-        fmt_metric(aggregate_raw.get("precision", float("nan"))),
-        len(test_indices),
+        _format_aggregate_log_line(
+            aggregate_label="raw",
+            aggregate_values=aggregate_raw,
+            tracked_metric_keys=metric_keys,
+        )
     )
     logger.info(
-        "Aggregate (post) | macro_dice=%s miou=%s grade5_dice=%s grade5_iou=%s sens=%s prec=%s | test_samples=%d",
-        fmt_metric(aggregate_post.get("macro_dice", float("nan"))),
-        fmt_metric(aggregate_post.get("miou", float("nan"))),
-        fmt_metric(aggregate_post.get("grade5_dice", float("nan"))),
-        fmt_metric(aggregate_post.get("grade5_iou", float("nan"))),
-        fmt_metric(aggregate_post.get("sensitivity", float("nan"))),
-        fmt_metric(aggregate_post.get("precision", float("nan"))),
-        len(test_indices),
+        _format_aggregate_log_line(
+            aggregate_label="post",
+            aggregate_values=aggregate_post,
+            tracked_metric_keys=metric_keys,
+        )
     )
-    summary = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "run_dir": str(run_dir),
-        "checkpoint": str(ckpt_path),
-        "data_root": str(cfg["data_root"]),
-        "consensus_root": str(cfg["consensus_root"]),
-        "split_manifest_path": str(split_manifest_path),
-        "aggregate": {k: json_float(v) for k, v in aggregate_post.items()},
-        "aggregate_raw": {k: json_float(v) for k, v in aggregate_raw.items()},
-        "aggregate_post": {k: json_float(v) for k, v in aggregate_post.items()},
-        "per_case": per_case,
-    }
+    summary = _build_evaluation_summary(
+        run_dir=run_dir,
+        checkpoint_path=ckpt_path,
+        cfg=cfg,
+        split_manifest_path=split_manifest_path,
+        tracked_metric_keys=metric_keys,
+        include_boundary_metrics=include_boundary_metrics,
+        aggregate_raw=aggregate_raw,
+        aggregate_post=aggregate_post,
+        per_case=per_case,
+    )
 
     wandb_logger = None
     if args.log_wandb_viz or args.log_wandb_metrics:
