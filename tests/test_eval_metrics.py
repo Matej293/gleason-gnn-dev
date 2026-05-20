@@ -568,3 +568,57 @@ def test_postprocess_matches_legacy_reference_on_representative_batch() -> None:
     )
 
     assert torch.equal(actual, expected)
+
+
+
+def test_postprocess_matches_legacy_reference_for_named_edge_fixtures() -> None:
+    min_comp = {1: 6, 2: 8, 3: 5}
+
+    # Fixture 1: no tumor present.
+    pred_no_tumor = torch.zeros((1, 20, 20), dtype=torch.long)
+    ignore_no_tumor = torch.zeros((1, 20, 20), dtype=torch.uint8)
+    tissue_no_tumor = torch.ones((1, 20, 20), dtype=torch.uint8)
+
+    # Fixture 2: tiny component removal.
+    pred_tiny = torch.zeros((1, 20, 20), dtype=torch.long)
+    pred_tiny[:, 2:4, 2:4] = 2
+    pred_tiny[:, 8:16, 8:16] = 2
+    ignore_tiny = torch.zeros((1, 20, 20), dtype=torch.uint8)
+    tissue_tiny = torch.ones((1, 20, 20), dtype=torch.uint8)
+
+    # Fixture 3: internal hole filling after pruning.
+    pred_hole = torch.ones((1, 20, 20), dtype=torch.long)
+    pred_hole[:, 8:11, 8:11] = 3
+    ignore_hole = torch.zeros((1, 20, 20), dtype=torch.uint8)
+    tissue_hole = torch.ones((1, 20, 20), dtype=torch.uint8)
+
+    # Fixture 4: ignore/tissue masking interaction.
+    pred_masked = torch.zeros((1, 20, 20), dtype=torch.long)
+    pred_masked[:, 1:6, 1:6] = 1
+    pred_masked[:, 10:15, 10:15] = 3
+    ignore_masked = torch.zeros((1, 20, 20), dtype=torch.uint8)
+    ignore_masked[:, :3, :] = 1
+    tissue_masked = torch.ones((1, 20, 20), dtype=torch.uint8)
+    tissue_masked[:, :, :4] = 0
+
+    fixtures = [
+        (pred_no_tumor, ignore_no_tumor, tissue_no_tumor),
+        (pred_tiny, ignore_tiny, tissue_tiny),
+        (pred_hole, ignore_hole, tissue_hole),
+        (pred_masked, ignore_masked, tissue_masked),
+    ]
+
+    for pred, ignore, tissue in fixtures:
+        actual = postprocess_predictions(
+            pred=pred,
+            ignore_mask=ignore,
+            tissue_mask=tissue,
+            min_component_size_by_class=min_comp,
+        )
+        expected = _legacy_postprocess_predictions(
+            pred=pred,
+            ignore_mask=ignore,
+            tissue_mask=tissue,
+            min_component_size_by_class=min_comp,
+        )
+        assert torch.equal(actual, expected)

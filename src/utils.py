@@ -52,7 +52,7 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     scaler: torch.amp.GradScaler | None = None,
     best_val_dice: float | None = None,
-    best_composite_score: float | None = None,
+    best_challenge_score: float | None = None,
     last_hd95: float | None = None,
 ) -> None:
     payload: dict[str, object] = {
@@ -60,7 +60,7 @@ def save_checkpoint(
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "best_val_dice": best_val_dice,
-        "best_composite_score": best_composite_score,
+        "best_challenge_score": best_challenge_score,
         "last_hd95": last_hd95,
     }
     if scheduler is not None:

@@ -43,6 +43,7 @@ from src.cli_utils import (
     validate_seed,
 )
 from src.eval_utils import (
+    build_confusion_matrix,
     collate_consensus_batch,
     compute_multiclass_metrics_from_pred,
     postprocess_predictions,
@@ -73,12 +74,6 @@ logger = logging.getLogger(__name__)
 
 VAL_METRIC_KEYS = LEGACY_METRIC_TRACK_KEYS
 
-COMPOSITE_WEIGHT_KEYS = (
-    "macro_dice",
-    "weighted_macro_dice",
-    "dice_g5",
-    "sensitivity",
-)
 
 
 def _fmt(v: float) -> str:
@@ -683,6 +678,159 @@ def _nanmean_tensor(values: torch.Tensor, valid_mask: torch.Tensor) -> torch.Ten
     return vals.mean()
 
 
+def _build_scale_loss_context(
+    *,
+    logits: torch.Tensor,
+    hard_mask: torch.Tensor,
+    soft_probs: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    sample_weights: torch.Tensor,
+    class_weights: torch.Tensor,
+    use_confidence_mask: bool,
+    confidence_threshold: float,
+    require_finite_logits: bool = False,
+    check_resized_finite: bool = False,
+    include_probs: bool = True,
+    include_hard_terms: bool = True,
+) -> dict[str, torch.Tensor]:
+    if require_finite_logits and not torch.isfinite(logits).all():
+        raise FloatingPointError("Non-finite logits passed to loss.")
+
+    hard_rs, soft_rs, ignore_rs = _resize_targets_for_logits(
+        logits=logits,
+        hard_mask=hard_mask,
+        soft_probs=soft_probs,
+        ignore_mask=ignore_mask,
+    )
+    if check_resized_finite:
+        if not torch.isfinite(soft_rs).all():
+            raise FloatingPointError("Non-finite soft targets after resize.")
+        if not torch.isfinite(hard_rs.float()).all():
+            raise FloatingPointError("Non-finite hard targets after resize.")
+        if not torch.isfinite(ignore_rs.float()).all():
+            raise FloatingPointError("Non-finite ignore mask after resize.")
+
+    valid_mask = _make_valid_mask(
+        ignore_mask=ignore_rs,
+        soft_probs=soft_rs,
+        use_confidence_mask=use_confidence_mask,
+        confidence_threshold=confidence_threshold,
+    )
+    pixel_weight = sample_weights.view(-1, 1, 1)
+    class_weights_4d = class_weights.view(1, -1, 1, 1)
+    expected_cls_weight = (soft_rs * class_weights_4d).sum(dim=1)
+
+    ctx: dict[str, torch.Tensor] = {
+        "hard_rs": hard_rs,
+        "soft_rs": soft_rs,
+        "ignore_rs": ignore_rs,
+        "valid_mask": valid_mask,
+        "valid_float": valid_mask.float(),
+        "pixel_weight": pixel_weight,
+        "class_weights_4d": class_weights_4d,
+        "expected_cls_weight": expected_cls_weight,
+    }
+
+    probs: torch.Tensor | None = None
+    if include_probs or include_hard_terms:
+        probs = F.softmax(logits.float(), dim=1)
+        ctx["probs"] = probs
+
+    if include_hard_terms:
+        if probs is None:
+            probs = F.softmax(logits.float(), dim=1)
+            ctx["probs"] = probs
+        num_classes = logits.shape[1]
+        target_one_hot = F.one_hot(
+            hard_rs.long().clamp(0, num_classes - 1), num_classes=num_classes
+        ).permute(0, 3, 1, 2).float()
+        valid = valid_mask.unsqueeze(1).float()
+        probs_valid = probs * valid
+        target_valid = target_one_hot * valid
+        per_class_target = target_valid.sum(dim=(0, 2, 3))
+        dice_intersection = (probs_valid * target_valid).sum(dim=(0, 2, 3))
+        dice_denom = probs_valid.sum(dim=(0, 2, 3)) + per_class_target
+        dice_per_class = (2.0 * dice_intersection + 1e-5) / (dice_denom + 1e-5)
+
+        ctx["target_one_hot"] = target_one_hot
+        ctx["probs_valid"] = probs_valid
+        ctx["target_valid"] = target_valid
+        ctx["dice_per_class"] = dice_per_class
+        ctx["dice_valid_mask"] = per_class_target > 0.0
+        ctx["hard_cls_weight"] = class_weights[hard_rs.long()].float()
+
+    return ctx
+
+
+def _single_scale_loss_from_context(
+    *,
+    logits: torch.Tensor,
+    ctx: dict[str, torch.Tensor],
+    soft_loss_type: str,
+    loss_variant: str,
+    lambda_soft: float,
+    lambda_dice: float,
+    include_background_in_dice: bool,
+    exclude_absent_classes_in_dice_loss: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    soft_map = _soft_loss_map(logits, ctx["soft_rs"], loss_type=soft_loss_type)
+    soft_map = soft_map * ctx["expected_cls_weight"]
+
+    soft_num = (soft_map * ctx["valid_float"] * ctx["pixel_weight"]).sum()
+    soft_den = (ctx["valid_float"] * ctx["pixel_weight"]).sum().clamp_min(1e-8)
+    soft_loss = soft_num / soft_den
+
+    if loss_variant == "focal_dice":
+        ce = F.cross_entropy(logits.float(), ctx["hard_rs"].long(), reduction="none")
+        pt = (ctx["probs"] * ctx["target_one_hot"]).sum(dim=1).clamp(1e-6, 1.0)
+        focal_gamma = 2.0
+        focal_map = ((1.0 - pt) ** focal_gamma) * ce
+        focal_num = (
+            focal_map * ctx["hard_cls_weight"] * ctx["valid_float"] * ctx["pixel_weight"]
+        ).sum()
+        focal_den = (
+            ctx["hard_cls_weight"] * ctx["valid_float"] * ctx["pixel_weight"]
+        ).sum().clamp_min(1e-8)
+        soft_loss = focal_num / focal_den
+
+    dice_c = ctx["dice_per_class"]
+    dice_valid_mask = ctx["dice_valid_mask"]
+    if include_background_in_dice:
+        dice_used = dice_c
+        dice_valid_used = dice_valid_mask
+    else:
+        dice_used = dice_c[1:]
+        dice_valid_used = dice_valid_mask[1:]
+
+    if loss_variant == "tversky_dice":
+        fp = (ctx["probs_valid"] * (1.0 - ctx["target_valid"])).sum(dim=(0, 2, 3))
+        fn = ((1.0 - ctx["probs_valid"]) * ctx["target_valid"]).sum(dim=(0, 2, 3))
+        tp = (ctx["probs_valid"] * ctx["target_valid"]).sum(dim=(0, 2, 3))
+        alpha = 0.3
+        beta = 0.7
+        tversky = (tp + 1e-5) / (tp + (alpha * fp) + (beta * fn) + 1e-5)
+        tversky_used = tversky if include_background_in_dice else tversky[1:]
+        if exclude_absent_classes_in_dice_loss:
+            hard_dice_loss = 1.0 - _nanmean_tensor(tversky_used, dice_valid_used)
+        else:
+            hard_dice_loss = 1.0 - tversky_used.mean()
+    else:
+        if exclude_absent_classes_in_dice_loss:
+            hard_dice_loss = 1.0 - _nanmean_tensor(dice_used, dice_valid_used)
+        else:
+            hard_dice_loss = 1.0 - dice_used.mean()
+
+    total = (lambda_soft * soft_loss) + (lambda_dice * hard_dice_loss)
+
+    with torch.no_grad():
+        stats = {
+            "soft_loss": float(soft_loss.detach().cpu().item()),
+            "hard_dice_loss": float(hard_dice_loss.detach().cpu().item()),
+            "valid_fraction": float(ctx["valid_float"].mean().detach().cpu().item()),
+        }
+    return total, stats
+
+
 def _single_scale_loss(
     logits: torch.Tensor,
     hard_mask: torch.Tensor,
@@ -699,102 +847,30 @@ def _single_scale_loss(
     include_background_in_dice: bool,
     exclude_absent_classes_in_dice_loss: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    if not torch.isfinite(logits).all():
-        raise FloatingPointError("Non-finite logits passed to loss.")
-    hard_rs, soft_rs, ignore_rs = _resize_targets_for_logits(
+    ctx = _build_scale_loss_context(
         logits=logits,
         hard_mask=hard_mask,
         soft_probs=soft_probs,
         ignore_mask=ignore_mask,
-    )
-    if not torch.isfinite(soft_rs).all():
-        raise FloatingPointError("Non-finite soft targets after resize.")
-    if not torch.isfinite(hard_rs.float()).all():
-        raise FloatingPointError("Non-finite hard targets after resize.")
-    if not torch.isfinite(ignore_rs.float()).all():
-        raise FloatingPointError("Non-finite ignore mask after resize.")
-
-    valid_mask = _make_valid_mask(
-        ignore_mask=ignore_rs,
-        soft_probs=soft_rs,
+        sample_weights=sample_weights,
+        class_weights=class_weights,
         use_confidence_mask=use_confidence_mask,
         confidence_threshold=confidence_threshold,
+        require_finite_logits=True,
+        check_resized_finite=True,
+        include_probs=True,
+        include_hard_terms=True,
     )
-
-    soft_map = _soft_loss_map(logits, soft_rs, loss_type=soft_loss_type)
-    expected_cls_weight = (soft_rs * class_weights.view(1, -1, 1, 1)).sum(dim=1)
-    soft_map = soft_map * expected_cls_weight
-
-    pixel_weight = sample_weights.view(-1, 1, 1)
-    valid_float = valid_mask.float()
-    soft_num = (soft_map * valid_float * pixel_weight).sum()
-    soft_den = (valid_float * pixel_weight).sum().clamp_min(1e-8)
-    soft_loss = soft_num / soft_den
-
-    probs = F.softmax(logits.float(), dim=1)
-    if loss_variant == "focal_dice":
-        target = F.one_hot(
-            hard_rs.long().clamp(0, logits.shape[1] - 1), num_classes=logits.shape[1]
-        ).permute(0, 3, 1, 2).float()
-        ce = F.cross_entropy(logits.float(), hard_rs.long(), reduction="none")
-        pt = (probs * target).sum(dim=1).clamp(1e-6, 1.0)
-        focal_gamma = 2.0
-        focal_map = ((1.0 - pt) ** focal_gamma) * ce
-        hard_cls_weight = class_weights[hard_rs.long()].float()
-        focal_num = (focal_map * hard_cls_weight * valid_float * pixel_weight).sum()
-        focal_den = (hard_cls_weight * valid_float * pixel_weight).sum().clamp_min(1e-8)
-        soft_loss = focal_num / focal_den
-    dice_c = _hard_dice_per_class(
-        probs=probs,
-        hard_mask=hard_rs,
-        valid_mask=valid_mask,
-        num_classes=logits.shape[1],
+    return _single_scale_loss_from_context(
+        logits=logits,
+        ctx=ctx,
+        soft_loss_type=soft_loss_type,
+        loss_variant=loss_variant,
+        lambda_soft=lambda_soft,
+        lambda_dice=lambda_dice,
+        include_background_in_dice=include_background_in_dice,
+        exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
     )
-    dice_valid_mask = _hard_dice_valid_class_mask(
-        hard_mask=hard_rs,
-        valid_mask=valid_mask,
-        num_classes=logits.shape[1],
-    )
-
-    if include_background_in_dice:
-        dice_used = dice_c
-        dice_valid_used = dice_valid_mask
-    else:
-        dice_used = dice_c[1:]
-        dice_valid_used = dice_valid_mask[1:]
-
-    if loss_variant == "tversky_dice":
-        target = F.one_hot(
-            hard_rs.long().clamp(0, logits.shape[1] - 1), num_classes=logits.shape[1]
-        ).permute(0, 3, 1, 2).float()
-        valid = valid_mask.unsqueeze(1).float()
-        p = probs * valid
-        t = target * valid
-        fp = (p * (1.0 - t)).sum(dim=(0, 2, 3))
-        fn = ((1.0 - p) * t).sum(dim=(0, 2, 3))
-        tp = (p * t).sum(dim=(0, 2, 3))
-        alpha = 0.3
-        beta = 0.7
-        tversky = (tp + 1e-5) / (tp + (alpha * fp) + (beta * fn) + 1e-5)
-        tversky_used = tversky if include_background_in_dice else tversky[1:]
-        if exclude_absent_classes_in_dice_loss:
-            hard_dice_loss = 1.0 - _nanmean_tensor(tversky_used, dice_valid_used)
-        else:
-            hard_dice_loss = 1.0 - tversky_used.mean()
-    else:
-        if exclude_absent_classes_in_dice_loss:
-            hard_dice_loss = 1.0 - _nanmean_tensor(dice_used, dice_valid_used)
-        else:
-            hard_dice_loss = 1.0 - dice_used.mean()
-    total = (lambda_soft * soft_loss) + (lambda_dice * hard_dice_loss)
-
-    with torch.no_grad():
-        stats = {
-            "soft_loss": float(soft_loss.detach().cpu().item()),
-            "hard_dice_loss": float(hard_dice_loss.detach().cpu().item()),
-            "valid_fraction": float(valid_mask.float().mean().detach().cpu().item()),
-        }
-    return total, stats
 
 
 def _consensus_loss(
@@ -869,44 +945,19 @@ def _consensus_loss(
     }
 
 
-def _gleason_ce_loss(
+def _gleason_ce_loss_from_context(
+    *,
     logits: torch.Tensor,
-    hard_mask: torch.Tensor,
-    soft_probs: torch.Tensor,
-    ignore_mask: torch.Tensor,
-    use_confidence_mask: bool,
-    confidence_threshold: float,
+    ctx: dict[str, torch.Tensor],
     include_background_in_dice: bool,
     exclude_absent_classes_in_dice_loss: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    hard_rs, soft_rs, ignore_rs = _resize_targets_for_logits(
-        logits=logits,
-        hard_mask=hard_mask,
-        soft_probs=soft_probs,
-        ignore_mask=ignore_mask,
-    )
-    valid_mask = _make_valid_mask(
-        ignore_mask=ignore_rs,
-        soft_probs=soft_rs,
-        use_confidence_mask=use_confidence_mask,
-        confidence_threshold=confidence_threshold,
-    )
-    target = hard_rs.clone()
-    target[ignore_rs != 0] = 255
+    target = ctx["hard_rs"].clone()
+    target[ctx["ignore_rs"] != 0] = 255
     loss = F.cross_entropy(logits, target, ignore_index=255)
 
-    probs = F.softmax(logits.float(), dim=1)
-    dice_c = _hard_dice_per_class(
-        probs=probs,
-        hard_mask=hard_rs,
-        valid_mask=valid_mask,
-        num_classes=logits.shape[1],
-    )
-    dice_valid_mask = _hard_dice_valid_class_mask(
-        hard_mask=hard_rs,
-        valid_mask=valid_mask,
-        num_classes=logits.shape[1],
-    )
+    dice_c = ctx["dice_per_class"]
+    dice_valid_mask = ctx["dice_valid_mask"]
     if include_background_in_dice:
         dice_used = dice_c
         dice_valid_used = dice_valid_mask
@@ -927,6 +978,49 @@ def _gleason_ce_loss(
     return loss, stats
 
 
+def _gleason_ce_loss(
+    logits: torch.Tensor,
+    hard_mask: torch.Tensor,
+    soft_probs: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    use_confidence_mask: bool,
+    confidence_threshold: float,
+    include_background_in_dice: bool,
+    exclude_absent_classes_in_dice_loss: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    ctx = _build_scale_loss_context(
+        logits=logits,
+        hard_mask=hard_mask,
+        soft_probs=soft_probs,
+        ignore_mask=ignore_mask,
+        sample_weights=torch.ones((logits.shape[0],), device=logits.device, dtype=torch.float32),
+        class_weights=torch.ones((logits.shape[1],), device=logits.device, dtype=torch.float32),
+        use_confidence_mask=use_confidence_mask,
+        confidence_threshold=confidence_threshold,
+        include_probs=True,
+        include_hard_terms=True,
+    )
+    return _gleason_ce_loss_from_context(
+        logits=logits,
+        ctx=ctx,
+        include_background_in_dice=include_background_in_dice,
+        exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+    )
+
+
+def _soft_target_term_loss_from_context(
+    *,
+    logits: torch.Tensor,
+    ctx: dict[str, torch.Tensor],
+    soft_loss_type: str,
+) -> torch.Tensor:
+    soft_map = _soft_loss_map(logits, ctx["soft_rs"], loss_type=soft_loss_type)
+    soft_map = soft_map * ctx["expected_cls_weight"]
+    soft_num = (soft_map * ctx["valid_float"] * ctx["pixel_weight"]).sum()
+    soft_den = (ctx["valid_float"] * ctx["pixel_weight"]).sum().clamp_min(1e-8)
+    return soft_num / soft_den
+
+
 def _soft_target_term_loss(
     logits: torch.Tensor,
     soft_probs: torch.Tensor,
@@ -937,26 +1031,23 @@ def _soft_target_term_loss(
     confidence_threshold: float,
     soft_loss_type: str,
 ) -> torch.Tensor:
-    _, soft_rs, ignore_rs = _resize_targets_for_logits(
+    ctx = _build_scale_loss_context(
         logits=logits,
-        hard_mask=torch.zeros_like(ignore_mask),
+        hard_mask=ignore_mask.new_zeros(ignore_mask.shape),
         soft_probs=soft_probs,
         ignore_mask=ignore_mask,
-    )
-    valid_mask = _make_valid_mask(
-        ignore_mask=ignore_rs,
-        soft_probs=soft_rs,
+        sample_weights=sample_weights,
+        class_weights=class_weights,
         use_confidence_mask=use_confidence_mask,
         confidence_threshold=confidence_threshold,
+        include_probs=False,
+        include_hard_terms=False,
     )
-    soft_map = _soft_loss_map(logits, soft_rs, loss_type=soft_loss_type)
-    expected_cls_weight = (soft_rs * class_weights.view(1, -1, 1, 1)).sum(dim=1)
-    soft_map = soft_map * expected_cls_weight
-    pixel_weight = sample_weights.view(-1, 1, 1)
-    valid_float = valid_mask.float()
-    soft_num = (soft_map * valid_float * pixel_weight).sum()
-    soft_den = (valid_float * pixel_weight).sum().clamp_min(1e-8)
-    return soft_num / soft_den
+    return _soft_target_term_loss_from_context(
+        logits=logits,
+        ctx=ctx,
+        soft_loss_type=soft_loss_type,
+    )
 
 
 def _compute_training_loss(
@@ -983,94 +1074,140 @@ def _compute_training_loss(
     pspnet_soft_weight: float,
     pspnet_soft_term: str,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce":
-        loss, stats = _gleason_ce_loss(
-            logits=logits,
+    def _build_ctx_for_scale(
+        scale_logits: torch.Tensor,
+        *,
+        include_hard_terms: bool = True,
+        require_finite: bool = False,
+        check_resized_finite: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        return _build_scale_loss_context(
+            logits=scale_logits,
             hard_mask=hard_mask,
-            soft_probs=soft_probs,
-            ignore_mask=ignore_mask,
-            use_confidence_mask=use_confidence_mask,
-            confidence_threshold=confidence_threshold,
-            include_background_in_dice=include_background_in_dice,
-            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-        )
-        if aux is not None:
-            aux_loss, _ = _gleason_ce_loss(
-                logits=aux,
-                hard_mask=hard_mask,
-                soft_probs=soft_probs,
-                ignore_mask=ignore_mask,
-                use_confidence_mask=use_confidence_mask,
-                confidence_threshold=confidence_threshold,
-                include_background_in_dice=include_background_in_dice,
-                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-            )
-            loss = loss + (float(pspnet_aux_weight) * aux_loss)
-        return loss, stats
-    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce_soft":
-        loss, stats = _gleason_ce_loss(
-            logits=logits,
-            hard_mask=hard_mask,
-            soft_probs=soft_probs,
-            ignore_mask=ignore_mask,
-            use_confidence_mask=use_confidence_mask,
-            confidence_threshold=confidence_threshold,
-            include_background_in_dice=include_background_in_dice,
-            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-        )
-        if aux is not None:
-            aux_loss, _ = _gleason_ce_loss(
-                logits=aux,
-                hard_mask=hard_mask,
-                soft_probs=soft_probs,
-                ignore_mask=ignore_mask,
-                use_confidence_mask=use_confidence_mask,
-                confidence_threshold=confidence_threshold,
-                include_background_in_dice=include_background_in_dice,
-                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-            )
-            loss = loss + (float(pspnet_aux_weight) * aux_loss)
-        soft_term = _soft_target_term_loss(
-            logits=logits,
             soft_probs=soft_probs,
             ignore_mask=ignore_mask,
             sample_weights=sample_weights,
             class_weights=class_weights,
             use_confidence_mask=use_confidence_mask,
             confidence_threshold=confidence_threshold,
+            require_finite_logits=require_finite,
+            check_resized_finite=check_resized_finite,
+            include_probs=include_hard_terms,
+            include_hard_terms=include_hard_terms,
+        )
+
+    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce":
+        ctx = _build_ctx_for_scale(logits, include_hard_terms=True)
+        loss, stats = _gleason_ce_loss_from_context(
+            logits=logits,
+            ctx=ctx,
+            include_background_in_dice=include_background_in_dice,
+            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+        )
+        if aux is not None:
+            aux_ctx = _build_ctx_for_scale(aux, include_hard_terms=True)
+            aux_loss, _ = _gleason_ce_loss_from_context(
+                logits=aux,
+                ctx=aux_ctx,
+                include_background_in_dice=include_background_in_dice,
+                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+            )
+            loss = loss + (float(pspnet_aux_weight) * aux_loss)
+        return loss, stats
+
+    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce_soft":
+        ctx = _build_ctx_for_scale(logits, include_hard_terms=True)
+        loss, stats = _gleason_ce_loss_from_context(
+            logits=logits,
+            ctx=ctx,
+            include_background_in_dice=include_background_in_dice,
+            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+        )
+        if aux is not None:
+            aux_ctx = _build_ctx_for_scale(aux, include_hard_terms=True)
+            aux_loss, _ = _gleason_ce_loss_from_context(
+                logits=aux,
+                ctx=aux_ctx,
+                include_background_in_dice=include_background_in_dice,
+                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+            )
+            loss = loss + (float(pspnet_aux_weight) * aux_loss)
+
+        soft_ctx = _build_ctx_for_scale(logits, include_hard_terms=False)
+        soft_term = _soft_target_term_loss_from_context(
+            logits=logits,
+            ctx=soft_ctx,
             soft_loss_type=pspnet_soft_term,
         )
         loss = loss + (float(pspnet_soft_weight) * soft_term)
         stats["soft_loss"] = float(soft_term.detach().cpu().item())
         return loss, stats
 
-    loss, stats = _consensus_loss(
-        outputs=scales if len(scales) > 1 else logits,
-        hard_mask=hard_mask,
-        soft_probs=soft_probs,
-        ignore_mask=ignore_mask,
-        sample_weights=sample_weights,
-        class_weights=class_weights,
-        use_confidence_mask=use_confidence_mask,
-        confidence_threshold=confidence_threshold,
-        soft_loss_type=soft_loss_type,
-        loss_variant=loss_variant,
-        lambda_soft=lambda_soft,
-        lambda_dice=lambda_dice,
-        include_background_in_dice=include_background_in_dice,
-        exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-    )
+    if len(scales) > 1:
+        raw = [1.0 / (2**i) for i in range(len(scales))]
+        total_w = sum(raw)
+        weights = [w / total_w for w in raw]
+
+        total_loss = torch.zeros((), device=scales[0].device, dtype=torch.float32)
+        soft_acc = 0.0
+        dice_acc = 0.0
+        valid_acc = 0.0
+        for scale_logits, w in zip(scales, weights):
+            ctx = _build_ctx_for_scale(
+                scale_logits,
+                include_hard_terms=True,
+                require_finite=True,
+                check_resized_finite=True,
+            )
+            scale_loss, scale_stats = _single_scale_loss_from_context(
+                logits=scale_logits,
+                ctx=ctx,
+                soft_loss_type=soft_loss_type,
+                loss_variant=loss_variant,
+                lambda_soft=lambda_soft,
+                lambda_dice=lambda_dice,
+                include_background_in_dice=include_background_in_dice,
+                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+            )
+            total_loss = total_loss + (w * scale_loss)
+            soft_acc += w * scale_stats["soft_loss"]
+            dice_acc += w * scale_stats["hard_dice_loss"]
+            valid_acc += w * scale_stats["valid_fraction"]
+        loss = total_loss
+        stats = {
+            "soft_loss": soft_acc,
+            "hard_dice_loss": dice_acc,
+            "valid_fraction": valid_acc,
+        }
+    else:
+        main_ctx = _build_ctx_for_scale(
+            logits,
+            include_hard_terms=True,
+            require_finite=True,
+            check_resized_finite=True,
+        )
+        loss, stats = _single_scale_loss_from_context(
+            logits=logits,
+            ctx=main_ctx,
+            soft_loss_type=soft_loss_type,
+            loss_variant=loss_variant,
+            lambda_soft=lambda_soft,
+            lambda_dice=lambda_dice,
+            include_background_in_dice=include_background_in_dice,
+            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+        )
+
     if model_name == "pspnet" and aux is not None:
         aux = aux.clamp(-15.0, 15.0)
-        aux_loss, _ = _consensus_loss(
-            outputs=aux,
-            hard_mask=hard_mask,
-            soft_probs=soft_probs,
-            ignore_mask=ignore_mask,
-            sample_weights=sample_weights,
-            class_weights=class_weights,
-            use_confidence_mask=use_confidence_mask,
-            confidence_threshold=confidence_threshold,
+        aux_ctx = _build_ctx_for_scale(
+            aux,
+            include_hard_terms=True,
+            require_finite=True,
+            check_resized_finite=True,
+        )
+        aux_loss, _ = _single_scale_loss_from_context(
+            logits=aux,
+            ctx=aux_ctx,
             soft_loss_type=soft_loss_type,
             loss_variant=loss_variant,
             lambda_soft=lambda_soft,
@@ -1194,9 +1331,8 @@ def validate(
     metric_keys = tuple(metric_track_keys)
     num_metrics = len(metric_keys)
     sums_raw = np.zeros(num_metrics, dtype=np.float64)
-    sums_post = np.zeros(num_metrics, dtype=np.float64)
     counts_raw = np.zeros(num_metrics, dtype=np.int64)
-    counts_post = np.zeros(num_metrics, dtype=np.int64)
+    raw_vals = np.empty(num_metrics, dtype=np.float64)
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     n_batches = 0
@@ -1339,21 +1475,13 @@ def validate(
                 (tumor_ignored_num / tumor_ignored_den) if tumor_ignored_den > 0 else float("nan")
             )
 
-            tissue_rs = None
-            if "tissue_mask" in batch:
-                tissue_mask = batch["tissue_mask"].to(device, non_blocking=True)
-                tissue_rs = F.interpolate(
-                    tissue_mask.unsqueeze(1).float(),
-                    size=(logits.shape[-2], logits.shape[-1]),
-                    mode="nearest",
-                ).squeeze(1).to(dtype=tissue_mask.dtype)
-
             pred_raw = logits.argmax(dim=1)
-            pred_post = postprocess_predictions(
+            raw_conf = build_confusion_matrix(
                 pred=pred_raw,
-                ignore_mask=ignore_rs,
-                tissue_mask=tissue_rs,
-                min_component_size_by_class=min_component_size_by_class,
+                hard_mask=hard_rs,
+                valid=valid,
+                num_classes=4,
+                valid_n=valid_n,
             )
 
             m_raw = compute_multiclass_metrics_from_pred(
@@ -1368,29 +1496,14 @@ def validate(
                 hard_valid_support=hard_valid_support,
                 ignored_pixel_fraction=ignored_fraction,
                 tumor_pixels_ignored_fraction=tumor_ignored_fraction,
-            )
-            m_post = compute_multiclass_metrics_from_pred(
-                pred=pred_post,
-                hard_mask=hard_rs,
-                ignore_mask=ignore_rs,
-                include_background_in_dice=include_background_in_dice,
-                include_boundary_metrics=include_boundary_metrics,
-                boundary_metric_cfg=boundary_metric_cfg,
-                valid_mask=valid,
-                valid_n=valid_n,
-                hard_valid_support=hard_valid_support,
-                ignored_pixel_fraction=ignored_fraction,
-                tumor_pixels_ignored_fraction=tumor_ignored_fraction,
+                confusion_matrix=raw_conf,
             )
 
-            raw_vals = np.array([float(m_raw.get(k, float("nan"))) for k in metric_keys], dtype=np.float64)
-            post_vals = np.array([float(m_post.get(k, float("nan"))) for k in metric_keys], dtype=np.float64)
+            for idx, key in enumerate(metric_keys):
+                raw_vals[idx] = float(m_raw.get(key, float("nan")))
             raw_ok = ~np.isnan(raw_vals)
-            post_ok = ~np.isnan(post_vals)
             sums_raw[raw_ok] += raw_vals[raw_ok]
-            sums_post[post_ok] += post_vals[post_ok]
             counts_raw[raw_ok] += 1
-            counts_post[post_ok] += 1
 
             loss_sum += loss.detach().to(dtype=torch.float64)
             n_batches += 1
@@ -1399,9 +1512,6 @@ def validate(
     for idx, key in enumerate(metric_keys):
         out_metrics[f"val_raw/{key}"] = (
             float(sums_raw[idx] / counts_raw[idx]) if counts_raw[idx] > 0 else float("nan")
-        )
-        out_metrics[f"val_post/{key}"] = (
-            float(sums_post[idx] / counts_post[idx]) if counts_post[idx] > 0 else float("nan")
         )
     return out_metrics
 
@@ -1523,43 +1633,17 @@ def _post_min_component_sizes_from_cfg(cfg: dict) -> dict[int, int]:
     }
 
 
-def _composite_from_metrics(
-    metrics: dict[str, float],
-    w_macro: float,
-    w_weighted_macro: float,
-    w_dice_g5: float,
-    w_sens: float,
-) -> float:
-    terms = {
-        "macro_dice": metrics["macro_dice"],
-        "weighted_macro_dice": metrics["weighted_macro_dice"],
-        "dice_g5": metrics["dice_g5"],
-        "sensitivity": metrics["sensitivity"],
-    }
-    if all(math.isnan(v) for v in terms.values()):
-        return float("nan")
-    weights = {
-        "macro_dice": w_macro,
-        "weighted_macro_dice": w_weighted_macro,
-        "dice_g5": w_dice_g5,
-        "sensitivity": w_sens,
-    }
-    score = 0.0
-    for key in COMPOSITE_WEIGHT_KEYS:
-        val = terms[key]
-        score += weights[key] * (0.0 if math.isnan(val) else val)
-    return float(score)
-
-
-def _selected_stream_metrics(
-    val_metrics: dict[str, float],
-    source: str,
-    metric_keys: tuple[str, ...] = VAL_METRIC_KEYS,
-) -> dict[str, float]:
-    return {k: val_metrics[f"val_{source}/{k}"] for k in metric_keys}
+def _resolve_training_best_checkpoint_source(best_checkpoint_source: str) -> str:
+    source = str(best_checkpoint_source).strip().lower()
+    if source != "raw":
+        raise ValueError(
+            "Training epoch validation is raw-only. Set metrics.best_checkpoint_source='raw'."
+        )
+    return source
 
 
 def _run_validation_visualizations(
+
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
@@ -2111,16 +2195,10 @@ def main() -> None:
     post_min_comp = _post_min_component_sizes_from_cfg(cfg)
 
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).lower()
-    dtype_map: dict[str, torch.dtype] = {"fp16": torch.float16, "bf16": torch.bfloat16}
     amp_dtype = validate_amp_runtime(cfg, device)
     use_amp = bool(cfg.get("use_amp", True)) and device.type == "cuda"
     val_enable_channels_last = bool(cfg.get("val_enable_channels_last", True))
 
-    amp_ctx = (
-        torch.amp.autocast(device_type="cuda", dtype=amp_dtype)  # type: ignore[attr-defined]
-        if use_amp
-        else torch.amp.autocast(device_type="cpu", enabled=False)  # type: ignore[attr-defined]
-    )
     use_fp16 = use_amp and amp_dtype == torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)  # type: ignore[attr-defined]
 
@@ -2152,12 +2230,7 @@ def main() -> None:
             device=device,
         )
         start_epoch = int(ckpt["epoch"]) + 1
-        best_metric = float(
-            ckpt.get(
-                "best_challenge_score",
-                ckpt.get("best_composite_score", float("-inf")),
-            )
-        )
+        best_metric = float(ckpt.get("best_challenge_score", float("-inf")))
         best_val_d = ckpt.get("best_val_dice", float("nan"))
         best_val_macro_dice = (
             float(best_val_d) if best_val_d is not None else float("nan")
@@ -2255,12 +2328,12 @@ def main() -> None:
         )
         best_ckpt_metric_name = "challenge_score"
     logger.info("Epoch validation boundary metrics: disabled (offline evaluation keeps them enabled).")
-    w_macro = float(cfg.get("best_ckpt_w_macro_dice", 0.45))
-    w_weighted_macro = float(cfg.get("best_ckpt_w_weighted_macro_dice", 0.15))
-    w_dice_g5 = float(cfg.get("best_ckpt_w_dice_g5", 0.30))
-    w_sens = float(cfg.get("best_ckpt_w_sensitivity", 0.10))
-    best_ckpt_metric_source = metric_settings.best_checkpoint_source
+    best_ckpt_metric_source = _resolve_training_best_checkpoint_source(
+        metric_settings.best_checkpoint_source
+    )
     nan_recovery_log_every = max(1, int(cfg.get("nan_recovery_log_every", 1)))
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+    non_finite_stats = {"soft_loss": float("nan"), "hard_dice_loss": float("nan"), "valid_fraction": float("nan")}
     viz_enabled = bool(cfg.get("viz_enabled", True))
     viz_every_n_epochs = max(1, int(cfg.get("viz_every_n_epochs", 5)))
     viz_num_cases = max(0, int(cfg.get("viz_num_cases", 8)))
@@ -2289,13 +2362,6 @@ def main() -> None:
         best_ckpt_metric_name,
         best_ckpt_metric_source,
     )
-    logger.info(
-        "Legacy composite (reference only): macro_dice=%.3f weighted_macro_dice=%.3f dice_g5=%.3f sensitivity=%.3f",
-        w_macro,
-        w_weighted_macro,
-        w_dice_g5,
-        w_sens,
-    )
     pspnet_aux_weight = float(cfg.get("pspnet_aux_weight", 0.5))
     pspnet_loss_mode = str(cfg.get("pspnet_loss_mode", "consensus")).strip().lower()
     if pspnet_loss_mode not in {"consensus", "gleason_ce", "gleason_ce_soft"}:
@@ -2313,6 +2379,56 @@ def main() -> None:
         raise ValueError(f"pspnet_soft_weight must be >= 0, got {pspnet_soft_weight}")
     if cfg_model != "pspnet":
         pspnet_loss_mode = "consensus"
+
+    def _forward_train_batch_loss(
+        batch_images: torch.Tensor,
+        *,
+        batch_hard_mask: torch.Tensor,
+        batch_soft_probs: torch.Tensor,
+        batch_ignore_mask: torch.Tensor,
+        batch_sample_w: torch.Tensor,
+        epoch_soft_weight: float,
+        epoch_dice_weight: float,
+        force_fp32: bool,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        autocast_enabled = use_amp and not force_fp32
+        with torch.autocast(
+            device_type=autocast_device,
+            dtype=amp_dtype,
+            enabled=autocast_enabled,
+        ):
+            model_input = batch_images.float() if force_fp32 else batch_images
+            out_local = model(model_input)
+            logits_local, scales_local, aux_local = _parse_model_outputs(out_local)
+            if force_fp32:
+                logits_local = logits_local.float().clamp(-15.0, 15.0)
+                scales_local = [s.float().clamp(-15.0, 15.0) for s in scales_local]
+            else:
+                logits_local = logits_local.clamp(-15.0, 15.0)
+                scales_local = [s.clamp(-15.0, 15.0) for s in scales_local]
+            return _compute_training_loss(
+                logits=logits_local,
+                scales=scales_local,
+                aux=aux_local,
+                hard_mask=batch_hard_mask,
+                soft_probs=batch_soft_probs,
+                ignore_mask=batch_ignore_mask,
+                sample_weights=batch_sample_w,
+                class_weights=class_weights,
+                use_confidence_mask=use_confidence_mask,
+                confidence_threshold=confidence_threshold,
+                soft_loss_type=soft_loss_type,
+                loss_variant=loss_variant,
+                lambda_soft=epoch_soft_weight,
+                lambda_dice=epoch_dice_weight,
+                include_background_in_dice=include_background_in_dice,
+                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+                model_name=cfg_model,
+                pspnet_loss_mode=pspnet_loss_mode,
+                pspnet_soft_weight=pspnet_soft_weight,
+                pspnet_soft_term=pspnet_soft_term,
+                pspnet_aux_weight=pspnet_aux_weight,
+            )
 
     for epoch in tqdm(range(start_epoch, epochs + 1), desc="Epochs", unit="epoch"):
         epoch_lambda_soft, epoch_lambda_dice = _resolve_epoch_lambda_weights(
@@ -2347,38 +2463,19 @@ def main() -> None:
 
             recovered_with_fp32 = False
             try:
-                with amp_ctx:
-                    out = model(images)
-                    logits, scales, aux = _parse_model_outputs(out)
-                    logits = logits.clamp(-15.0, 15.0)
-                    scales = [s.clamp(-15.0, 15.0) for s in scales]
-
-                    loss, stats = _compute_training_loss(
-                        logits=logits,
-                        scales=scales,
-                        aux=aux,
-                        hard_mask=hard_mask,
-                        soft_probs=soft_probs,
-                        ignore_mask=ignore_mask,
-                        sample_weights=sample_w,
-                        class_weights=class_weights,
-                        use_confidence_mask=use_confidence_mask,
-                        confidence_threshold=confidence_threshold,
-                        soft_loss_type=soft_loss_type,
-                        loss_variant=loss_variant,
-                        lambda_soft=epoch_lambda_soft,
-                        lambda_dice=epoch_lambda_dice,
-                        include_background_in_dice=include_background_in_dice,
-                        exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-                        model_name=cfg_model,
-                        pspnet_loss_mode=pspnet_loss_mode,
-                        pspnet_soft_weight=pspnet_soft_weight,
-                        pspnet_soft_term=pspnet_soft_term,
-                        pspnet_aux_weight=pspnet_aux_weight,
-                    )
+                loss, stats = _forward_train_batch_loss(
+                    images,
+                    batch_hard_mask=hard_mask,
+                    batch_soft_probs=soft_probs,
+                    batch_ignore_mask=ignore_mask,
+                    batch_sample_w=sample_w,
+                    epoch_soft_weight=epoch_lambda_soft,
+                    epoch_dice_weight=epoch_lambda_dice,
+                    force_fp32=False,
+                )
             except FloatingPointError:
                 loss = torch.tensor(float("nan"), device=device)
-                stats = {"soft_loss": float("nan"), "hard_dice_loss": float("nan"), "valid_fraction": float("nan")}
+                stats = non_finite_stats
 
             if not torch.isfinite(loss):
                 loss_value = float(loss.detach().cpu().item())
@@ -2390,40 +2487,22 @@ def main() -> None:
                         loss_value,
                     )
                 optimizer.zero_grad(set_to_none=True)
-                del out, loss, stats
+                del loss, stats
 
                 try:
-                    with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", enabled=False):
-                        out = model(images.float())
-                        logits, scales, aux = _parse_model_outputs(out)
-                        logits = logits.float().clamp(-15.0, 15.0)
-                        scales = [s.float().clamp(-15.0, 15.0) for s in scales]
-                        loss, stats = _compute_training_loss(
-                            logits=logits,
-                            scales=scales,
-                            aux=aux,
-                            hard_mask=hard_mask,
-                            soft_probs=soft_probs,
-                            ignore_mask=ignore_mask,
-                            sample_weights=sample_w,
-                            class_weights=class_weights,
-                            use_confidence_mask=use_confidence_mask,
-                            confidence_threshold=confidence_threshold,
-                            soft_loss_type=soft_loss_type,
-                            loss_variant=loss_variant,
-                            lambda_soft=epoch_lambda_soft,
-                            lambda_dice=epoch_lambda_dice,
-                            include_background_in_dice=include_background_in_dice,
-                            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-                            model_name=cfg_model,
-                            pspnet_loss_mode=pspnet_loss_mode,
-                            pspnet_soft_weight=pspnet_soft_weight,
-                            pspnet_soft_term=pspnet_soft_term,
-                            pspnet_aux_weight=pspnet_aux_weight,
-                        )
+                    loss, stats = _forward_train_batch_loss(
+                        images,
+                        batch_hard_mask=hard_mask,
+                        batch_soft_probs=soft_probs,
+                        batch_ignore_mask=ignore_mask,
+                        batch_sample_w=sample_w,
+                        epoch_soft_weight=epoch_lambda_soft,
+                        epoch_dice_weight=epoch_lambda_dice,
+                        force_fp32=True,
+                    )
                 except FloatingPointError:
                     loss = torch.tensor(float("nan"), device=device)
-                    stats = {"soft_loss": float("nan"), "hard_dice_loss": float("nan"), "valid_fraction": float("nan")}
+                    stats = non_finite_stats
 
                 if not torch.isfinite(loss):
                     nan_batch_count += 1
@@ -2435,7 +2514,7 @@ def main() -> None:
                         max_nan_batches,
                     )
                     optimizer.zero_grad(set_to_none=True)
-                    del out, images, soft_probs, hard_mask, ignore_mask, sample_w, loss
+                    del images, soft_probs, hard_mask, ignore_mask, sample_w, loss
                     if nan_batch_count >= max_nan_batches:
                         raise FloatingPointError(
                             f"Non-finite loss for {max_nan_batches} consecutive batches "
@@ -2483,7 +2562,7 @@ def main() -> None:
                 dice=f"{stats['hard_dice_loss']:.4f}",
             )
 
-            del out, images, soft_probs, hard_mask, ignore_mask, sample_w, loss
+            del images, soft_probs, hard_mask, ignore_mask, sample_w, loss
 
         if not scheduler_step_per_batch and epoch_optimizer_steps > 0:
             scheduler.step()
@@ -2528,7 +2607,7 @@ def main() -> None:
             scheduler=scheduler,
             scaler=scaler,
             best_val_dice=best_val_macro_dice,
-            best_composite_score=best_metric,
+            best_challenge_score=best_metric,
             last_hd95=float("nan"),
         )
         rotate_checkpoints(checkpoint_dir, keep_last_n)
@@ -2584,38 +2663,17 @@ def main() -> None:
         )
 
         val_log: dict[str, float] = {"val/loss": val_metrics["val_loss"]}
-        for stream in ("raw", "post"):
-            for k in val_metric_keys:
-                val_log[f"val_{stream}/{k}"] = val_metrics[f"val_{stream}/{k}"]
-        raw_view = _selected_stream_metrics(val_metrics, source="raw", metric_keys=val_metric_keys)
-        post_view = _selected_stream_metrics(val_metrics, source="post", metric_keys=val_metric_keys)
-        raw_composite = _composite_from_metrics(
-            raw_view,
-            w_macro=w_macro,
-            w_weighted_macro=w_weighted_macro,
-            w_dice_g5=w_dice_g5,
-            w_sens=w_sens,
-        )
-        post_composite = _composite_from_metrics(
-            post_view,
-            w_macro=w_macro,
-            w_weighted_macro=w_weighted_macro,
-            w_dice_g5=w_dice_g5,
-            w_sens=w_sens,
-        )
-        val_log["val_raw/composite_score"] = raw_composite
-        val_log["val_post/composite_score"] = post_composite
+        for k in val_metric_keys:
+            val_log[f"val_raw/{k}"] = val_metrics[f"val_raw/{k}"]
         wandb_logger.log_epoch(val_log, step=epoch)
 
         logger.info(
-            "Epoch %d/%d | val_loss=%s | raw_macro=%s post_macro=%s | raw_sens=%s post_sens=%s",
+            "Epoch %d/%d | val_loss=%s | raw_macro=%s | raw_sens=%s",
             epoch,
             epochs,
             _fmt(val_metrics["val_loss"]),
             _fmt(val_metrics["val_raw/macro_dice"]),
-            _fmt(val_metrics["val_post/macro_dice"]),
             _fmt(val_metrics["val_raw/sensitivity"]),
-            _fmt(val_metrics["val_post/sensitivity"]),
         )
 
         if device.type == "cuda":
@@ -2650,37 +2708,22 @@ def main() -> None:
                 run_dir / viz_output_subdir / f"epoch_{epoch:04d}",
             )
 
-        selected_composite = post_composite if best_ckpt_metric_source == "post" else raw_composite
-        selected_metric = (
-            val_metrics[f"val_post/{best_ckpt_metric_name}"]
-            if best_ckpt_metric_source == "post"
-            else val_metrics[f"val_raw/{best_ckpt_metric_name}"]
-        )
-        selected_macro = (
-            val_metrics["val_post/macro_dice"]
-            if best_ckpt_metric_source == "post"
-            else val_metrics["val_raw/macro_dice"]
-        )
+        selected_metric = val_metrics[f"val_raw/{best_ckpt_metric_name}"]
+        selected_macro = val_metrics["val_raw/macro_dice"]
 
-        if not math.isnan(selected_composite):
-            wandb_logger.log_epoch(
-                {"val/composite_score": selected_composite},
-                step=epoch,
-            )
         if not math.isnan(selected_metric):
             wandb_logger.log_epoch(
                 {f"val/{best_ckpt_metric_name}": selected_metric},
                 step=epoch,
             )
             logger.info(
-                "Epoch %d/%d | selected_%s(%s)=%.4f (best=%s) | selected_composite=%.4f",
+                "Epoch %d/%d | selected_%s(%s)=%.4f (best=%s)",
                 epoch,
                 epochs,
                 best_ckpt_metric_name,
                 best_ckpt_metric_source,
                 selected_metric,
                 _fmt(best_metric),
-                selected_composite,
             )
 
         if (
@@ -2697,7 +2740,7 @@ def main() -> None:
                 scheduler=scheduler,
                 scaler=scaler,
                 best_val_dice=best_val_macro_dice,
-                best_composite_score=best_metric,
+                best_challenge_score=best_metric,
                 last_hd95=float("nan"),
             )
             logger.info(
@@ -2734,7 +2777,6 @@ def main() -> None:
         "best_checkpoint": str(best_ckpt if best_ckpt.exists() else ""),
         "latest_epoch_checkpoint": str(epoch_ckpts[-1]) if epoch_ckpts else "",
         "best_challenge_score": None if math.isnan(best_metric) else float(best_metric),
-        "best_composite_score": None if math.isnan(best_metric) else float(best_metric),
         "best_val_macro_dice": None
         if math.isnan(best_val_macro_dice)
         else float(best_val_macro_dice),

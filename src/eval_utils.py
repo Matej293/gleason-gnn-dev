@@ -203,7 +203,7 @@ def compute_multiclass_metrics(
 
 
 
-def _build_confusion_matrix(
+def build_confusion_matrix(
     pred: torch.Tensor,
     hard_mask: torch.Tensor,
     valid: torch.Tensor,
@@ -222,32 +222,17 @@ def _build_confusion_matrix(
     flat_counts = torch.bincount(flat_idx, minlength=num_classes * num_classes)
     return flat_counts.reshape(num_classes, num_classes).to(dtype=torch.float64)
 
-def compute_multiclass_metrics_from_pred(
-    pred: torch.Tensor,
-    hard_mask: torch.Tensor,
-    ignore_mask: torch.Tensor,
-    include_background_in_dice: bool,
-    include_boundary_metrics: bool = True,
-    boundary_metric_cfg: Mapping[str, object] | None = None,
-    *,
-    valid_mask: torch.Tensor | None = None,
-    valid_n: int | None = None,
-    hard_valid_support: torch.Tensor | None = None,
-    ignored_pixel_fraction: float | None = None,
-    tumor_pixels_ignored_fraction: float | None = None,
-) -> dict[str, float]:
-    valid = valid_mask if valid_mask is not None else (ignore_mask == 0)
-    if valid_n is None:
-        valid_n = int(valid.sum().item())
 
-    num_classes = 4
-    conf = _build_confusion_matrix(
-        pred=pred,
-        hard_mask=hard_mask,
-        valid=valid,
-        num_classes=num_classes,
-        valid_n=valid_n,
-    )
+def _compute_metrics_from_confusion(
+    conf: torch.Tensor,
+    *,
+    include_background_in_dice: bool,
+    valid_n: int,
+    hard_valid_support: torch.Tensor,
+    ignored_pixel_fraction: float,
+    tumor_pixels_ignored_fraction: float,
+) -> dict[str, float]:
+    num_classes = int(conf.shape[0])
     diag = conf.diag()
     row = conf.sum(dim=1)
     col = conf.sum(dim=0)
@@ -257,8 +242,8 @@ def compute_multiclass_metrics_from_pred(
 
     denom = row + col
     union = row + col - diag
-    dice_t = torch.full((num_classes,), float("nan"), dtype=torch.float64, device=pred.device)
-    iou_t = torch.full((num_classes,), float("nan"), dtype=torch.float64, device=pred.device)
+    dice_t = torch.full((num_classes,), float("nan"), dtype=torch.float64, device=conf.device)
+    iou_t = torch.full((num_classes,), float("nan"), dtype=torch.float64, device=conf.device)
     dice_valid = denom > 0
     iou_valid = union > 0
     dice_t[dice_valid] = (2.0 * diag[dice_valid] + 1e-5) / (denom[dice_valid] + 1e-5)
@@ -272,9 +257,7 @@ def compute_multiclass_metrics_from_pred(
     macro_dice = float(sum(used) / len(used)) if used else float("nan")
     weighted_num = 0.0
     weighted_den = 0.0
-    if hard_valid_support is None:
-        hard_valid_support = row
-    hard_valid_support = hard_valid_support.to(device=pred.device, dtype=torch.float64)
+    hard_valid_support = hard_valid_support.to(device=conf.device, dtype=torch.float64)
     for c in range(start, num_classes):
         support = int(hard_valid_support[c].item())
         dice_c = dice_values[c]
@@ -285,7 +268,6 @@ def compute_multiclass_metrics_from_pred(
         float(weighted_num / weighted_den) if weighted_den > 0.0 else float("nan")
     )
 
-    # For single-label segmentation, per-class Dice equals per-class F1.
     macro_f1 = macro_dice
     tp_sum = float(tp_per_class.sum().item())
     fp_sum = float(fp_per_class.sum().item())
@@ -296,12 +278,13 @@ def compute_multiclass_metrics_from_pred(
         else float("nan")
     )
 
-    # Multiclass Cohen's kappa over valid pixels.
     if valid_n > 0:
         po = float(diag.sum().item() / float(valid_n))
         pe = float((row * col).sum().item() / float(valid_n * valid_n))
-        denom = 1.0 - pe
-        cohen_kappa = float((po - pe) / denom) if abs(denom) > 1e-12 else float("nan")
+        denom_kappa = 1.0 - pe
+        cohen_kappa = (
+            float((po - pe) / denom_kappa) if abs(denom_kappa) > 1e-12 else float("nan")
+        )
     else:
         cohen_kappa = float("nan")
 
@@ -322,17 +305,7 @@ def compute_multiclass_metrics_from_pred(
     prec = (tp + 1e-6) / (tp + fp + 1e-6) if (tp + fp) > 0 else float("nan")
     iou_tumor = (tp + 1e-6) / (tp + fp + fn + 1e-6) if (tp + fp + fn) > 0 else float("nan")
 
-    if ignored_pixel_fraction is None:
-        ignored_pixel_fraction = float((~valid).float().mean().item())
-    if tumor_pixels_ignored_fraction is None:
-        tumor_pixels = hard_mask > 0
-        tumor_ignored_den = float(tumor_pixels.sum().item())
-        tumor_ignored_num = float((tumor_pixels & (~valid)).sum().item())
-        tumor_pixels_ignored_fraction = (
-            (tumor_ignored_num / tumor_ignored_den) if tumor_ignored_den > 0 else float("nan")
-        )
-
-    metrics = {
+    return {
         "macro_dice": macro_dice,
         "macro_f1": macro_f1,
         "micro_f1": micro_f1,
@@ -356,6 +329,65 @@ def compute_multiclass_metrics_from_pred(
         "ignored_pixel_fraction": ignored_pixel_fraction,
         "tumor_pixels_ignored_fraction": tumor_pixels_ignored_fraction,
     }
+
+def compute_multiclass_metrics_from_pred(
+    pred: torch.Tensor,
+    hard_mask: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    include_background_in_dice: bool,
+    include_boundary_metrics: bool = True,
+    boundary_metric_cfg: Mapping[str, object] | None = None,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    valid_n: int | None = None,
+    hard_valid_support: torch.Tensor | None = None,
+    ignored_pixel_fraction: float | None = None,
+    tumor_pixels_ignored_fraction: float | None = None,
+    confusion_matrix: torch.Tensor | None = None,
+) -> dict[str, float]:
+    valid = valid_mask if valid_mask is not None else (ignore_mask == 0)
+    if valid_n is None:
+        valid_n = int(valid.sum().item())
+
+    num_classes = 4
+    conf = (
+        confusion_matrix.to(device=pred.device, dtype=torch.float64)
+        if confusion_matrix is not None
+        else build_confusion_matrix(
+            pred=pred,
+            hard_mask=hard_mask,
+            valid=valid,
+            num_classes=num_classes,
+            valid_n=valid_n,
+        )
+    )
+    if conf.shape != (num_classes, num_classes):
+        raise ValueError(
+            "confusion_matrix must have shape "
+            f"({num_classes}, {num_classes}), got {tuple(conf.shape)}"
+        )
+    row = conf.sum(dim=1)
+
+    if ignored_pixel_fraction is None:
+        ignored_pixel_fraction = float((~valid).float().mean().item())
+    if tumor_pixels_ignored_fraction is None:
+        tumor_pixels = hard_mask > 0
+        tumor_ignored_den = float(tumor_pixels.sum().item())
+        tumor_ignored_num = float((tumor_pixels & (~valid)).sum().item())
+        tumor_pixels_ignored_fraction = (
+            (tumor_ignored_num / tumor_ignored_den) if tumor_ignored_den > 0 else float("nan")
+        )
+
+    if hard_valid_support is None:
+        hard_valid_support = row
+    metrics = _compute_metrics_from_confusion(
+        conf=conf,
+        include_background_in_dice=include_background_in_dice,
+        valid_n=valid_n,
+        hard_valid_support=hard_valid_support,
+        ignored_pixel_fraction=ignored_pixel_fraction,
+        tumor_pixels_ignored_fraction=tumor_pixels_ignored_fraction,
+    )
 
     if include_boundary_metrics:
         boundary_cfg = boundary_metric_cfg if isinstance(boundary_metric_cfg, Mapping) else {}
@@ -462,16 +494,17 @@ def postprocess_predictions(
     for b in torch.nonzero(tumor_present, as_tuple=False).view(-1).tolist():
         sample = out[b].detach().cpu().numpy().copy()
         sample_valid = valid[b].detach().cpu().numpy()
+        present_counts = np.bincount(sample[sample_valid].reshape(-1), minlength=4)
 
         for cls_id, min_sz in active_classes:
-            mask = (sample == cls_id) & sample_valid
-            if not mask.any():
+            if cls_id >= present_counts.shape[0] or int(present_counts[cls_id]) == 0:
                 continue
+            mask = (sample == cls_id) & sample_valid
             comps = label(mask, connectivity=2)
-            ids, counts = np.unique(comps, return_counts=True)
-            keep_ids = {int(i) for i, c in zip(ids, counts) if int(i) != 0 and int(c) >= min_sz}
-            cleaned = np.isin(comps, list(keep_ids))
-            sample[np.logical_and(mask, ~cleaned)] = 0
+            comp_counts = np.bincount(comps.reshape(-1))
+            keep = comp_counts >= min_sz
+            keep[0] = False
+            sample[np.logical_and(mask, ~keep[comps])] = 0
 
         sample = _fill_internal_tumor_holes(sample, sample_valid)
         out[b] = torch.from_numpy(sample).to(device=out.device, dtype=out.dtype)
@@ -495,6 +528,7 @@ def load_test_indices_from_manifest(dataset_items: list[dict], split_manifest_pa
 
 
 __all__ = [
+    "build_confusion_matrix",
     "collate_consensus_batch",
     "compute_multiclass_metrics",
     "compute_multiclass_metrics_from_pred",

@@ -27,6 +27,37 @@ This repository covers:
 pip install -r requirements.txt
 ```
 
+## Command-to-file map
+
+### Make targets and entry files
+
+| Make target | Command entry file |
+| --- | --- |
+| `make train` | `src/train_deconver.py` (module: `src.train_deconver`) |
+| `make eval` | `scripts/evaluate_checkpoint.py` |
+| `make smoke` | `scripts/smoke_test.py` |
+| `make test` | `tests/` (via `pytest`) |
+| `make consensus` / `make consensus-weighted` | `scripts/build_consensus.py` |
+| `make viz-consensus-gt` | `scripts/generate_consensus_gt_viz.py` |
+| `make audit-background-ignore` | `scripts/audit_background_ignore.py` |
+| `make gnn-build` / `make gnn-build-all` | `scripts/build_superpixel_graphs.py` |
+| `make gnn-eval` | `scripts/eval_gnn_baselines.py` |
+| `make gnn-train` / `make gnn-train-all` | `scripts/train_gnn_node_classifier.py` |
+| `make gnn-viz` | `scripts/visualize_gnn_predictions.py` |
+| `make gnn-viz-best` | `scripts/select_best_gnn_run.py` + `scripts/visualize_gnn_predictions.py` |
+| `make gnn-compare-viz` | `scripts/visualize_gnn_baseline_comparison.py` |
+
+### Main filenames across the codebase
+
+- Training loop and loss logic: `src/train_deconver.py`
+- Dataset loading: `src/gleason_consensus_dataset.py`
+- Model factory: `src/models/__init__.py`
+- Consensus modules: `src/consensus_builder/`
+- Graph export pipeline: `src/graph_pipeline/`
+- GNN models/training core: `src/gnn/`
+- Runtime scripts: `scripts/`
+- Experiment configs: `configs/deconver.yaml`, `configs/unet_lite.yaml`, `configs/pspnet.yaml`
+
 ## GPU compatibility (Volta / TITAN V)
 
 The provided training configs are tuned for Volta-class GPUs (for example, NVIDIA TITAN V).
@@ -243,5 +274,5 @@ Supported variants:
 
 ```bash
 PYTHONPATH=. pytest -q tests
-pytest -q tests/test_graph_pipeline.py
+PYTHONPATH=. pytest -q tests/test_graph_pipeline.py
 ```
