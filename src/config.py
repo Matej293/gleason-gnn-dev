@@ -28,21 +28,48 @@ def _require_cfg_key(cfg: dict[str, Any], key: str) -> Any:
     return cfg[key]
 
 
-def resolve_patch_size(cfg: dict[str, Any]) -> tuple[int, int]:
-    raw = _require_cfg_key(cfg, "patch_size")
+def _resolve_hw_pair(cfg: dict[str, Any], key: str) -> tuple[int, int]:
+    raw = _require_cfg_key(cfg, key)
     if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-        raise ValueError("patch_size must be a 2-item list/tuple [H, W].")
-    patch_h = int(raw[0])
-    patch_w = int(raw[1])
-    if patch_h <= 0 or patch_w <= 0:
-        raise ValueError(f"patch_size entries must be > 0, got [{patch_h}, {patch_w}]")
-    return patch_h, patch_w
+        raise ValueError(f"{key} must be a 2-item list/tuple [H, W].")
+    h = int(raw[0])
+    w = int(raw[1])
+    if h <= 0 or w <= 0:
+        raise ValueError(f"{key} entries must be > 0, got [{h}, {w}]")
+    return h, w
 
 
-def resolve_patch_overlap(cfg: dict[str, Any]) -> float:
-    overlap = float(cfg.get("patch_overlap", 0.5))
+def resolve_resize_short_side(cfg: dict[str, Any], key: str) -> int:
+    short_side = int(_require_cfg_key(cfg, key))
+    if short_side <= 0:
+        raise ValueError(f"{key} must be > 0, got {short_side}")
+    return short_side
+
+
+def resolve_train_crop_size(cfg: dict[str, Any]) -> tuple[int, int]:
+    return _resolve_hw_pair(cfg, "train_crop_size")
+
+
+def resolve_inference_mode(cfg: dict[str, Any]) -> str:
+    mode = str(_require_cfg_key(cfg, "inference_mode")).strip().lower()
+    if mode not in {"resized_full", "resized_sliding_window"}:
+        raise ValueError(
+            "inference_mode must be one of ['resized_full', 'resized_sliding_window'], "
+            f"got {mode!r}"
+        )
+    return mode
+
+
+def resolve_resized_sliding_window_patch_size(cfg: dict[str, Any]) -> tuple[int, int]:
+    return _resolve_hw_pair(cfg, "resized_sliding_window_patch_size")
+
+
+def resolve_resized_sliding_window_overlap(cfg: dict[str, Any]) -> float:
+    overlap = float(cfg.get("resized_sliding_window_overlap", 0.25))
     if overlap < 0.0 or overlap >= 1.0:
-        raise ValueError(f"patch_overlap must be in [0.0, 1.0), got {overlap}")
+        raise ValueError(
+            f"resized_sliding_window_overlap must be in [0.0, 1.0), got {overlap}"
+        )
     return overlap
 
 

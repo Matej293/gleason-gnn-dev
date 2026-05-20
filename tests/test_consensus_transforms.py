@@ -59,7 +59,6 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "flip_v": 0.50,
         "rotate90": 0.20,
         "affine": 0.15,
-        "crop": 0.00,
         "scale_intensity": 0.15,
         "adjust_contrast": 0.10,
         "gaussian_noise": 0.10,
@@ -71,7 +70,6 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "flip_v": 0.50,
         "rotate90": 0.30,
         "affine": 0.25,
-        "crop": 0.00,
         "scale_intensity": 0.20,
         "adjust_contrast": 0.15,
         "gaussian_noise": 0.15,
@@ -83,7 +81,6 @@ _DEFAULT_TRANSFORM_PROFILES = {
         "flip_v": 0.50,
         "rotate90": 0.40,
         "affine": 0.35,
-        "crop": 0.00,
         "scale_intensity": 0.25,
         "adjust_contrast": 0.20,
         "gaussian_noise": 0.20,
@@ -95,16 +92,24 @@ _DEFAULT_TRANSFORM_PROFILES = {
 
 def _enabled_cfg() -> dict:
     return {
+        "resize_short_side": 1024,
+        "train_crop_enabled": True,
+        "train_crop_size": [800, 800],
+        "train_resize_random_scale_enabled": False,
+        "train_resize_random_scale_min": 0.9,
+        "train_resize_random_scale_max": 1.1,
+        "inference_resize_short_side": 1024,
+        "inference_mode": "resized_full",
+        "resized_sliding_window_patch_size": [800, 800],
+        "resized_sliding_window_overlap": 0.25,
         "transforms_enabled": True,
         "transforms_profile": "light",
-        "transforms_patch_size": None,
         "transforms_profiles": _DEFAULT_TRANSFORM_PROFILES,
         "transforms_prob": {
             "flip_h": 1.0,
             "flip_v": 1.0,
             "rotate90": 1.0,
             "affine": 0.0,
-            "crop": 0.0,
             "scale_intensity": 0.0,
             "adjust_contrast": 0.0,
             "gaussian_noise": 0.0,
@@ -188,7 +193,7 @@ def test_ignore_and_tissue_masks_remain_binary_and_aligned(tmp_path: Path) -> No
 
     assert ignore.shape == hard.shape
     assert tissue.shape == hard.shape
-    assert set(torch.unique(ignore).tolist()).issubset({0, 1})
+    assert set(torch.unique(ignore).tolist()).issubset({0, 255})
     assert set(torch.unique(tissue).tolist()).issubset({0, 1})
 
 
@@ -225,7 +230,7 @@ def test_transform_enabled_loss_smoke(tmp_path: Path) -> None:
     assert 0.0 <= stats["valid_fraction"] <= 1.0
 
 
-def test_transforms_disabled_keeps_interface_noop(tmp_path: Path) -> None:
+def test_transforms_always_include_resized_preprocessing(tmp_path: Path) -> None:
     data_root, consensus_root = _make_toy_dataset(tmp_path)
     cfg = {
         "model": "deconver",
@@ -236,19 +241,27 @@ def test_transforms_disabled_keeps_interface_noop(tmp_path: Path) -> None:
         "transforms_enabled": False,
         "renormalize_probs": True,
         "enforce_background_ignore": True,
+        "resize_short_side": 1024,
+        "train_crop_enabled": True,
+        "train_crop_size": [800, 800],
+        "train_resize_random_scale_enabled": False,
+        "inference_resize_short_side": 1024,
+        "inference_mode": "resized_full",
+        "resized_sliding_window_patch_size": [800, 800],
+        "resized_sliding_window_overlap": 0.25,
     }
 
     train_t, val_t = consensus_train_val_transforms_from_config(cfg)
-    assert train_t is None
-    assert val_t is None
+    assert train_t is not None
+    assert val_t is not None
 
-    ds_a = GleasonConsensusDataset(**consensus_dataset_kwargs_from_config(cfg))
-    ds_b = GleasonConsensusDataset(**consensus_dataset_kwargs_from_config(cfg, transform=train_t))
+    ds_train = GleasonConsensusDataset(**consensus_dataset_kwargs_from_config(cfg, transform=train_t))
+    ds_val = GleasonConsensusDataset(**consensus_dataset_kwargs_from_config(cfg, transform=val_t))
 
-    a = ds_a[0]
-    b = ds_b[0]
-    for key in ["image", "soft_probs", "hard_mask", "ignore_mask", "tissue_mask"]:
-        assert torch.equal(a[key], b[key])
+    train_sample = ds_train[0]
+    val_sample = ds_val[0]
+    assert train_sample["image"].shape[-2:] == (800, 800)
+    assert val_sample["image"].shape[-2:] == (1024, 1365)
 
 
 def test_new_augmentation_ops_use_profile_probs_when_not_overridden() -> None:

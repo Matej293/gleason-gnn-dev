@@ -15,13 +15,20 @@ _TRANSFORM_PROB_KEYS = {
     "flip_v",
     "rotate90",
     "affine",
-    "crop",
     "scale_intensity",
     "adjust_contrast",
     "gaussian_noise",
     "gaussian_smooth",
     "shift_intensity",
 }
+
+_REMOVED_NATIVE_KEYS = (
+    "patch_size",
+    "patch_overlap",
+    "patch_tissue_filter_enabled",
+    "patch_min_tissue_fraction",
+    "transforms_patch_size",
+)
 
 
 def _require_keys(cfg: dict, keys: list[str]) -> None:
@@ -69,6 +76,77 @@ def _validate_fixed_len_numeric_sequence(
         float(value)
 
 
+def _validate_hw_pair(cfg: dict, key: str) -> tuple[int, int]:
+    raw = cfg.get(key)
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        raise ValueError(f"{key} must be a 2-item list/tuple [H, W].")
+    h = int(raw[0])
+    w = int(raw[1])
+    if h <= 0 or w <= 0:
+        raise ValueError(f"{key} entries must be > 0, got [{h}, {w}]")
+    return h, w
+
+
+def _validate_resized_schema(cfg: dict) -> None:
+    for key in _REMOVED_NATIVE_KEYS:
+        if key in cfg:
+            raise ValueError(
+                f"Config key '{key}' was removed in the resized-only migration. "
+                "Use resized pipeline keys instead: "
+                "resize_short_side, train_crop_enabled, train_crop_size, "
+                "train_resize_random_scale_enabled, inference_resize_short_side, "
+                "inference_mode, resized_sliding_window_patch_size, resized_sliding_window_overlap."
+            )
+
+    resize_short_side = int(cfg.get("resize_short_side", 0))
+    if resize_short_side <= 0:
+        raise ValueError(f"resize_short_side must be > 0, got {resize_short_side}")
+
+    if not isinstance(cfg.get("train_crop_enabled", None), bool):
+        raise ValueError("train_crop_enabled must be a boolean.")
+    _validate_hw_pair(cfg, "train_crop_size")
+
+    if not isinstance(cfg.get("train_resize_random_scale_enabled", None), bool):
+        raise ValueError("train_resize_random_scale_enabled must be a boolean.")
+    if bool(cfg.get("train_resize_random_scale_enabled", False)):
+        if "train_resize_random_scale_min" not in cfg or "train_resize_random_scale_max" not in cfg:
+            raise ValueError(
+                "train_resize_random_scale_enabled=true requires train_resize_random_scale_min and train_resize_random_scale_max."
+            )
+        random_scale_min = float(cfg["train_resize_random_scale_min"])
+        random_scale_max = float(cfg["train_resize_random_scale_max"])
+        if random_scale_min <= 0.0:
+            raise ValueError(
+                f"train_resize_random_scale_min must be > 0, got {random_scale_min}"
+            )
+        if random_scale_max < random_scale_min:
+            raise ValueError(
+                "train_resize_random_scale_max must be >= train_resize_random_scale_min."
+            )
+
+    inference_resize_short_side = int(cfg.get("inference_resize_short_side", 0))
+    if inference_resize_short_side <= 0:
+        raise ValueError(
+            f"inference_resize_short_side must be > 0, got {inference_resize_short_side}"
+        )
+
+    inference_mode = str(cfg.get("inference_mode", "")).strip().lower()
+    if inference_mode not in {"resized_full", "resized_sliding_window"}:
+        raise ValueError(
+            "inference_mode must be one of ['resized_full', 'resized_sliding_window'], "
+            f"got {inference_mode!r}"
+        )
+
+    _validate_hw_pair(cfg, "resized_sliding_window_patch_size")
+
+    resized_sw_overlap = float(cfg.get("resized_sliding_window_overlap", -1.0))
+    if resized_sw_overlap < 0.0 or resized_sw_overlap >= 1.0:
+        raise ValueError(
+            "resized_sliding_window_overlap must be in [0.0, 1.0), "
+            f"got {resized_sw_overlap}"
+        )
+
+
 def validate_deconver_config(
     cfg: dict,
     *,
@@ -85,26 +163,18 @@ def validate_deconver_config(
             "consensus_root",
             "base_output_dir",
             "image_subdirs",
-            "patch_size",
-            "patch_overlap",
-            "transforms_enabled",
-            "transforms_profile",
-            "transforms_seed_sync",
-            "transforms_patch_size",
-            "transforms_profiles",
-            "transforms_prob",
-            "transforms_affine_rotate_range",
-            "transforms_affine_translate_range",
-            "transforms_affine_scale_range",
-            "transforms_scale_intensity_factors",
-            "transforms_adjust_contrast_gamma",
-            "transforms_gaussian_noise_mean",
-            "transforms_gaussian_noise_std",
-            "transforms_gaussian_smooth_sigma_x",
-            "transforms_gaussian_smooth_sigma_y",
-            "transforms_shift_intensity_offsets",
+            "resize_short_side",
+            "train_crop_enabled",
+            "train_crop_size",
+            "train_resize_random_scale_enabled",
+            "inference_resize_short_side",
+            "inference_mode",
+            "resized_sliding_window_patch_size",
+            "resized_sliding_window_overlap",
         ],
     )
+
+    _validate_resized_schema(cfg)
 
     model_name = str(cfg.get("model", "")).strip().lower()
     if model_name not in {"deconver", "unet_lite", "pspnet"}:
@@ -115,27 +185,6 @@ def validate_deconver_config(
     image_subdirs = cfg.get("image_subdirs")
     if not isinstance(image_subdirs, (list, tuple)) or not image_subdirs:
         raise ValueError("image_subdirs must be a non-empty list/tuple.")
-
-    patch_size = cfg.get("patch_size", None)
-    if not isinstance(patch_size, (list, tuple)) or len(patch_size) != 2:
-        raise ValueError("patch_size must be a 2-item list/tuple [H, W].")
-    patch_h = int(patch_size[0])
-    patch_w = int(patch_size[1])
-    if patch_h <= 0 or patch_w <= 0:
-        raise ValueError(f"patch_size entries must be > 0, got [{patch_h}, {patch_w}]")
-
-    patch_overlap = float(cfg.get("patch_overlap", 0.5))
-    if patch_overlap < 0.0 or patch_overlap >= 1.0:
-        raise ValueError(
-            f"patch_overlap must be in [0.0, 1.0), got {patch_overlap}"
-        )
-
-    patch_min_tissue_fraction = float(cfg.get("patch_min_tissue_fraction", 0.0))
-    if patch_min_tissue_fraction < 0.0 or patch_min_tissue_fraction > 1.0:
-        raise ValueError(
-            "patch_min_tissue_fraction must be in [0.0, 1.0], "
-            f"got {patch_min_tissue_fraction}"
-        )
 
     spatial_dims = int(cfg.get("spatial_dims", 2))
     if spatial_dims != 2:
@@ -243,138 +292,124 @@ def validate_deconver_config(
 
     validate_metrics_config(cfg)
 
-    transforms_profiles = cfg.get("transforms_profiles")
-    if not isinstance(transforms_profiles, dict):
-        raise ValueError("transforms_profiles must be a mapping of profile_name -> probability map.")
+    transforms_profiles = cfg.get("transforms_profiles", None)
+    if transforms_profiles is not None:
+        if not isinstance(transforms_profiles, dict):
+            raise ValueError("transforms_profiles must be a mapping of profile_name -> probability map.")
+        for profile_name, probs in transforms_profiles.items():
+            _validate_transform_profile_probs(profile_name=str(profile_name), probs=probs)
 
-    required_profiles = {"light", "medium", "strong"}
-    missing_profiles = sorted(required_profiles - set(transforms_profiles.keys()))
-    if missing_profiles:
-        raise ValueError(
-            f"transforms_profiles missing required profiles: {missing_profiles}"
-        )
-    for profile_name, probs in transforms_profiles.items():
-        _validate_transform_profile_probs(profile_name=str(profile_name), probs=probs)
-
-    transforms_profile = str(cfg.get("transforms_profile", "")).strip().lower()
-    if transforms_profile not in transforms_profiles:
+    transforms_profile = str(cfg.get("transforms_profile", "light")).strip().lower()
+    if transforms_profiles is not None and transforms_profile not in transforms_profiles:
         raise ValueError(
             "transforms_profile must match one of transforms_profiles keys, "
             f"got {transforms_profile!r}"
         )
 
-    transforms_patch = cfg.get("transforms_patch_size", None)
-    if transforms_patch is not None:
-        if not isinstance(transforms_patch, (list, tuple)) or len(transforms_patch) != 2:
-            raise ValueError("transforms_patch_size must be a 2-item list/tuple [H, W].")
-        patch_h = int(transforms_patch[0])
-        patch_w = int(transforms_patch[1])
-        if patch_h <= 0 or patch_w <= 0:
-            raise ValueError(
-                f"transforms_patch_size entries must be > 0, got [{patch_h}, {patch_w}]"
-            )
-
     transforms_prob = cfg.get("transforms_prob", None)
-    if transforms_prob is None:
-        transforms_prob = {}
-    if not isinstance(transforms_prob, dict):
+    if transforms_prob is not None and not isinstance(transforms_prob, dict):
         raise ValueError("transforms_prob must be a mapping of op_name -> probability.")
-    for key, value in transforms_prob.items():
-        if key not in _TRANSFORM_PROB_KEYS:
+    if isinstance(transforms_prob, dict):
+        for key, value in transforms_prob.items():
+            if key not in _TRANSFORM_PROB_KEYS:
+                raise ValueError(
+                    f"Unsupported transforms_prob key {key!r}. Supported: {sorted(_TRANSFORM_PROB_KEYS)}"
+                )
+            p = float(value)
+            if p < 0.0 or p > 1.0:
+                raise ValueError(
+                    f"transforms_prob[{key!r}] must be in [0,1], got {p}"
+                )
+
+    if "transforms_affine_rotate_range" in cfg:
+        _validate_fixed_len_numeric_sequence(
+            cfg.get("transforms_affine_rotate_range"),
+            key="transforms_affine_rotate_range",
+            expected_len=1,
+        )
+    if "transforms_affine_translate_range" in cfg:
+        _validate_fixed_len_numeric_sequence(
+            cfg.get("transforms_affine_translate_range"),
+            key="transforms_affine_translate_range",
+            expected_len=2,
+        )
+    if "transforms_affine_scale_range" in cfg:
+        _validate_fixed_len_numeric_sequence(
+            cfg.get("transforms_affine_scale_range"),
+            key="transforms_affine_scale_range",
+            expected_len=2,
+        )
+    if "transforms_adjust_contrast_gamma" in cfg:
+        _validate_fixed_len_numeric_sequence(
+            cfg.get("transforms_adjust_contrast_gamma"),
+            key="transforms_adjust_contrast_gamma",
+            expected_len=2,
+        )
+    if "transforms_gaussian_smooth_sigma_x" in cfg:
+        _validate_fixed_len_numeric_sequence(
+            cfg.get("transforms_gaussian_smooth_sigma_x"),
+            key="transforms_gaussian_smooth_sigma_x",
+            expected_len=2,
+        )
+    if "transforms_gaussian_smooth_sigma_y" in cfg:
+        _validate_fixed_len_numeric_sequence(
+            cfg.get("transforms_gaussian_smooth_sigma_y"),
+            key="transforms_gaussian_smooth_sigma_y",
+            expected_len=2,
+        )
+    if "transforms_shift_intensity_offsets" in cfg:
+        _validate_fixed_len_numeric_sequence(
+            cfg.get("transforms_shift_intensity_offsets"),
+            key="transforms_shift_intensity_offsets",
+            expected_len=2,
+        )
+
+    if "transforms_scale_intensity_factors" in cfg:
+        float(cfg.get("transforms_scale_intensity_factors"))
+    if "transforms_gaussian_noise_mean" in cfg:
+        float(cfg.get("transforms_gaussian_noise_mean"))
+    if "transforms_gaussian_noise_std" in cfg:
+        noise_std = float(cfg.get("transforms_gaussian_noise_std"))
+        if noise_std < 0.0:
+            raise ValueError(f"transforms_gaussian_noise_std must be >= 0, got {noise_std}")
+
+    if "transforms_gaussian_smooth_sigma_x" in cfg:
+        sigma_x_min, sigma_x_max = (
+            float(cfg["transforms_gaussian_smooth_sigma_x"][0]),
+            float(cfg["transforms_gaussian_smooth_sigma_x"][1]),
+        )
+        if sigma_x_min < 0.0 or sigma_x_max < 0.0:
             raise ValueError(
-                f"Unsupported transforms_prob key {key!r}. Supported: {sorted(_TRANSFORM_PROB_KEYS)}"
+                f"transforms_gaussian_smooth_sigma_x entries must be >= 0, got [{sigma_x_min}, {sigma_x_max}]"
             )
-        p = float(value)
-        if p < 0.0 or p > 1.0:
+        if sigma_x_max < sigma_x_min:
             raise ValueError(
-                f"transforms_prob[{key!r}] must be in [0,1], got {p}"
+                "transforms_gaussian_smooth_sigma_x must satisfy [min, max] with max >= min."
             )
 
-    transforms_enabled = bool(cfg.get("transforms_enabled", False))
-    base_profile_probs = transforms_profiles[transforms_profile]
-    crop_p = float(base_profile_probs.get("crop", 0.0))
-    if "crop" in transforms_prob:
-        crop_p = float(transforms_prob["crop"])
-    if transforms_enabled and crop_p > 0.0 and transforms_patch is None:
-        raise ValueError(
-            "transforms_prob['crop'] > 0 requires transforms_patch_size=[H, W]."
+    if "transforms_gaussian_smooth_sigma_y" in cfg:
+        sigma_y_min, sigma_y_max = (
+            float(cfg["transforms_gaussian_smooth_sigma_y"][0]),
+            float(cfg["transforms_gaussian_smooth_sigma_y"][1]),
         )
+        if sigma_y_min < 0.0 or sigma_y_max < 0.0:
+            raise ValueError(
+                f"transforms_gaussian_smooth_sigma_y entries must be >= 0, got [{sigma_y_min}, {sigma_y_max}]"
+            )
+        if sigma_y_max < sigma_y_min:
+            raise ValueError(
+                "transforms_gaussian_smooth_sigma_y must satisfy [min, max] with max >= min."
+            )
 
-    _validate_fixed_len_numeric_sequence(
-        cfg.get("transforms_affine_rotate_range"),
-        key="transforms_affine_rotate_range",
-        expected_len=1,
-    )
-    _validate_fixed_len_numeric_sequence(
-        cfg.get("transforms_affine_translate_range"),
-        key="transforms_affine_translate_range",
-        expected_len=2,
-    )
-    _validate_fixed_len_numeric_sequence(
-        cfg.get("transforms_affine_scale_range"),
-        key="transforms_affine_scale_range",
-        expected_len=2,
-    )
-    _validate_fixed_len_numeric_sequence(
-        cfg.get("transforms_adjust_contrast_gamma"),
-        key="transforms_adjust_contrast_gamma",
-        expected_len=2,
-    )
-    _validate_fixed_len_numeric_sequence(
-        cfg.get("transforms_gaussian_smooth_sigma_x"),
-        key="transforms_gaussian_smooth_sigma_x",
-        expected_len=2,
-    )
-    _validate_fixed_len_numeric_sequence(
-        cfg.get("transforms_gaussian_smooth_sigma_y"),
-        key="transforms_gaussian_smooth_sigma_y",
-        expected_len=2,
-    )
-    _validate_fixed_len_numeric_sequence(
-        cfg.get("transforms_shift_intensity_offsets"),
-        key="transforms_shift_intensity_offsets",
-        expected_len=2,
-    )
-    float(cfg.get("transforms_scale_intensity_factors"))
-    float(cfg.get("transforms_gaussian_noise_mean"))
-    noise_std = float(cfg.get("transforms_gaussian_noise_std"))
-    if noise_std < 0.0:
-        raise ValueError(f"transforms_gaussian_noise_std must be >= 0, got {noise_std}")
-
-    sigma_x_min, sigma_x_max = (
-        float(cfg["transforms_gaussian_smooth_sigma_x"][0]),
-        float(cfg["transforms_gaussian_smooth_sigma_x"][1]),
-    )
-    if sigma_x_min < 0.0 or sigma_x_max < 0.0:
-        raise ValueError(
-            f"transforms_gaussian_smooth_sigma_x entries must be >= 0, got [{sigma_x_min}, {sigma_x_max}]"
+    if "transforms_shift_intensity_offsets" in cfg:
+        shift_min, shift_max = (
+            float(cfg["transforms_shift_intensity_offsets"][0]),
+            float(cfg["transforms_shift_intensity_offsets"][1]),
         )
-    if sigma_x_max < sigma_x_min:
-        raise ValueError(
-            "transforms_gaussian_smooth_sigma_x must satisfy [min, max] with max >= min."
-        )
-
-    sigma_y_min, sigma_y_max = (
-        float(cfg["transforms_gaussian_smooth_sigma_y"][0]),
-        float(cfg["transforms_gaussian_smooth_sigma_y"][1]),
-    )
-    if sigma_y_min < 0.0 or sigma_y_max < 0.0:
-        raise ValueError(
-            f"transforms_gaussian_smooth_sigma_y entries must be >= 0, got [{sigma_y_min}, {sigma_y_max}]"
-        )
-    if sigma_y_max < sigma_y_min:
-        raise ValueError(
-            "transforms_gaussian_smooth_sigma_y must satisfy [min, max] with max >= min."
-        )
-
-    shift_min, shift_max = (
-        float(cfg["transforms_shift_intensity_offsets"][0]),
-        float(cfg["transforms_shift_intensity_offsets"][1]),
-    )
-    if shift_max < shift_min:
-        raise ValueError(
-            "transforms_shift_intensity_offsets must satisfy [min, max] with max >= min."
-        )
+        if shift_max < shift_min:
+            raise ValueError(
+                "transforms_shift_intensity_offsets must satisfy [min, max] with max >= min."
+            )
 
     amp_dtype_str = str(cfg.get("amp_dtype", "fp16")).strip().lower()
     if amp_dtype_str not in {"fp16", "bf16"}:

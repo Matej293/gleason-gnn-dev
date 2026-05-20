@@ -19,7 +19,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from monai.inferers import sliding_window_inference
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -28,9 +27,11 @@ sys.path.insert(0, str(_SRC))
 
 from config import (  # noqa: E402
     consensus_dataset_kwargs_from_config,
+    consensus_train_val_transforms_from_config,
     load_config,
-    resolve_patch_overlap,
-    resolve_patch_size,
+    resolve_inference_mode,
+    resolve_resized_sliding_window_overlap,
+    resolve_resized_sliding_window_patch_size,
 )
 from cli_utils import (  # noqa: E402
     require_existing_dir,
@@ -64,21 +65,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _sliding_window_logits(
+def _infer_logits(
     model: torch.nn.Module,
     images: torch.Tensor,
-    patch_size: tuple[int, int],
-    patch_overlap: float,
+    inference_mode: str,
+    resized_sliding_window_patch_size: tuple[int, int],
+    resized_sliding_window_overlap: float,
 ) -> torch.Tensor:
-    def _predictor(window: torch.Tensor) -> torch.Tensor:
-        return _extract_logits(model(window))
+    mode = str(inference_mode).strip().lower()
+    if mode == "resized_full":
+        if images.ndim != 4:
+            raise ValueError(f"Expected images shape [B,C,H,W], got {tuple(images.shape)}")
+        h, w = int(images.shape[-2]), int(images.shape[-1])
+        multiple = 32
+        pad_h = (multiple - (h % multiple)) % multiple
+        pad_w = (multiple - (w % multiple)) % multiple
+        x = images
+        if pad_h > 0 or pad_w > 0:
+            x = torch.nn.functional.pad(images, (0, pad_w, 0, pad_h), mode="replicate")
+        logits = _extract_logits(model(x))
+        if pad_h > 0 or pad_w > 0:
+            logits = logits[..., :h, :w]
+        return logits
+    if mode == "resized_sliding_window":
+        from monai.inferers import sliding_window_inference
 
-    return sliding_window_inference(
-        inputs=images,
-        roi_size=patch_size,
-        sw_batch_size=1,
-        predictor=_predictor,
-        overlap=patch_overlap,
+        def _predictor(window: torch.Tensor) -> torch.Tensor:
+            return _extract_logits(model(window))
+
+        return sliding_window_inference(
+            inputs=images,
+            roi_size=resized_sliding_window_patch_size,
+            sw_batch_size=1,
+            predictor=_predictor,
+            overlap=resized_sliding_window_overlap,
+        )
+    raise ValueError(
+        "Unsupported inference_mode: "
+        f"{inference_mode!r}. Expected 'resized_full' or 'resized_sliding_window'."
     )
 
 
@@ -219,24 +243,28 @@ def main() -> None:
         "include_background": bool(metric_settings.boundary.include_background),
         "symmetric_asd": bool(metric_settings.boundary.symmetric_asd),
     }
-    patch_size = resolve_patch_size(cfg)
-    patch_overlap = resolve_patch_overlap(cfg)
+    inference_mode = resolve_inference_mode(cfg)
+    resized_sliding_window_patch_size = resolve_resized_sliding_window_patch_size(cfg)
+    resized_sliding_window_overlap = resolve_resized_sliding_window_overlap(cfg)
 
     ckpt_path = resolve_checkpoint_path(run_dir, args.checkpoint, prefer_best=True)
 
-    dataset_kwargs = consensus_dataset_kwargs_from_config(cfg)
+    _, val_transform = consensus_train_val_transforms_from_config(cfg)
+    dataset_kwargs = consensus_dataset_kwargs_from_config(cfg, transform=val_transform)
     dataset = GleasonConsensusDataset(**dataset_kwargs)
 
     split_manifest_path = resolve_split_manifest_path(cfg)
     logger.info(
-        "Evaluation setup | run=%s checkpoint=%s split_manifest=%s output_json=%s patch_size=(%d,%d) overlap=%.2f",
+        "Evaluation setup | run=%s checkpoint=%s split_manifest=%s output_json=%s inference_mode=%s "
+        "sw_patch=(%d,%d) sw_overlap=%.2f",
         run_dir,
         ckpt_path,
         split_manifest_path,
         args.output_json if args.output_json is not None else (run_dir / "evaluation_summary.json"),
-        patch_size[0],
-        patch_size[1],
-        patch_overlap,
+        inference_mode,
+        resized_sliding_window_patch_size[0],
+        resized_sliding_window_patch_size[1],
+        resized_sliding_window_overlap,
     )
     test_indices = load_test_indices_from_manifest(dataset.items, split_manifest_path)
     test_ds = Subset(dataset, test_indices)
@@ -276,11 +304,12 @@ def main() -> None:
             ignore_mask = batch["ignore_mask"].to(device, non_blocking=True)
             image_ids = [str(x) for x in batch["image_id"]]
 
-            logits = _sliding_window_logits(
+            logits = _infer_logits(
                 model=model,
                 images=images,
-                patch_size=patch_size,
-                patch_overlap=patch_overlap,
+                inference_mode=inference_mode,
+                resized_sliding_window_patch_size=resized_sliding_window_patch_size,
+                resized_sliding_window_overlap=resized_sliding_window_overlap,
             )
             logits = logits.clamp(-15.0, 15.0)
             pred = logits.argmax(dim=1)

@@ -5,19 +5,61 @@ import sys
 from pathlib import Path
 
 import torch
-from monai.inferers import sliding_window_inference
 
 from src.config import (
     consensus_dataset_kwargs_from_config,
+    consensus_train_val_transforms_from_config,
     load_config,
-    resolve_patch_overlap,
-    resolve_patch_size,
+    resolve_inference_mode,
+    resolve_resized_sliding_window_overlap,
+    resolve_resized_sliding_window_patch_size,
 )
 from src.config_validation import validate_deconver_config
 from src.eval_utils import collate_consensus_batch, compute_multiclass_metrics
 from src.gleason_consensus_dataset import GleasonConsensusDataset
 from src.model_outputs import extract_logits
 from src.models import build_model
+
+
+def _infer_logits(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    inference_mode: str,
+    resized_sliding_window_patch_size: tuple[int, int],
+    resized_sliding_window_overlap: float,
+) -> torch.Tensor:
+    mode = str(inference_mode).strip().lower()
+    if mode == "resized_full":
+        if images.ndim != 4:
+            raise ValueError(f"Expected images shape [B,C,H,W], got {tuple(images.shape)}")
+        h, w = int(images.shape[-2]), int(images.shape[-1])
+        multiple = 32
+        pad_h = (multiple - (h % multiple)) % multiple
+        pad_w = (multiple - (w % multiple)) % multiple
+        x = images
+        if pad_h > 0 or pad_w > 0:
+            x = torch.nn.functional.pad(images, (0, pad_w, 0, pad_h), mode="replicate")
+        logits = extract_logits(model(x))
+        if pad_h > 0 or pad_w > 0:
+            logits = logits[..., :h, :w]
+        return logits
+    if mode == "resized_sliding_window":
+        from monai.inferers import sliding_window_inference
+
+        def _predictor(window: torch.Tensor) -> torch.Tensor:
+            return extract_logits(model(window))
+
+        return sliding_window_inference(
+            inputs=images,
+            roi_size=resized_sliding_window_patch_size,
+            sw_batch_size=1,
+            predictor=_predictor,
+            overlap=resized_sliding_window_overlap,
+        )
+    raise ValueError(
+        "Unsupported inference_mode: "
+        f"{inference_mode!r}. Expected 'resized_full' or 'resized_sliding_window'."
+    )
 
 
 def main() -> int:
@@ -35,7 +77,10 @@ def main() -> int:
         print("SKIP: data paths not found")
         return 0
 
-    ds = GleasonConsensusDataset(**consensus_dataset_kwargs_from_config(cfg))
+    _, val_transform = consensus_train_val_transforms_from_config(cfg)
+    ds = GleasonConsensusDataset(
+        **consensus_dataset_kwargs_from_config(cfg, transform=val_transform)
+    )
     if len(ds) == 0:
         print("SKIP: no consensus samples discovered")
         return 0
@@ -43,21 +88,19 @@ def main() -> int:
     sample = ds[0]
     batch = collate_consensus_batch([sample])
 
-    patch_size = resolve_patch_size(cfg)
-    patch_overlap = resolve_patch_overlap(cfg)
+    inference_mode = resolve_inference_mode(cfg)
+    resized_sliding_window_patch_size = resolve_resized_sliding_window_patch_size(cfg)
+    resized_sliding_window_overlap = resolve_resized_sliding_window_overlap(cfg)
 
     model = build_model(cfg).eval()
 
-    def _predictor(window: torch.Tensor) -> torch.Tensor:
-        return extract_logits(model(window))
-
     with torch.inference_mode():
-        logits = sliding_window_inference(
-            inputs=batch["image"],
-            roi_size=patch_size,
-            sw_batch_size=1,
-            predictor=_predictor,
-            overlap=patch_overlap,
+        logits = _infer_logits(
+            model=model,
+            images=batch["image"],
+            inference_mode=inference_mode,
+            resized_sliding_window_patch_size=resized_sliding_window_patch_size,
+            resized_sliding_window_overlap=resized_sliding_window_overlap,
         )
 
     metrics = compute_multiclass_metrics(

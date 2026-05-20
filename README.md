@@ -111,7 +111,7 @@ make train CONFIG=configs/unet_lite.yaml
 make train CONFIG=configs/pspnet.yaml
 ```
 
-Canonical training configs (`configs/deconver.yaml`, `configs/unet_lite.yaml`, `configs/pspnet.yaml`) enable train-time augmentation by default. Tune via `transforms_*` keys in YAML.
+Canonical training configs (`configs/deconver.yaml`, `configs/unet_lite.yaml`, `configs/pspnet.yaml`) use a resized-only pipeline by default (`resize_short_side`, `train_crop_size`, `inference_mode`) and enable train-time augmentation by default via `transforms_*` keys.
 
 4. Evaluate the segmentation run.
 

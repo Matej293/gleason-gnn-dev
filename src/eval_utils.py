@@ -67,12 +67,20 @@ def collate_consensus_batch(batch: list[dict]) -> dict:
     ignore_masks: list[torch.Tensor] = []
     tissue_masks: list[torch.Tensor] = []
     image_ids: list[str] = []
+    orig_hws: list[tuple[int, int]] = []
+    resized_hws: list[tuple[int, int]] = []
 
     for s in batch:
         images.append(pad_to_hw(s["image"], max_h, max_w, value=0.0))
         hard_masks.append(pad_to_hw(s["hard_mask"], max_h, max_w, value=0))
-        ignore_masks.append(pad_to_hw(s["ignore_mask"], max_h, max_w, value=1))
+        ignore_masks.append(pad_to_hw(s["ignore_mask"], max_h, max_w, value=255))
         image_ids.append(str(s["image_id"]))
+        if "_orig_hw" in s:
+            oh, ow = s["_orig_hw"]
+            orig_hws.append((int(oh), int(ow)))
+        if "_resized_hw" in s:
+            rh, rw = s["_resized_hw"]
+            resized_hws.append((int(rh), int(rw)))
         if "soft_probs" in s:
             soft_probs.append(pad_to_hw(s["soft_probs"], max_h, max_w, value=0.0))
         if "tissue_mask" in s:
@@ -88,6 +96,10 @@ def collate_consensus_batch(batch: list[dict]) -> dict:
         out["soft_probs"] = torch.stack(soft_probs, dim=0)
     if tissue_masks:
         out["tissue_mask"] = torch.stack(tissue_masks, dim=0)
+    if len(orig_hws) == len(batch):
+        out["orig_hw"] = orig_hws
+    if len(resized_hws) == len(batch):
+        out["resized_hw"] = resized_hws
     return out
 
 
@@ -189,6 +201,27 @@ def compute_multiclass_metrics(
     )
 
 
+
+
+def _build_confusion_matrix(
+    pred: torch.Tensor,
+    hard_mask: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    num_classes: int,
+    valid_n: int | None = None,
+) -> torch.Tensor:
+    if valid_n is None:
+        valid_n = int(valid.sum().item())
+    if valid_n <= 0:
+        return torch.zeros((num_classes, num_classes), dtype=torch.float64, device=pred.device)
+
+    pred_v = pred[valid].long().clamp(0, num_classes - 1).reshape(-1)
+    hard_v = hard_mask[valid].long().clamp(0, num_classes - 1).reshape(-1)
+    flat_idx = (hard_v * num_classes) + pred_v
+    flat_counts = torch.bincount(flat_idx, minlength=num_classes * num_classes)
+    return flat_counts.reshape(num_classes, num_classes).to(dtype=torch.float64)
+
 def compute_multiclass_metrics_from_pred(
     pred: torch.Tensor,
     hard_mask: torch.Tensor,
@@ -196,38 +229,42 @@ def compute_multiclass_metrics_from_pred(
     include_background_in_dice: bool,
     include_boundary_metrics: bool = True,
     boundary_metric_cfg: Mapping[str, object] | None = None,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    valid_n: int | None = None,
+    hard_valid_support: torch.Tensor | None = None,
+    ignored_pixel_fraction: float | None = None,
+    tumor_pixels_ignored_fraction: float | None = None,
 ) -> dict[str, float]:
-    valid = ignore_mask == 0
-    valid_n = int(valid.sum().item())
+    valid = valid_mask if valid_mask is not None else (ignore_mask == 0)
+    if valid_n is None:
+        valid_n = int(valid.sum().item())
 
     num_classes = 4
-    dice_values: list[float] = []
-    iou_values: list[float] = []
-    tp_per_class: list[float] = []
-    fp_per_class: list[float] = []
-    fn_per_class: list[float] = []
-    # TODO: Benchmark MONAI/scikit-learn parity for Dice/IoU/F1/Kappa before replacing legacy metrics.
-    for c in range(num_classes):
-        p = (pred == c) & valid
-        t = (hard_mask == c) & valid
-        tp_c = float((p & t).sum().item())
-        fp_c = float((p & (~t)).sum().item())
-        fn_c = float(((~p) & t).sum().item())
-        tp_per_class.append(tp_c)
-        fp_per_class.append(fp_c)
-        fn_per_class.append(fn_c)
-        denom = p.sum().item() + t.sum().item()
-        union = (p | t).sum().item()
-        if denom == 0:
-            dice_values.append(float("nan"))
-        else:
-            inter = (p & t).sum().item()
-            dice_values.append((2.0 * inter + 1e-5) / (denom + 1e-5))
-        if union == 0:
-            iou_values.append(float("nan"))
-        else:
-            inter = (p & t).sum().item()
-            iou_values.append((inter + 1e-5) / (union + 1e-5))
+    conf = _build_confusion_matrix(
+        pred=pred,
+        hard_mask=hard_mask,
+        valid=valid,
+        num_classes=num_classes,
+        valid_n=valid_n,
+    )
+    diag = conf.diag()
+    row = conf.sum(dim=1)
+    col = conf.sum(dim=0)
+    tp_per_class = diag
+    fp_per_class = col - diag
+    fn_per_class = row - diag
+
+    denom = row + col
+    union = row + col - diag
+    dice_t = torch.full((num_classes,), float("nan"), dtype=torch.float64, device=pred.device)
+    iou_t = torch.full((num_classes,), float("nan"), dtype=torch.float64, device=pred.device)
+    dice_valid = denom > 0
+    iou_valid = union > 0
+    dice_t[dice_valid] = (2.0 * diag[dice_valid] + 1e-5) / (denom[dice_valid] + 1e-5)
+    iou_t[iou_valid] = (diag[iou_valid] + 1e-5) / (union[iou_valid] + 1e-5)
+    dice_values = [float(x) for x in dice_t.tolist()]
+    iou_values = [float(x) for x in iou_t.tolist()]
 
     start = 0 if include_background_in_dice else 1
     used = [d for d in dice_values[start:] if not math.isnan(d)]
@@ -235,8 +272,11 @@ def compute_multiclass_metrics_from_pred(
     macro_dice = float(sum(used) / len(used)) if used else float("nan")
     weighted_num = 0.0
     weighted_den = 0.0
+    if hard_valid_support is None:
+        hard_valid_support = row
+    hard_valid_support = hard_valid_support.to(device=pred.device, dtype=torch.float64)
     for c in range(start, num_classes):
-        support = int(((hard_mask == c) & valid).sum().item())
+        support = int(hard_valid_support[c].item())
         dice_c = dice_values[c]
         if support > 0 and not math.isnan(dice_c):
             weighted_num += float(support) * float(dice_c)
@@ -247,9 +287,9 @@ def compute_multiclass_metrics_from_pred(
 
     # For single-label segmentation, per-class Dice equals per-class F1.
     macro_f1 = macro_dice
-    tp_sum = float(sum(tp_per_class))
-    fp_sum = float(sum(fp_per_class))
-    fn_sum = float(sum(fn_per_class))
+    tp_sum = float(tp_per_class.sum().item())
+    fp_sum = float(fp_per_class.sum().item())
+    fn_sum = float(fn_per_class.sum().item())
     micro_f1 = (
         (2.0 * tp_sum) / ((2.0 * tp_sum) + fp_sum + fn_sum + 1e-8)
         if valid_n > 0
@@ -258,18 +298,7 @@ def compute_multiclass_metrics_from_pred(
 
     # Multiclass Cohen's kappa over valid pixels.
     if valid_n > 0:
-        conf = torch.zeros((num_classes, num_classes), dtype=torch.float64, device=pred.device)
-        pred_v = pred[valid].long().clamp(0, num_classes - 1).view(-1)
-        hard_v = hard_mask[valid].long().clamp(0, num_classes - 1).view(-1)
-        flat_idx = (hard_v * num_classes) + pred_v
-        conf.view(-1).index_add_(
-            0,
-            flat_idx,
-            torch.ones_like(flat_idx, dtype=torch.float64, device=pred.device),
-        )
-        po = float(conf.diag().sum().item() / float(valid_n))
-        row = conf.sum(dim=1)
-        col = conf.sum(dim=0)
+        po = float(diag.sum().item() / float(valid_n))
         pe = float((row * col).sum().item() / float(valid_n * valid_n))
         denom = 1.0 - pe
         cohen_kappa = float((po - pe) / denom) if abs(denom) > 1e-12 else float("nan")
@@ -285,23 +314,23 @@ def compute_multiclass_metrics_from_pred(
     grade5_dice = dice_values[3] if len(dice_values) > 3 else float("nan")
     grade5_iou = iou_values[3] if len(iou_values) > 3 else float("nan")
 
-    p_pos = (pred > 0) & valid
-    t_pos = (hard_mask > 0) & valid
-    tp = float((p_pos & t_pos).sum().item())
-    fn = float((~p_pos & t_pos).sum().item())
-    fp = float((p_pos & ~t_pos).sum().item())
+    tp = float(conf[1:, 1:].sum().item())
+    fn = float(conf[1:, 0].sum().item())
+    fp = float(conf[0, 1:].sum().item())
 
     sens = (tp + 1e-6) / (tp + fn + 1e-6) if (tp + fn) > 0 else float("nan")
     prec = (tp + 1e-6) / (tp + fp + 1e-6) if (tp + fp) > 0 else float("nan")
     iou_tumor = (tp + 1e-6) / (tp + fp + fn + 1e-6) if (tp + fp + fn) > 0 else float("nan")
 
-    ignored_fraction = float((~valid).float().mean().item())
-    tumor_pixels = hard_mask > 0
-    tumor_ignored_den = float(tumor_pixels.sum().item())
-    tumor_ignored_num = float((tumor_pixels & (~valid)).sum().item())
-    tumor_ignored_fraction = (
-        (tumor_ignored_num / tumor_ignored_den) if tumor_ignored_den > 0 else float("nan")
-    )
+    if ignored_pixel_fraction is None:
+        ignored_pixel_fraction = float((~valid).float().mean().item())
+    if tumor_pixels_ignored_fraction is None:
+        tumor_pixels = hard_mask > 0
+        tumor_ignored_den = float(tumor_pixels.sum().item())
+        tumor_ignored_num = float((tumor_pixels & (~valid)).sum().item())
+        tumor_pixels_ignored_fraction = (
+            (tumor_ignored_num / tumor_ignored_den) if tumor_ignored_den > 0 else float("nan")
+        )
 
     metrics = {
         "macro_dice": macro_dice,
@@ -324,8 +353,8 @@ def compute_multiclass_metrics_from_pred(
         "iou_tumor_vs_benign": iou_tumor,
         "sensitivity": sens,
         "precision": prec,
-        "ignored_pixel_fraction": ignored_fraction,
-        "tumor_pixels_ignored_fraction": tumor_ignored_fraction,
+        "ignored_pixel_fraction": ignored_pixel_fraction,
+        "tumor_pixels_ignored_fraction": tumor_pixels_ignored_fraction,
     }
 
     if include_boundary_metrics:
@@ -395,8 +424,16 @@ def postprocess_predictions(
     if not min_component_size_by_class:
         return out
 
+    active_classes = [
+        (int(cls), int(min_size))
+        for cls, min_size in min_component_size_by_class.items()
+        if int(cls) > 0 and int(min_size) > 1
+    ]
+
     def _fill_internal_tumor_holes(sample: np.ndarray, sample_valid: np.ndarray) -> np.ndarray:
         tumor = (sample > 0) & sample_valid
+        if not tumor.any():
+            return sample
         holes = np.logical_and(binary_fill_holes(tumor), ~tumor) & sample_valid
         if not holes.any():
             return sample
@@ -418,16 +455,15 @@ def postprocess_predictions(
             sample[hole] = fill_cls
         return sample
 
-    out_np = out.detach().cpu().numpy()
-    valid_np = valid.detach().cpu().numpy()
-    for b in range(out_np.shape[0]):
-        sample = out_np[b]
-        sample_valid = valid_np[b]
-        for cls, min_size in min_component_size_by_class.items():
-            cls_id = int(cls)
-            min_sz = int(min_size)
-            if cls_id <= 0 or min_sz <= 1:
-                continue
+    tumor_present = ((out > 0) & valid).flatten(1).any(dim=1)
+    if not bool(tumor_present.any().item()):
+        return out
+
+    for b in torch.nonzero(tumor_present, as_tuple=False).view(-1).tolist():
+        sample = out[b].detach().cpu().numpy().copy()
+        sample_valid = valid[b].detach().cpu().numpy()
+
+        for cls_id, min_sz in active_classes:
             mask = (sample == cls_id) & sample_valid
             if not mask.any():
                 continue
@@ -436,10 +472,11 @@ def postprocess_predictions(
             keep_ids = {int(i) for i, c in zip(ids, counts) if int(i) != 0 and int(c) >= min_sz}
             cleaned = np.isin(comps, list(keep_ids))
             sample[np.logical_and(mask, ~cleaned)] = 0
-        sample = _fill_internal_tumor_holes(sample, sample_valid)
-        out_np[b] = sample
 
-    return torch.from_numpy(out_np).to(device=out.device, dtype=out.dtype)
+        sample = _fill_internal_tumor_holes(sample, sample_valid)
+        out[b] = torch.from_numpy(sample).to(device=out.device, dtype=out.dtype)
+
+    return out
 
 
 def load_test_indices_from_manifest(dataset_items: list[dict], split_manifest_path: Path) -> list[int]:

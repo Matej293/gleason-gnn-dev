@@ -1,10 +1,10 @@
 experiment_name: deconver_consensus
 epochs: 200
-batch_size: 2
+batch_size: 1
 val_batch_size: 1
 learning_rate: 2e-4
 weight_decay: 1e-5
-num_workers: 6
+num_workers: 8
 device: cuda
 base_output_dir: ./outputs/runs
 random_seed: 42
@@ -30,10 +30,16 @@ split_search_max_attempts: 100
 # Loader robustness and tissue/background handling
 renormalize_probs: true
 enforce_background_ignore: true
-patch_size: [768, 768]
-patch_overlap: 0.25
-patch_tissue_filter_enabled: true
-patch_min_tissue_fraction: 0.10
+resize_short_side: 1024
+train_crop_enabled: true
+train_crop_size: [512, 512]
+train_resize_random_scale_enabled: false
+train_resize_random_scale_min: 0.9
+train_resize_random_scale_max: 1.1
+inference_resize_short_side: 1024
+inference_mode: resized_full
+resized_sliding_window_patch_size: [512, 512]
+resized_sliding_window_overlap: 0.25
 otsu_close_radius: 3
 otsu_min_object_size: 4096
 otsu_min_hole_size: 4096
@@ -43,14 +49,12 @@ probs_eps: 1e-8
 transforms_enabled: true
 transforms_profile: light
 transforms_seed_sync: true
-transforms_patch_size: null
 transforms_profiles:
   light:
     flip_h: 0.50
     flip_v: 0.50
     rotate90: 0.20
     affine: 0.15
-    crop: 0.00
     scale_intensity: 0.15
     adjust_contrast: 0.10
     gaussian_noise: 0.10
@@ -61,7 +65,6 @@ transforms_profiles:
     flip_v: 0.50
     rotate90: 0.30
     affine: 0.25
-    crop: 0.00
     scale_intensity: 0.20
     adjust_contrast: 0.15
     gaussian_noise: 0.15
@@ -72,7 +75,6 @@ transforms_profiles:
     flip_v: 0.50
     rotate90: 0.40
     affine: 0.35
-    crop: 0.00
     scale_intensity: 0.25
     adjust_contrast: 0.20
     gaussian_noise: 0.20
@@ -132,7 +134,7 @@ qc_per_rater_penalty: 0.1
 qc_min_weight: 0.2
 
 # Validation
-val_every: 2
+val_every: 1
 val_start_epoch: 1
 eval_leave_one_rater_out: false
 
