@@ -34,10 +34,15 @@ GNN_BUILD_BATCH_SIZE ?= 4
 GNN_BUILD_NUM_WORKERS ?= 8
 GNN_BUILD_INFERENCE_MODE ?= resized_sliding_window
 GNN_CHECKPOINT ?=
+GNN_BUILD_OUTPUT_DIR ?=
+GNN_FELZ_AUTO_OUTPUT_DIR ?= outputs/graphs_felz
 GNN_SUPERPIXEL_PRESET ?=
 GNN_NUM_SEGMENTS ?= 300
 GNN_COMPACTNESS ?= 10.0
 GNN_SIGMA ?= 1.0
+GNN_SUPERPIXEL_METHOD ?= slic
+GNN_FELZENSZWALB_SCALE ?= 100.0
+GNN_FELZENSZWALB_MIN_SIZE ?= 20
 GNN_TINY_SUPERPIXEL_MAX_PIXELS ?= 8
 GNN_COMPARISON_DIR ?= $(GNN_COMPARISON_DIR_PLACEHOLDER)
 GNN_RUNS_ROOT ?= outputs/gnn_runs
@@ -72,8 +77,9 @@ VIZ_GNN_MODULE := src.cli.visualize_gnn_predictions
 SELECT_BEST_GNN_MODULE := src.cli.select_best_gnn_run
 VIZ_GNN_COMPARISON_MODULE := src.cli.visualize_gnn_baseline_comparison
 
-GNN_BUILD_COMMON_ARGS := --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --inference-mode $(GNN_BUILD_INFERENCE_MODE) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) --edge-policy $(GNN_EDGE_POLICY) --edge-knn-k $(GNN_EDGE_KNN_K) --edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE)
-GNN_BUILD_OPTIONAL_ARGS := $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) $(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),)
+GNN_BUILD_AUTO_OUTPUT_DIR := $(if $(GNN_BUILD_OUTPUT_DIR),$(GNN_BUILD_OUTPUT_DIR),$(if $(filter felzenszwalb,$(GNN_SUPERPIXEL_METHOD)),$(GNN_FELZ_AUTO_OUTPUT_DIR),))
+GNN_BUILD_COMMON_ARGS := --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --inference-mode $(GNN_BUILD_INFERENCE_MODE) --superpixel-method $(GNN_SUPERPIXEL_METHOD) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --felzenszwalb-scale $(GNN_FELZENSZWALB_SCALE) --felzenszwalb-min-size $(GNN_FELZENSZWALB_MIN_SIZE) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) --edge-policy $(GNN_EDGE_POLICY) --edge-knn-k $(GNN_EDGE_KNN_K) --edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE)
+GNN_BUILD_OPTIONAL_ARGS := $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) $(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),) $(if $(GNN_BUILD_AUTO_OUTPUT_DIR),--output-dir $(GNN_BUILD_AUTO_OUTPUT_DIR),)
 
 define require_non_placeholder
 @if [ -z "$($(1))" ] || [ "$($(1))" = "$(2)" ]; then echo "Usage: $(3)"; exit 1; fi
@@ -125,7 +131,9 @@ help:
 	@echo "  RUN=$(RUN)"
 	@echo "  GNN_GRAPHS_ROOT=$(GNN_GRAPHS_ROOT)"
 	@echo "  GNN_BUILD_BATCH_SIZE=$(GNN_BUILD_BATCH_SIZE) GNN_BUILD_NUM_WORKERS=$(GNN_BUILD_NUM_WORKERS)"
-	@echo "  GNN_EDGE_POLICY=$(GNN_EDGE_POLICY) GNN_EDGE_KNN_K=$(GNN_EDGE_KNN_K) GNN_EDGE_KNN_MAX_DISTANCE=$(GNN_EDGE_KNN_MAX_DISTANCE)"
+	@echo "  GNN_SUPERPIXEL_METHOD=$(GNN_SUPERPIXEL_METHOD) GNN_EDGE_POLICY=$(GNN_EDGE_POLICY)"
+	@echo "  GNN_FELZ_AUTO_OUTPUT_DIR=$(GNN_FELZ_AUTO_OUTPUT_DIR) GNN_BUILD_OUTPUT_DIR=$(GNN_BUILD_OUTPUT_DIR)"
+	@echo "  GNN_EDGE_KNN_K=$(GNN_EDGE_KNN_K) GNN_EDGE_KNN_MAX_DISTANCE=$(GNN_EDGE_KNN_MAX_DISTANCE)"
 
 train:
 	$(PY) -m $(TRAIN_MODULE) --config $(CONFIG)

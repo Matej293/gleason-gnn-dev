@@ -10,6 +10,7 @@ import torch
 from src.pipelines.graph.graph_build import build_edges, build_touch_adjacency_edges
 from src.pipelines.graph.node_features import compute_node_features
 from src.pipelines.graph.node_labels import assign_majority_node_labels
+from src.pipelines.graph.superpixel_methods import generate_superpixels
 
 
 def _load_build_graphs_module():
@@ -130,3 +131,36 @@ def test_compute_node_features_supports_non_contiguous_superpixel_ids() -> None:
     node_ids, feats = compute_node_features(img, sp, probs)
     assert node_ids.tolist() == [2, 7]
     assert feats.shape == (2, 22)
+
+
+def test_generate_superpixels_felzenszwalb_respects_tissue_mask() -> None:
+    img = np.zeros((16, 16, 3), dtype=np.uint8)
+    img[..., 0] = np.tile(np.arange(16, dtype=np.uint8), (16, 1))
+    tissue = np.zeros((16, 16), dtype=np.uint8)
+    tissue[3:13, 3:13] = 1
+
+    sp = generate_superpixels(
+        image_rgb=img,
+        tissue_mask=tissue,
+        method="felzenszwalb",
+        felzenszwalb_scale=80.0,
+        felzenszwalb_sigma=0.8,
+        felzenszwalb_min_size=8,
+    )
+
+    assert sp.shape == tissue.shape
+    assert np.all(sp[tissue == 0] == -1)
+    assert np.any(sp[tissue == 1] >= 0)
+
+
+def test_generate_superpixels_raises_for_unsupported_method() -> None:
+    img = np.zeros((4, 4, 3), dtype=np.uint8)
+    tissue = np.ones((4, 4), dtype=np.uint8)
+
+    try:
+        _ = generate_superpixels(image_rgb=img, tissue_mask=tissue, method="unknown")
+    except ValueError as exc:
+        assert "Unsupported superpixel method" in str(exc)
+        return
+
+    raise AssertionError("Expected ValueError for unsupported superpixel method")

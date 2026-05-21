@@ -35,7 +35,7 @@ from src.pipelines.graph import (
     assign_majority_node_labels,
     build_edges,
     compute_node_features,
-    generate_slic_superpixels,
+    generate_superpixels,
 )
 from src.models import build_model
 from src.common.model_outputs import extract_logits as _extract_logits
@@ -77,10 +77,23 @@ def parse_args() -> argparse.Namespace:
     )
 
     sp_group = p.add_argument_group("Superpixel / Graph")
+    sp_group.add_argument("--superpixel-method", choices=["slic", "felzenszwalb"], default="slic")
     sp_group.add_argument("--num-segments", type=int, default=300)
     sp_group.add_argument("--compactness", type=float, default=10.0)
     sp_group.add_argument("--superpixel-preset", choices=["low", "med", "high"], default=None)
     sp_group.add_argument("--sigma", type=float, default=1.0)
+    sp_group.add_argument(
+        "--felzenszwalb-scale",
+        type=float,
+        default=100.0,
+        help="Felzenszwalb observation scale (used only with --superpixel-method felzenszwalb).",
+    )
+    sp_group.add_argument(
+        "--felzenszwalb-min-size",
+        type=int,
+        default=20,
+        help="Minimum Felzenszwalb component size (used only with --superpixel-method felzenszwalb).",
+    )
     sp_group.add_argument("--edge-policy", choices=["touch", "knn", "touch_plus_knn"], default="touch")
     sp_group.add_argument("--edge-knn-k", type=int, default=2)
     sp_group.add_argument(
@@ -158,11 +171,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.prefetch_factor = validate_positive_int(args.prefetch_factor, field_name="prefetch_factor")
     args.compactness = float(args.compactness)
     args.sigma = float(args.sigma)
+    args.felzenszwalb_scale = float(args.felzenszwalb_scale)
+    args.felzenszwalb_min_size = validate_positive_int(
+        args.felzenszwalb_min_size,
+        field_name="felzenszwalb_min_size",
+    )
     args.edge_knn_max_distance = float(args.edge_knn_max_distance)
     if args.compactness < 0.0:
         raise ValueError(f"compactness must be >= 0, got {args.compactness}.")
     if args.sigma < 0.0:
         raise ValueError(f"sigma must be >= 0, got {args.sigma}.")
+    if args.felzenszwalb_scale <= 0.0:
+        raise ValueError(f"felzenszwalb_scale must be > 0, got {args.felzenszwalb_scale}.")
     if args.edge_knn_max_distance < 0.0:
         raise ValueError(
             "edge_knn_max_distance must be >= 0; use 0 to disable threshold."
@@ -367,12 +387,16 @@ def main() -> None:
 
             for i, image_id in enumerate(image_ids):
                 image_rgb = (batch["image"][i].numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
-                sp = generate_slic_superpixels(
+                sp = generate_superpixels(
                     image_rgb=image_rgb,
                     tissue_mask=tissue_mask[i].numpy().astype(np.uint8),
-                    num_segments=num_segments,
-                    compactness=compactness,
-                    sigma=args.sigma,
+                    method=args.superpixel_method,
+                    num_segments=int(num_segments),
+                    compactness=float(compactness),
+                    slic_sigma=float(args.sigma),
+                    felzenszwalb_scale=float(args.felzenszwalb_scale),
+                    felzenszwalb_sigma=float(args.sigma),
+                    felzenszwalb_min_size=int(args.felzenszwalb_min_size),
                 )
                 edge_index = build_edges(
                     sp,
@@ -464,9 +488,12 @@ def main() -> None:
             "legacy_prob_slice": [9, 13],
         },
         "build_args": {
+            "superpixel_method": args.superpixel_method,
             "num_segments": num_segments,
             "compactness": compactness,
             "sigma": args.sigma,
+            "felzenszwalb_scale": float(args.felzenszwalb_scale),
+            "felzenszwalb_min_size": int(args.felzenszwalb_min_size),
             "min_majority_fraction": args.min_majority_fraction,
             "superpixel_preset": args.superpixel_preset,
             "tiny_superpixel_max_pixels": int(args.tiny_superpixel_max_pixels),
@@ -486,9 +513,12 @@ def main() -> None:
             "resized_sliding_window_overlap": float(resized_sliding_window_overlap),
         },
         "superpixel_params": {
+            "method": args.superpixel_method,
             "num_segments": num_segments,
             "compactness": compactness,
             "sigma": args.sigma,
+            "felzenszwalb_scale": float(args.felzenszwalb_scale),
+            "felzenszwalb_min_size": int(args.felzenszwalb_min_size),
             "preset": args.superpixel_preset,
         },
         "graph_params": {
