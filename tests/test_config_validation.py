@@ -224,3 +224,22 @@ def test_validate_metrics_block_rejects_invalid_boundary_percentile() -> None:
     }
     with pytest.raises(ValueError, match="hausdorff_percentile"):
         validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_deconver_accepts_explicit_decoder_depth() -> None:
+    cfg = _base_cfg()
+    cfg["deconver_encoder_depth"] = [1, 1, 1, 1, 1]
+    cfg["deconver_encoder_width"] = [32, 64, 128, 256, 512]
+    cfg["deconver_strides"] = [1, 2, 2, 2, 2]
+    cfg["deconver_decoder_depth"] = [1, 1, 1, 1]
+    validate_deconver_config(cfg, for_eval=False, require_paths=False)
+
+
+def test_validate_deconver_rejects_decoder_depth_len_mismatch() -> None:
+    cfg = _base_cfg()
+    cfg["deconver_encoder_depth"] = [1, 1, 1, 1, 1]
+    cfg["deconver_encoder_width"] = [32, 64, 128, 256, 512]
+    cfg["deconver_strides"] = [1, 2, 2, 2, 2]
+    cfg["deconver_decoder_depth"] = [1, 1, 1]
+    with pytest.raises(ValueError, match="deconver_decoder_depth length"):
+        validate_deconver_config(cfg, for_eval=False, require_paths=False)

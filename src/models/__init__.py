@@ -65,19 +65,27 @@ def build_model(cfg: dict) -> nn.Module:
             "Check that the submodule is present and its dependencies are installed."
         )
 
+    encoder_depth_cfg = list(cfg.get("deconver_encoder_depth", [1, 1, 1, 1]))
+    decoder_depth_cfg = list(
+        cfg.get(
+            "deconver_decoder_depth",
+            [1] * max(1, len(encoder_depth_cfg) - 1),
+        )
+    )
+
     deep_supervision = bool(cfg.get("deep_supervision", False))
     num_deep_supr: bool | int = False
     if deep_supervision:
-        encoder_depth = cfg.get("deconver_encoder_depth", [1, 1, 1, 1])
-        num_deep_supr = max(1, len(encoder_depth) - 1)
+        num_deep_supr = max(1, len(encoder_depth_cfg) - 1)
 
     return _Deconver(  # type: ignore[misc]
         in_channels=in_channels,
         out_channels=out_channels,
         spatial_dims=2,
-        encoder_depth=tuple(cfg.get("deconver_encoder_depth", [1, 1, 1, 1])),
+        encoder_depth=tuple(encoder_depth_cfg),
         encoder_width=tuple(cfg.get("deconver_encoder_width", [64, 128, 256, 512])),
         strides=tuple(cfg.get("deconver_strides", [1, 2, 2, 2])),
+        decoder_depth=tuple(decoder_depth_cfg),
         norm=nn.InstanceNorm2d,
         kernel_size=tuple(cfg.get("deconver_kernel_size", [3, 3])),
         groups=cfg.get("deconver_groups", -1),

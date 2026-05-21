@@ -1,4 +1,4 @@
-experiment_name: deconver_consensus
+experiment_name: deconver_external_pretrained
 epochs: 200
 batch_size: 1
 val_batch_size: 1
@@ -98,9 +98,10 @@ spatial_dims: 2
 input_channels: 3
 out_channels: 4
 deep_supervision: false
-deconver_encoder_depth: [1, 1, 1, 1]
-deconver_encoder_width: [64, 128, 256, 512]
-deconver_strides: [1, 2, 2, 2]
+deconver_encoder_depth: [1, 1, 1, 1, 1, 1]
+deconver_encoder_width: [32, 64, 128, 256, 512, 512]
+deconver_strides: [1, 2, 2, 2, 2, 2]
+deconver_decoder_depth: [1, 1, 1, 1, 1]
 deconver_kernel_size: [5, 5]
 deconver_groups: -1
 deconver_ndc_ratio: 4
@@ -146,7 +147,7 @@ use_compile: false
 # Checkpointing
 keep_last_checkpoints: 5
 # Optional warm-start source (partial load; ignored when resume_checkpoint/--resume is set)
-pretrained_checkpoint: null
+pretrained_checkpoint: data/checkpoints/model_fold=0_checkpoint_epoch=500.pt
 
 # Best checkpoint selection
 best_ckpt_w_macro_dice: 0.45

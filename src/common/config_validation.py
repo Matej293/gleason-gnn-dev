@@ -205,6 +205,41 @@ def validate_deconver_config(
         if any(int(x) <= 0 for x in deconver_strides):
             raise ValueError("deconver_strides entries must all be > 0.")
 
+        encoder_depth = cfg.get("deconver_encoder_depth", [1, 1, 1, 1])
+        if not isinstance(encoder_depth, (list, tuple)) or not encoder_depth:
+            raise ValueError("deconver_encoder_depth must be a non-empty list/tuple for model='deconver'.")
+        if any(int(x) <= 0 for x in encoder_depth):
+            raise ValueError("deconver_encoder_depth entries must all be > 0.")
+
+        encoder_width = cfg.get("deconver_encoder_width", [64, 128, 256, 512])
+        if not isinstance(encoder_width, (list, tuple)) or not encoder_width:
+            raise ValueError("deconver_encoder_width must be a non-empty list/tuple for model='deconver'.")
+        if any(int(x) <= 0 for x in encoder_width):
+            raise ValueError("deconver_encoder_width entries must all be > 0.")
+
+        if len(encoder_width) != len(encoder_depth):
+            raise ValueError(
+                "deconver_encoder_width length must match deconver_encoder_depth length. "
+                f"Got {len(encoder_width)} vs {len(encoder_depth)}."
+            )
+        if len(deconver_strides) != len(encoder_depth):
+            raise ValueError(
+                "deconver_strides length must match deconver_encoder_depth length. "
+                f"Got {len(deconver_strides)} vs {len(encoder_depth)}."
+            )
+
+        decoder_depth = cfg.get("deconver_decoder_depth", None)
+        if decoder_depth is not None:
+            if not isinstance(decoder_depth, (list, tuple)) or not decoder_depth:
+                raise ValueError("deconver_decoder_depth must be a non-empty list/tuple when provided.")
+            if any(int(x) <= 0 for x in decoder_depth):
+                raise ValueError("deconver_decoder_depth entries must all be > 0.")
+            if len(decoder_depth) != max(0, len(encoder_depth) - 1):
+                raise ValueError(
+                    "deconver_decoder_depth length must be len(deconver_encoder_depth) - 1. "
+                    f"Got {len(decoder_depth)} vs {max(0, len(encoder_depth) - 1)}."
+                )
+
     if model_name == "unet_lite":
         base_channels = int(cfg.get("unet_lite_base_channels", 32))
         if base_channels <= 0:

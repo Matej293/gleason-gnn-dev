@@ -56,6 +56,7 @@ from src.common.utils import (
     create_run_dir,
     ensure_cuda_binary_compatibility,
     load_checkpoint,
+    load_pretrained_checkpoint,
     rotate_checkpoints,
     save_checkpoint,
     save_config_copy,
@@ -1827,6 +1828,13 @@ def parse_args() -> argparse.Namespace:
         metavar="CHECKPOINT",
         help="Checkpoint path to resume from (CLI takes precedence over config resume_checkpoint).",
     )
+    io_group.add_argument(
+        "--pretrained",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT",
+        help="Checkpoint path for warm-start model weights (CLI takes precedence over config pretrained_checkpoint). Ignored when resume is used.",
+    )
 
     split_group = parser.add_argument_group("Split Control")
     split_group.add_argument(
@@ -1855,6 +1863,12 @@ def main() -> None:
     if args.resume is not None:
         resume_from_cli = str(
             require_existing_file(args.resume, label="Resume checkpoint")
+        )
+
+    pretrained_from_cli: str | None = None
+    if args.pretrained is not None:
+        pretrained_from_cli = str(
+            require_existing_file(args.pretrained, label="Pretrained checkpoint")
         )
 
     cfg_model = str(cfg.get("model", "deconver")).lower()
@@ -2268,6 +2282,47 @@ def main() -> None:
                 label="Config resume_checkpoint",
             )
         )
+
+    pretrained_path: str | None = None
+    if resume_path is None:
+        pretrained_candidate = pretrained_from_cli
+        if pretrained_candidate is None and cfg.get("pretrained_checkpoint"):
+            pretrained_candidate = str(
+                require_existing_file(
+                    cfg["pretrained_checkpoint"],
+                    label="Config pretrained_checkpoint",
+                )
+            )
+        pretrained_path = pretrained_candidate
+    elif pretrained_from_cli is not None or cfg.get("pretrained_checkpoint"):
+        logger.warning(
+            "Ignoring pretrained checkpoint because resume checkpoint is set."
+        )
+
+    if pretrained_path:
+        pretrain_info = load_pretrained_checkpoint(
+            path=pretrained_path,
+            model=model,
+            device=device,
+        )
+        skipped_shape_keys = pretrain_info["skipped_shape_mismatch_keys"]
+        skipped_unexpected_keys = pretrain_info["skipped_unexpected_keys"]
+        logger.info(
+            "Warm-start loaded %d/%d tensors from %s (shape_mismatch=%d, unexpected=%d)",
+            pretrain_info["loaded_count"],
+            pretrain_info["target_param_count"],
+            pretrained_path,
+            len(skipped_shape_keys),
+            len(skipped_unexpected_keys),
+        )
+        if skipped_shape_keys:
+            preview = ", ".join(str(k) for k in skipped_shape_keys[:12])
+            logger.info(
+                "Warm-start skipped shape-mismatch keys (first %d): %s",
+                min(12, len(skipped_shape_keys)),
+                preview,
+            )
+
     wandb_logger = WandbLogger(cfg=cfg, run_dir=run_dir, resume_checkpoint=resume_path)
     if resume_path:
         ckpt = load_checkpoint(

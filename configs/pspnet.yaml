@@ -137,6 +137,8 @@ use_amp: true
 amp_dtype: fp16
 use_compile: false
 keep_last_checkpoints: 5
+# Optional warm-start source (partial load; ignored when resume_checkpoint/--resume is set)
+pretrained_checkpoint: null
 
 best_ckpt_w_macro_dice: 0.45
 best_ckpt_w_weighted_macro_dice: 0.15
