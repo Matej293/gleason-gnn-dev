@@ -13,5 +13,4 @@ monai==1.4.0
 pyyaml
 Pillow
 tqdm
-SimpleITK
 segmentation-models-pytorch

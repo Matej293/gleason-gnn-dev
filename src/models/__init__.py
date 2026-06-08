@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 
 import torch.nn as nn
-from src.models.unet_lite import UNetLite
 from src.models.pspnet import PSPNet
 
 _DECONVER_ROOT = Path(__file__).parent / "deconver"
@@ -31,12 +30,6 @@ def build_model(cfg: dict) -> nn.Module:
         raise ValueError("input_channels must be > 0")
 
     out_channels = int(cfg.get("out_channels", 4))
-    if name == "unet_lite":
-        return UNetLite(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            base_channels=int(cfg.get("unet_lite_base_channels", 32)),
-        )
     if name == "pspnet":
         encoder_weights_cfg = cfg.get("pspnet_encoder_weights", None)
         if encoder_weights_cfg is None:
@@ -56,7 +49,7 @@ def build_model(cfg: dict) -> nn.Module:
 
     if name != "deconver":
         raise ValueError(
-            f"Unsupported model {name!r}. Expected 'deconver', 'unet_lite', or 'pspnet'."
+            f"Unsupported model {name!r}. Expected 'deconver' or 'pspnet'."
         )
     if not _DECONVER_AVAILABLE:
         raise ValueError(

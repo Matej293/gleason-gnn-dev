@@ -177,9 +177,9 @@ def validate_deconver_config(
     _validate_resized_schema(cfg)
 
     model_name = str(cfg.get("model", "")).strip().lower()
-    if model_name not in {"deconver", "unet_lite", "pspnet"}:
+    if model_name not in {"deconver", "pspnet"}:
         raise ValueError(
-            f"Expected model in ['deconver', 'unet_lite', 'pspnet'], got {model_name!r}"
+            f"Expected model in ['deconver', 'pspnet'], got {model_name!r}"
         )
 
     image_subdirs = cfg.get("image_subdirs")
@@ -240,28 +240,21 @@ def validate_deconver_config(
                     f"Got {len(decoder_depth)} vs {max(0, len(encoder_depth) - 1)}."
                 )
 
-    if model_name == "unet_lite":
-        base_channels = int(cfg.get("unet_lite_base_channels", 32))
-        if base_channels <= 0:
-            raise ValueError(
-                f"unet_lite_base_channels must be > 0, got {base_channels}"
-            )
-
     if model_name == "pspnet":
         if input_channels != 3:
             raise ValueError(
                 f"pspnet requires input_channels=3, got {input_channels}"
             )
-        pspnet_loss_mode = str(cfg.get("pspnet_loss_mode", "consensus")).strip().lower()
-        if pspnet_loss_mode not in {"consensus", "gleason_ce", "gleason_ce_soft"}:
+        pspnet_loss_mode = str(cfg.get("pspnet_loss_mode", "gleason_ce_soft")).strip().lower()
+        if pspnet_loss_mode != "gleason_ce_soft":
             raise ValueError(
-                "pspnet_loss_mode must be one of ['consensus', 'gleason_ce', 'gleason_ce_soft'], "
+                "pspnet_loss_mode must be 'gleason_ce_soft', "
                 f"got {pspnet_loss_mode!r}"
             )
         pspnet_soft_term = str(cfg.get("pspnet_soft_term", "ce")).strip().lower()
-        if pspnet_soft_term not in {"ce", "kl"}:
+        if pspnet_soft_term != "ce":
             raise ValueError(
-                "pspnet_soft_term must be one of ['ce', 'kl'], "
+                "pspnet_soft_term must be 'ce', "
                 f"got {pspnet_soft_term!r}"
             )
         pspnet_soft_weight = float(cfg.get("pspnet_soft_weight", 0.2))
@@ -286,15 +279,13 @@ def validate_deconver_config(
                     f"got {encoder_weights!r}"
                 )
 
-    soft_label_loss = str(cfg.get("soft_label_loss", "ce")).strip().lower()
-    if soft_label_loss not in {"ce", "kl"}:
-        raise ValueError(f"soft_label_loss must be 'ce' or 'kl', got {soft_label_loss!r}")
-    loss_variant = str(cfg.get("loss_variant", "soft_dice")).strip().lower()
-    if loss_variant not in {"soft_dice", "focal_dice", "tversky_dice"}:
-        raise ValueError(
-            "loss_variant must be one of ['soft_dice','focal_dice','tversky_dice'], "
-            f"got {loss_variant!r}"
-        )
+    if model_name == "deconver":
+        soft_label_loss = str(cfg.get("soft_label_loss", "ce")).strip().lower()
+        if soft_label_loss != "ce":
+            raise ValueError(f"soft_label_loss must be 'ce', got {soft_label_loss!r}")
+        loss_variant = str(cfg.get("loss_variant", "soft_dice")).strip().lower()
+        if loss_variant != "soft_dice":
+            raise ValueError(f"loss_variant must be 'soft_dice', got {loss_variant!r}")
 
     confidence_threshold = float(cfg.get("confidence_threshold", 0.6))
     if not 0.0 <= confidence_threshold <= 1.0:

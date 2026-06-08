@@ -82,9 +82,9 @@ def soft_loss_map(
     soft_probs: torch.Tensor,
     loss_type: str,
 ) -> torch.Tensor:
+    if loss_type != "ce":
+        raise ValueError(f"Unsupported soft loss type {loss_type!r}. Expected 'ce'.")
     log_p = F.log_softmax(logits.float(), dim=1)
-    if loss_type == "kl":
-        return F.kl_div(log_p, soft_probs.float(), reduction="none").sum(dim=1)
     return -(soft_probs.float() * log_p).sum(dim=1)
 
 
@@ -225,25 +225,16 @@ def single_scale_loss_from_context(
     include_background_in_dice: bool,
     exclude_absent_classes_in_dice_loss: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    if loss_variant != "soft_dice":
+        raise ValueError(
+            f"Unsupported loss_variant {loss_variant!r}. Expected 'soft_dice'."
+        )
     soft_map = soft_loss_map(logits, ctx["soft_rs"], loss_type=soft_loss_type)
     soft_map = soft_map * ctx["expected_cls_weight"]
 
     soft_num = (soft_map * ctx["valid_float"] * ctx["pixel_weight"]).sum()
     soft_den = (ctx["valid_float"] * ctx["pixel_weight"]).sum().clamp_min(1e-8)
     soft_loss = soft_num / soft_den
-
-    if loss_variant == "focal_dice":
-        ce = F.cross_entropy(logits.float(), ctx["hard_rs"].long(), reduction="none")
-        pt = (ctx["probs"] * ctx["target_one_hot"]).sum(dim=1).clamp(1e-6, 1.0)
-        focal_gamma = 2.0
-        focal_map = ((1.0 - pt) ** focal_gamma) * ce
-        focal_num = (
-            focal_map * ctx["hard_cls_weight"] * ctx["valid_float"] * ctx["pixel_weight"]
-        ).sum()
-        focal_den = (
-            ctx["hard_cls_weight"] * ctx["valid_float"] * ctx["pixel_weight"]
-        ).sum().clamp_min(1e-8)
-        soft_loss = focal_num / focal_den
 
     dice_c = ctx["dice_per_class"]
     dice_valid_mask = ctx["dice_valid_mask"]
@@ -254,23 +245,10 @@ def single_scale_loss_from_context(
         dice_used = dice_c[1:]
         dice_valid_used = dice_valid_mask[1:]
 
-    if loss_variant == "tversky_dice":
-        fp = (ctx["probs_valid"] * (1.0 - ctx["target_valid"])).sum(dim=(0, 2, 3))
-        fn = ((1.0 - ctx["probs_valid"]) * ctx["target_valid"]).sum(dim=(0, 2, 3))
-        tp = (ctx["probs_valid"] * ctx["target_valid"]).sum(dim=(0, 2, 3))
-        alpha = 0.3
-        beta = 0.7
-        tversky = (tp + 1e-5) / (tp + (alpha * fp) + (beta * fn) + 1e-5)
-        tversky_used = tversky if include_background_in_dice else tversky[1:]
-        if exclude_absent_classes_in_dice_loss:
-            hard_dice_loss = 1.0 - nanmean_tensor(tversky_used, dice_valid_used)
-        else:
-            hard_dice_loss = 1.0 - tversky_used.mean()
+    if exclude_absent_classes_in_dice_loss:
+        hard_dice_loss = 1.0 - nanmean_tensor(dice_used, dice_valid_used)
     else:
-        if exclude_absent_classes_in_dice_loss:
-            hard_dice_loss = 1.0 - nanmean_tensor(dice_used, dice_valid_used)
-        else:
-            hard_dice_loss = 1.0 - dice_used.mean()
+        hard_dice_loss = 1.0 - dice_used.mean()
 
     total = (lambda_soft * soft_loss) + (lambda_dice * hard_dice_loss)
 
@@ -430,36 +408,6 @@ def gleason_ce_loss_from_context(
     return loss, stats
 
 
-def gleason_ce_loss(
-    logits: torch.Tensor,
-    hard_mask: torch.Tensor,
-    soft_probs: torch.Tensor,
-    ignore_mask: torch.Tensor,
-    use_confidence_mask: bool,
-    confidence_threshold: float,
-    include_background_in_dice: bool,
-    exclude_absent_classes_in_dice_loss: bool,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    ctx = build_scale_loss_context(
-        logits=logits,
-        hard_mask=hard_mask,
-        soft_probs=soft_probs,
-        ignore_mask=ignore_mask,
-        sample_weights=torch.ones((logits.shape[0],), device=logits.device, dtype=torch.float32),
-        class_weights=torch.ones((logits.shape[1],), device=logits.device, dtype=torch.float32),
-        use_confidence_mask=use_confidence_mask,
-        confidence_threshold=confidence_threshold,
-        include_probs=True,
-        include_hard_terms=True,
-    )
-    return gleason_ce_loss_from_context(
-        logits=logits,
-        ctx=ctx,
-        include_background_in_dice=include_background_in_dice,
-        exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-    )
-
-
 def soft_target_term_loss_from_context(
     *,
     logits: torch.Tensor,
@@ -471,35 +419,6 @@ def soft_target_term_loss_from_context(
     soft_num = (soft_map * ctx["valid_float"] * ctx["pixel_weight"]).sum()
     soft_den = (ctx["valid_float"] * ctx["pixel_weight"]).sum().clamp_min(1e-8)
     return soft_num / soft_den
-
-
-def soft_target_term_loss(
-    logits: torch.Tensor,
-    soft_probs: torch.Tensor,
-    ignore_mask: torch.Tensor,
-    sample_weights: torch.Tensor,
-    class_weights: torch.Tensor,
-    use_confidence_mask: bool,
-    confidence_threshold: float,
-    soft_loss_type: str,
-) -> torch.Tensor:
-    ctx = build_scale_loss_context(
-        logits=logits,
-        hard_mask=ignore_mask.new_zeros(ignore_mask.shape),
-        soft_probs=soft_probs,
-        ignore_mask=ignore_mask,
-        sample_weights=sample_weights,
-        class_weights=class_weights,
-        use_confidence_mask=use_confidence_mask,
-        confidence_threshold=confidence_threshold,
-        include_probs=False,
-        include_hard_terms=False,
-    )
-    return soft_target_term_loss_from_context(
-        logits=logits,
-        ctx=ctx,
-        soft_loss_type=soft_loss_type,
-    )
 
 
 def compute_training_loss(
@@ -548,26 +467,11 @@ def compute_training_loss(
             include_hard_terms=include_hard_terms,
         )
 
-    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce":
-        ctx = _build_ctx_for_scale(logits, include_hard_terms=True)
-        loss, stats = gleason_ce_loss_from_context(
-            logits=logits,
-            ctx=ctx,
-            include_background_in_dice=include_background_in_dice,
-            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-        )
-        if aux is not None:
-            aux_ctx = _build_ctx_for_scale(aux, include_hard_terms=True)
-            aux_loss, _ = gleason_ce_loss_from_context(
-                logits=aux,
-                ctx=aux_ctx,
-                include_background_in_dice=include_background_in_dice,
-                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
+    if model_name == "pspnet":
+        if pspnet_loss_mode != "gleason_ce_soft":
+            raise ValueError(
+                f"Unsupported pspnet_loss_mode {pspnet_loss_mode!r}. Expected 'gleason_ce_soft'."
             )
-            loss = loss + (float(pspnet_aux_weight) * aux_loss)
-        return loss, stats
-
-    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce_soft":
         ctx = _build_ctx_for_scale(logits, include_hard_terms=True)
         loss, stats = gleason_ce_loss_from_context(
             logits=logits,

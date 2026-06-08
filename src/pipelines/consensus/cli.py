@@ -6,7 +6,7 @@ from .pipeline import ConsensusConfig, ConsensusMaskBuilder
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Gleason2019 consensus mask builder (STAPLE + QC)")
+    p = argparse.ArgumentParser(description="Gleason2019 weighted consensus mask builder (QC + postprocess)")
     p.add_argument("--dataset-root", default="data", help="Dataset root with Maps*_T and image folders")
     p.add_argument("--output-root", default="data/consensus", help="Output root")
     p.add_argument("--disable-gpu", action="store_true", help="Disable optional GPU acceleration")
@@ -47,13 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=1, help="Parallel workers across images (CPU mode)")
     p.add_argument("--low-loo-dice", type=float, default=0.35, help="QC threshold for low leave-one-out dice")
     p.add_argument("--grade5-floor", type=float, default=0.08, help="Minimum grade-5 prob floor when safeguarded")
-    p.add_argument(
-        "--consensus-fusion-mode",
-        type=str,
-        default="staple_unweighted",
-        choices=["staple_unweighted", "weighted"],
-        help="Consensus fusion mode.",
-    )
     p.add_argument("--ignore-threshold-loose", type=float, default=0.30, help="Loose ignore confidence threshold")
     p.add_argument("--ignore-threshold-strict", type=float, default=0.50, help="Strict ignore confidence threshold")
     p.add_argument(
@@ -74,7 +67,6 @@ def main() -> None:
         enable_gpu=not args.disable_gpu,
         strict_ignore=args.strict_ignore,
         workers=max(1, args.workers),
-        consensus_fusion_mode=args.consensus_fusion_mode,
         ignore_threshold_loose=float(args.ignore_threshold_loose),
         ignore_threshold_strict=float(args.ignore_threshold_strict),
         target_ignore_tissue_frac=float(args.target_ignore_tissue_frac),

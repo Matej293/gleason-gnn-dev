@@ -33,6 +33,10 @@ def _baseline_single_scale_loss(
     include_background_in_dice: bool,
     exclude_absent_classes_in_dice_loss: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    if soft_loss_type != "ce":
+        raise ValueError(f"Unsupported soft_loss_type {soft_loss_type!r}")
+    if loss_variant != "soft_dice":
+        raise ValueError(f"Unsupported loss_variant {loss_variant!r}")
     if not torch.isfinite(logits).all():
         raise FloatingPointError("Non-finite logits passed to loss.")
     hard_rs, soft_rs, ignore_rs = _resize_targets_for_logits(
@@ -66,18 +70,6 @@ def _baseline_single_scale_loss(
     soft_loss = soft_num / soft_den
 
     probs = F.softmax(logits.float(), dim=1)
-    if loss_variant == "focal_dice":
-        target = F.one_hot(
-            hard_rs.long().clamp(0, logits.shape[1] - 1), num_classes=logits.shape[1]
-        ).permute(0, 3, 1, 2).float()
-        ce = F.cross_entropy(logits.float(), hard_rs.long(), reduction="none")
-        pt = (probs * target).sum(dim=1).clamp(1e-6, 1.0)
-        focal_gamma = 2.0
-        focal_map = ((1.0 - pt) ** focal_gamma) * ce
-        hard_cls_weight = class_weights[hard_rs.long()].float()
-        focal_num = (focal_map * hard_cls_weight * valid_float * pixel_weight).sum()
-        focal_den = (hard_cls_weight * valid_float * pixel_weight).sum().clamp_min(1e-8)
-        soft_loss = focal_num / focal_den
 
     dice_c = _hard_dice_per_class(
         probs=probs,
@@ -98,29 +90,10 @@ def _baseline_single_scale_loss(
         dice_used = dice_c[1:]
         dice_valid_used = dice_valid_mask[1:]
 
-    if loss_variant == "tversky_dice":
-        target = F.one_hot(
-            hard_rs.long().clamp(0, logits.shape[1] - 1), num_classes=logits.shape[1]
-        ).permute(0, 3, 1, 2).float()
-        valid = valid_mask.unsqueeze(1).float()
-        p = probs * valid
-        t = target * valid
-        fp = (p * (1.0 - t)).sum(dim=(0, 2, 3))
-        fn = ((1.0 - p) * t).sum(dim=(0, 2, 3))
-        tp = (p * t).sum(dim=(0, 2, 3))
-        alpha = 0.3
-        beta = 0.7
-        tversky = (tp + 1e-5) / (tp + (alpha * fp) + (beta * fn) + 1e-5)
-        tversky_used = tversky if include_background_in_dice else tversky[1:]
-        if exclude_absent_classes_in_dice_loss:
-            hard_dice_loss = 1.0 - _nanmean_tensor(tversky_used, dice_valid_used)
-        else:
-            hard_dice_loss = 1.0 - tversky_used.mean()
+    if exclude_absent_classes_in_dice_loss:
+        hard_dice_loss = 1.0 - _nanmean_tensor(dice_used, dice_valid_used)
     else:
-        if exclude_absent_classes_in_dice_loss:
-            hard_dice_loss = 1.0 - _nanmean_tensor(dice_used, dice_valid_used)
-        else:
-            hard_dice_loss = 1.0 - dice_used.mean()
+        hard_dice_loss = 1.0 - dice_used.mean()
 
     total = (lambda_soft * soft_loss) + (lambda_dice * hard_dice_loss)
     stats = {
@@ -315,32 +288,9 @@ def _baseline_compute_training_loss(**kwargs: torch.Tensor | list[torch.Tensor] 
     pspnet_soft_weight = kwargs["pspnet_soft_weight"]
     pspnet_soft_term = kwargs["pspnet_soft_term"]
 
-    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce":
-        loss, stats = _baseline_gleason_ce_loss(
-            logits=logits,
-            hard_mask=hard_mask,
-            soft_probs=soft_probs,
-            ignore_mask=ignore_mask,
-            use_confidence_mask=use_confidence_mask,
-            confidence_threshold=confidence_threshold,
-            include_background_in_dice=include_background_in_dice,
-            exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-        )
-        if aux is not None:
-            aux_loss, _ = _baseline_gleason_ce_loss(
-                logits=aux,
-                hard_mask=hard_mask,
-                soft_probs=soft_probs,
-                ignore_mask=ignore_mask,
-                use_confidence_mask=use_confidence_mask,
-                confidence_threshold=confidence_threshold,
-                include_background_in_dice=include_background_in_dice,
-                exclude_absent_classes_in_dice_loss=exclude_absent_classes_in_dice_loss,
-            )
-            loss = loss + (float(pspnet_aux_weight) * aux_loss)
-        return loss, stats
-
-    if model_name == "pspnet" and pspnet_loss_mode == "gleason_ce_soft":
+    if model_name == "pspnet":
+        if pspnet_loss_mode != "gleason_ce_soft":
+            raise ValueError(f"Unsupported pspnet_loss_mode {pspnet_loss_mode!r}")
         loss, stats = _baseline_gleason_ce_loss(
             logits=logits,
             hard_mask=hard_mask,
@@ -453,13 +403,12 @@ def _make_loss_inputs(loss_variant: str, model_name: str, pspnet_loss_mode: str)
         "pspnet_loss_mode": pspnet_loss_mode,
         "pspnet_aux_weight": 0.5,
         "pspnet_soft_weight": 0.2,
-        "pspnet_soft_term": "kl",
+        "pspnet_soft_term": "ce",
     }
 
 
-@pytest.mark.parametrize("loss_variant", ["soft_dice", "focal_dice", "tversky_dice"])
-def test_compute_training_loss_consensus_parity(loss_variant: str) -> None:
-    kwargs = _make_loss_inputs(loss_variant=loss_variant, model_name="deconver", pspnet_loss_mode="consensus")
+def test_compute_training_loss_consensus_parity() -> None:
+    kwargs = _make_loss_inputs(loss_variant="soft_dice", model_name="deconver", pspnet_loss_mode="gleason_ce_soft")
     expected_loss, expected_stats = _baseline_compute_training_loss(**kwargs)
     got_loss, got_stats = _compute_training_loss(**kwargs)
 
@@ -469,12 +418,8 @@ def test_compute_training_loss_consensus_parity(loss_variant: str) -> None:
         assert got_stats[key] == pytest.approx(expected_stats[key], rel=1e-6, abs=1e-7)
 
 
-@pytest.mark.parametrize("mode", ["consensus", "gleason_ce", "gleason_ce_soft"])
-def test_compute_training_loss_pspnet_modes_parity(mode: str) -> None:
-    kwargs = _make_loss_inputs(loss_variant="soft_dice", model_name="pspnet", pspnet_loss_mode=mode)
-    if mode == "consensus":
-        kwargs["soft_loss_type"] = "kl"
-        kwargs["loss_variant"] = "focal_dice"
+def test_compute_training_loss_pspnet_mode_parity() -> None:
+    kwargs = _make_loss_inputs(loss_variant="soft_dice", model_name="pspnet", pspnet_loss_mode="gleason_ce_soft")
     expected_loss, expected_stats = _baseline_compute_training_loss(**kwargs)
     got_loss, got_stats = _compute_training_loss(**kwargs)
 
@@ -484,9 +429,8 @@ def test_compute_training_loss_pspnet_modes_parity(mode: str) -> None:
         assert got_stats[key] == pytest.approx(expected_stats[key], rel=1e-6, abs=1e-7)
 
 
-@pytest.mark.parametrize("loss_variant", ["soft_dice", "focal_dice", "tversky_dice"])
-def test_compute_training_loss_gradients_finite_single_step(loss_variant: str) -> None:
-    kwargs = _make_loss_inputs(loss_variant=loss_variant, model_name="deconver", pspnet_loss_mode="consensus")
+def test_compute_training_loss_gradients_finite_single_step() -> None:
+    kwargs = _make_loss_inputs(loss_variant="soft_dice", model_name="deconver", pspnet_loss_mode="gleason_ce_soft")
     logits = kwargs["logits"].clone().detach().requires_grad_(True)
     kwargs = copy.deepcopy(kwargs)
     kwargs["logits"] = logits
@@ -501,7 +445,7 @@ def test_compute_training_loss_gradients_finite_single_step(loss_variant: str) -
 
 
 def test_compute_training_loss_nonfinite_logits_raises() -> None:
-    kwargs = _make_loss_inputs(loss_variant="soft_dice", model_name="deconver", pspnet_loss_mode="consensus")
+    kwargs = _make_loss_inputs(loss_variant="soft_dice", model_name="deconver", pspnet_loss_mode="gleason_ce_soft")
     bad_logits = kwargs["logits"].clone()
     bad_logits[0, 0, 0, 0] = float("nan")
     kwargs["logits"] = bad_logits

@@ -11,6 +11,7 @@ from scipy.ndimage import binary_dilation
 from tqdm import tqdm
 
 from . import metrics
+from .fusion import run_multiclass_weighted_vote
 from .io import (
     discover_image_ids,
     find_source_image,
@@ -36,11 +37,6 @@ from .postprocess import (
     refine_hard_mask_classes,
 )
 from .qc import QCConfig, class_stats, decide_rater_status, fragmentation_stats, qc_flags_for_rater
-from .staple import (
-    StapleConfig,
-    run_multiclass_one_vs_rest_staple,
-    run_multiclass_weighted_vote,
-)
 
 
 @dataclass
@@ -52,7 +48,6 @@ class ConsensusConfig:
     enable_gpu: bool = True
     strict_ignore: bool = False
     workers: int = 1
-    consensus_fusion_mode: str = "weighted"
     ignore_threshold_loose: float = 0.30
     ignore_threshold_strict: float = 0.50
     target_ignore_tissue_frac: float = 0.05
@@ -64,7 +59,6 @@ class ConsensusConfig:
     single_rater_ignore_policy: str = "confidence_mask"
 
     qc: QCConfig = field(default_factory=QCConfig)
-    staple: StapleConfig = field(default_factory=StapleConfig)
     post: PostConfig = field(default_factory=PostConfig)
 
 
@@ -213,9 +207,6 @@ class ConsensusMaskBuilder:
         masks = [sem_maps[r] for r in kept]
         used_weights = [float(weights.get(r, 1.0)) for r in kept]
         reliable_flags = [weights[r] >= 0.7 for r in kept]
-        fusion_mode = str(self.config.consensus_fusion_mode).strip().lower()
-        if fusion_mode not in {"staple_unweighted", "weighted"}:
-            raise ValueError(f"Unsupported consensus_fusion_mode: {self.config.consensus_fusion_mode!r}")
 
         if len(masks) == 1:
             hard = masks[0].astype(np.uint8)
@@ -243,10 +234,7 @@ class ConsensusMaskBuilder:
                 "used_weights_per_pathologist": {kept[0]: float(used_weights[0])},
             }
 
-        if fusion_mode == "weighted":
-            probs_raw = run_multiclass_weighted_vote(masks, used_weights, self.config.num_classes)
-        else:
-            probs_raw = run_multiclass_one_vs_rest_staple(masks, self.config.num_classes, self.config.staple)
+        probs_raw = run_multiclass_weighted_vote(masks, used_weights, self.config.num_classes)
         probs = normalize_probs(probs_raw, epsilon=self.config.post.epsilon, use_gpu=self.config.enable_gpu)
         probs = apply_grade5_safeguard(probs, masks, reliable_flags, self.config.post.grade5_floor)
         if not np.isfinite(probs).all():
@@ -283,7 +271,7 @@ class ConsensusMaskBuilder:
         boundary_denom = float(max(1, int(boundary_band.sum())))
         ignored_boundary_fraction = float(np.logical_and(ignore > 0, boundary_band).sum()) / boundary_denom
         return hard, probs, ignore, {
-            "effective_fusion_mode": fusion_mode,
+            "effective_fusion_mode": "weighted",
             "n_kept_raters": len(kept),
             "used_weights_per_pathologist": {r: float(weights.get(r, 0.0)) for r in kept},
             "ignore_threshold_used": float(threshold),
@@ -394,7 +382,7 @@ class ConsensusMaskBuilder:
                     failed += 1
                 pbar.set_postfix(image=image_id, ok=success, fail=failed)
         else:
-            # STAPLE is CPU-bound; parallelize across images when not using GPU.
+            # Parallelize across images in CPU mode.
             with ProcessPoolExecutor(max_workers=self.config.workers) as ex:
                 futures = {
                     ex.submit(_process_image_worker, self.config, image_id, {k: str(v) for k, v in paths.items()}): image_id

@@ -11,7 +11,7 @@ def visualize_example(
     image_path: str | Path,
     rater_masks: dict[str, np.ndarray],
     majority_vote: np.ndarray,
-    staple_hard: np.ndarray,
+    fused_hard: np.ndarray,
     uncertainty: np.ndarray,
     disagreement: np.ndarray,
     out_path: str | Path,
@@ -38,8 +38,8 @@ def visualize_example(
     axes[1, 0].set_title("Majority Vote")
     axes[1, 0].axis("off")
 
-    axes[1, 1].imshow(staple_hard, vmin=0, vmax=3, cmap="viridis")
-    axes[1, 1].set_title("STAPLE Hard")
+    axes[1, 1].imshow(fused_hard, vmin=0, vmax=3, cmap="viridis")
+    axes[1, 1].set_title("Weighted Hard")
     axes[1, 1].axis("off")
 
     axes[1, 2].imshow(uncertainty, vmin=0, vmax=1, cmap="magma")

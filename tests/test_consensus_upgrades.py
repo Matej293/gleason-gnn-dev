@@ -29,7 +29,7 @@ def test_weighted_fusion_changes_output_when_downweighted_rater_perturbed() -> N
     sem_b = np.zeros((8, 8), dtype=np.uint8)
     sem_b[:, 4:] = 3
 
-    cfg = ConsensusConfig(consensus_fusion_mode="weighted", strict_ignore=False)
+    cfg = ConsensusConfig(strict_ignore=False)
     builder = ConsensusMaskBuilder(cfg)
 
     hard_hi, probs_hi, _, _ = builder._run_consensus(
@@ -103,12 +103,10 @@ def test_auto_calibrated_ignore_reduces_tissue_ignore() -> None:
     sem_b[:, 4:] = 3
 
     cfg_fixed = ConsensusConfig(
-        consensus_fusion_mode="weighted",
         ignore_threshold_loose=0.30,
         auto_calibrate_ignore_threshold=False,
     )
     cfg_cal = ConsensusConfig(
-        consensus_fusion_mode="weighted",
         ignore_threshold_loose=0.30,
         auto_calibrate_ignore_threshold=True,
         target_ignore_tissue_frac=0.05,
@@ -153,7 +151,6 @@ def test_end_to_end_consensus_build_writes_artifacts_and_qc_fields(tmp_path: Pat
         dataset_root=str(data_root),
         output_root=str(out_root),
         raters=["p1", "p2"],
-        consensus_fusion_mode="weighted",
     )
     builder = ConsensusMaskBuilder(cfg)
     res = builder.process_all()

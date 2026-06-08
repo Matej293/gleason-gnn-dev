@@ -108,9 +108,9 @@ deconver_ndc_ratio: 4
 deconver_fp32_islands: true # keep Deconver update math in FP32 (safer on pre-BF16 GPUs)
 deconver_fp32_scope: iterative_block # update_only | iterative_block
 
-# Loss: soft-label CE/KL + hard Dice
+# Loss: soft-label CE + hard Dice
 soft_label_loss: ce
-loss_variant: soft_dice # soft_dice | focal_dice | tversky_dice
+loss_variant: soft_dice
 lambda_soft: 1.0
 lambda_dice: 1.0
 loss_schedule_enabled: true

@@ -1,4 +1,4 @@
-.PHONY: help train eval smoke test lint typecheck test-cov consensus consensus-weighted viz-consensus-gt audit-background-ignore gnn-build gnn-build-all gnn-eval gnn-train gnn-train-all gnn-viz gnn-viz-best gnn-compare-viz
+.PHONY: help train eval smoke test lint typecheck test-cov consensus-weighted viz-consensus-gt audit-background-ignore gnn-build gnn-build-all gnn-eval gnn-train gnn-train-all gnn-viz gnn-viz-best gnn-compare-viz
 .DEFAULT_GOAL := help
 
 PYTHON ?= python
@@ -95,7 +95,6 @@ help:
 	@echo "  make eval RUN=outputs/runs/<run_name> [EVAL_ARGS='']"
 	@echo "  make smoke"
 	@echo "  make test"
-	@echo "  make consensus"
 	@echo "  make consensus-weighted"
 	@echo "  make viz-consensus-gt [MAX_CASES=64]"
 	@echo "  make audit-background-ignore"
@@ -165,9 +164,6 @@ test-cov:
 		echo "pytest-cov not installed; running tests without coverage"; \
 		$(PYTEST) -q tests; \
 	fi
-
-consensus:
-	$(PY) -m $(BUILD_CONSENSUS_MODULE) --dataset-root data --output-root data/consensus
 
 consensus-weighted:
 	$(PY) -m $(BUILD_CONSENSUS_MODULE) \

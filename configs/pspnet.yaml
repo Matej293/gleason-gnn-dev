@@ -105,16 +105,6 @@ pspnet_encoder_name: resnet101
 pspnet_encoder_weights: imagenet
 deep_supervision: false
 
-soft_label_loss: ce
-loss_variant: focal_dice
-lambda_soft: 1.0
-lambda_dice: 1.0
-loss_schedule_enabled: true
-loss_schedule_transition_epoch: 12
-lambda_soft_warmup: 1.2
-lambda_dice_warmup: 0.8
-lambda_soft_final: 0.8
-lambda_dice_final: 1.2
 use_confidence_mask: true
 confidence_threshold: 0.70
 include_background_in_dice: false
