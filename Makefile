@@ -1,15 +1,18 @@
 .PHONY: help train eval smoke test lint typecheck test-cov consensus-weighted viz-consensus-gt audit-background-ignore gnn-build gnn-build-all gnn-eval gnn-train gnn-train-all gnn-viz gnn-viz-best gnn-compare-viz
 .DEFAULT_GOAL := help
 
+# Runtime
 PYTHON ?= python
 PYTHONPATH_ROOT ?= .
 PY := PYTHONPATH=$(PYTHONPATH_ROOT) $(PYTHON)
 PYTEST := PYTHONPATH=$(PYTHONPATH_ROOT) pytest
 
+# Placeholders
 RUN_PLACEHOLDER := outputs/runs/<run_name>
 GNN_RUN_DIR_PLACEHOLDER := outputs/gnn_runs/<run_dir>
 GNN_COMPARISON_DIR_PLACEHOLDER := outputs/gnn_runs/<comparison_dir>
 
+# User-configurable defaults
 MAX_CASES ?= 64
 CONFIG ?= configs/deconver.yaml
 RUN ?= $(RUN_PLACEHOLDER)
@@ -63,6 +66,26 @@ GNN_WANDB_RUN_NAME ?=
 GNN_WANDB_TAGS ?=
 GNN_WANDB_LOG_MAX_CASE_IMAGES ?= 24
 
+# Usage strings
+TRAIN_USAGE := make train CONFIG=configs/deconver.yaml
+EVAL_USAGE := make eval RUN=outputs/runs/<run_name> [EVAL_ARGS='']
+EVAL_REQUIRE_USAGE := make eval RUN=outputs/runs/<run_name>
+SMOKE_USAGE := make smoke
+TEST_USAGE := make test
+CONSENSUS_WEIGHTED_USAGE := make consensus-weighted
+VIZ_CONSENSUS_GT_USAGE := make viz-consensus-gt [MAX_CASES=64]
+AUDIT_BACKGROUND_IGNORE_USAGE := make audit-background-ignore
+GNN_BUILD_USAGE := make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>
+GNN_BUILD_ALL_USAGE := make gnn-build-all RUN=outputs/runs/<run_name> [GNN_BUILD_SPLITS='train val test']
+GNN_EVAL_USAGE := make gnn-eval [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_PROFILE=thesis]
+GNN_TRAIN_USAGE := make gnn-train [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_MODEL=<mlp|graphsage|gcn|gat>]
+GNN_TRAIN_ALL_USAGE := make gnn-train-all [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_TRAIN_NAME=<name_prefix>]
+GNN_VIZ_USAGE := make gnn-viz GNN_RUN_DIR=outputs/gnn_runs/<run_dir> [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>]
+GNN_VIZ_BEST_USAGE := make gnn-viz-best [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_TRAIN_NAME=<name_prefix>]
+GNN_COMPARE_VIZ_USAGE := make gnn-compare-viz GNN_COMPARISON_DIR=outputs/gnn_runs/<comparison_dir> [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>]
+CANONICAL_CONFIGS_NOTE := note: canonical configs enable train-time augmentation via transforms_* YAML keys
+
+# CLI entry modules
 TRAIN_MODULE := src.cli.train
 TRAIN_FILE := src/cli/train.py
 EVAL_CHECKPOINT_MODULE := src.cli.evaluate_checkpoint
@@ -77,10 +100,57 @@ VIZ_GNN_MODULE := src.cli.visualize_gnn_predictions
 SELECT_BEST_GNN_MODULE := src.cli.select_best_gnn_run
 VIZ_GNN_COMPARISON_MODULE := src.cli.visualize_gnn_baseline_comparison
 
+# Shared argument groups
 GNN_BUILD_AUTO_OUTPUT_DIR := $(if $(GNN_BUILD_OUTPUT_DIR),$(GNN_BUILD_OUTPUT_DIR),$(if $(filter felzenszwalb,$(GNN_SUPERPIXEL_METHOD)),$(GNN_FELZ_AUTO_OUTPUT_DIR),))
-GNN_BUILD_COMMON_ARGS := --batch-size $(GNN_BUILD_BATCH_SIZE) --num-workers $(GNN_BUILD_NUM_WORKERS) --inference-mode $(GNN_BUILD_INFERENCE_MODE) --superpixel-method $(GNN_SUPERPIXEL_METHOD) --num-segments $(GNN_NUM_SEGMENTS) --compactness $(GNN_COMPACTNESS) --sigma $(GNN_SIGMA) --felzenszwalb-scale $(GNN_FELZENSZWALB_SCALE) --felzenszwalb-min-size $(GNN_FELZENSZWALB_MIN_SIZE) --tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) --edge-policy $(GNN_EDGE_POLICY) --edge-knn-k $(GNN_EDGE_KNN_K) --edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE)
-GNN_BUILD_OPTIONAL_ARGS := $(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) $(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),) $(if $(GNN_BUILD_AUTO_OUTPUT_DIR),--output-dir $(GNN_BUILD_AUTO_OUTPUT_DIR),)
+GNN_BUILD_COMMON_ARGS := \
+	--batch-size $(GNN_BUILD_BATCH_SIZE) \
+	--num-workers $(GNN_BUILD_NUM_WORKERS) \
+	--inference-mode $(GNN_BUILD_INFERENCE_MODE) \
+	--superpixel-method $(GNN_SUPERPIXEL_METHOD) \
+	--num-segments $(GNN_NUM_SEGMENTS) \
+	--compactness $(GNN_COMPACTNESS) \
+	--sigma $(GNN_SIGMA) \
+	--felzenszwalb-scale $(GNN_FELZENSZWALB_SCALE) \
+	--felzenszwalb-min-size $(GNN_FELZENSZWALB_MIN_SIZE) \
+	--tiny-superpixel-max-pixels $(GNN_TINY_SUPERPIXEL_MAX_PIXELS) \
+	--edge-policy $(GNN_EDGE_POLICY) \
+	--edge-knn-k $(GNN_EDGE_KNN_K) \
+	--edge-knn-max-distance $(GNN_EDGE_KNN_MAX_DISTANCE)
+GNN_BUILD_OPTIONAL_ARGS := \
+	$(if $(GNN_SUPERPIXEL_PRESET),--superpixel-preset $(GNN_SUPERPIXEL_PRESET),) \
+	$(if $(GNN_CHECKPOINT),--checkpoint $(GNN_CHECKPOINT),) \
+	$(if $(GNN_BUILD_AUTO_OUTPUT_DIR),--output-dir $(GNN_BUILD_AUTO_OUTPUT_DIR),)
+GNN_TRAIN_PREFIX_ARGS := \
+	--graphs-root $(GNN_GRAPHS_ROOT) \
+	--profile $(GNN_PROFILE) \
+	--normalize-features
+GNN_TRAIN_LOSS_ARGS := \
+	--loss $(GNN_LOSS) \
+	--focal-gamma $(GNN_FOCAL_GAMMA) \
+	--feature-dropout $(GNN_FEATURE_DROPOUT) \
+	--edge-dropout $(GNN_EDGE_DROPOUT)
+GNN_TRAIN_OPTIONAL_ARGS := \
+	$(if $(GNN_HIDDEN_DIM),--hidden-dim $(GNN_HIDDEN_DIM),) \
+	$(if $(GNN_DROPOUT),--dropout $(GNN_DROPOUT),) \
+	$(if $(GNN_LR),--lr $(GNN_LR),) \
+	$(if $(GNN_WEIGHT_DECAY),--weight-decay $(GNN_WEIGHT_DECAY),) \
+	$(if $(GNN_EPOCHS),--epochs $(GNN_EPOCHS),) \
+	$(if $(GNN_PATIENCE),--patience $(GNN_PATIENCE),)
+GNN_TRAIN_ALL_PREFIX_ARGS := \
+	--residual-head \
+	--residual-alpha 0.2 \
+	--mask-unsupported-classes
+GNN_TRAIN_ALL_SUFFIX_ARGS := \
+	--grad-clip-norm 1.0 \
+	--scheduler \
+	--selection-metric $(GNN_SELECTION_METRIC) \
+	--seed $(GNN_SEED) \
+	--seeds $(GNN_TRAIN_SEEDS)
+GNN_VIZ_PREFIX_ARGS := --graphs-root $(GNN_GRAPHS_ROOT)
+GNN_VIZ_SUFFIX_ARGS := --split $(GNN_VIZ_SPLIT) --seed $(GNN_SEED)
+GNN_COMPARE_WANDB_BOOL_ARG := $(if $(filter 1 true on yes,$(GNN_LOG_WANDB)),--log-wandb,--no-log-wandb)
 
+# Validation helpers
 define require_non_placeholder
 @if [ -z "$($(1))" ] || [ "$($(1))" = "$(2)" ]; then echo "Usage: $(3)"; exit 1; fi
 endef
@@ -89,26 +159,35 @@ define require_non_empty
 @if [ -z "$($(1))" ]; then echo "Usage: $(2)"; exit 1; fi
 endef
 
+define gnn_build_command
+$(PY) -m $(BUILD_SUPERPIXEL_GRAPHS_MODULE) --run $(1) --split $(2) $(GNN_BUILD_COMMON_ARGS) $(GNN_BUILD_OPTIONAL_ARGS)
+endef
+
+define gnn_viz_command
+$(PY) -m $(VIZ_GNN_MODULE) $(GNN_VIZ_PREFIX_ARGS) --run-dir $(1) $(GNN_VIZ_SUFFIX_ARGS) $(2)
+endef
+
+# Targets
 help:
 	@echo "Core Targets:"
-	@echo "  make train CONFIG=configs/deconver.yaml"
-	@echo "  make eval RUN=outputs/runs/<run_name> [EVAL_ARGS='']"
-	@echo "  make smoke"
-	@echo "  make test"
-	@echo "  make consensus-weighted"
-	@echo "  make viz-consensus-gt [MAX_CASES=64]"
-	@echo "  make audit-background-ignore"
-	@echo "  note: canonical configs enable train-time augmentation via transforms_* YAML keys"
+	@echo "  $(TRAIN_USAGE)"
+	@echo "  $(EVAL_USAGE)"
+	@echo "  $(SMOKE_USAGE)"
+	@echo "  $(TEST_USAGE)"
+	@echo "  $(CONSENSUS_WEIGHTED_USAGE)"
+	@echo "  $(VIZ_CONSENSUS_GT_USAGE)"
+	@echo "  $(AUDIT_BACKGROUND_IGNORE_USAGE)"
+	@echo "  $(CANONICAL_CONFIGS_NOTE)"
 	@echo ""
 	@echo "Graph/GNN Targets:"
-	@echo "  make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>"
-	@echo "  make gnn-build-all RUN=outputs/runs/<run_name> [GNN_BUILD_SPLITS='train val test']"
-	@echo "  make gnn-eval [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_PROFILE=thesis]"
-	@echo "  make gnn-train [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_MODEL=<mlp|graphsage|gcn|gat>]"
-	@echo "  make gnn-train-all [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_TRAIN_NAME=<name_prefix>]"
-	@echo "  make gnn-viz GNN_RUN_DIR=outputs/gnn_runs/<run_dir> [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>]"
-	@echo "  make gnn-viz-best [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>] [GNN_TRAIN_NAME=<name_prefix>]"
-	@echo "  make gnn-compare-viz GNN_COMPARISON_DIR=outputs/gnn_runs/<comparison_dir> [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>]"
+	@echo "  $(GNN_BUILD_USAGE)"
+	@echo "  $(GNN_BUILD_ALL_USAGE)"
+	@echo "  $(GNN_EVAL_USAGE)"
+	@echo "  $(GNN_TRAIN_USAGE)"
+	@echo "  $(GNN_TRAIN_ALL_USAGE)"
+	@echo "  $(GNN_VIZ_USAGE)"
+	@echo "  $(GNN_VIZ_BEST_USAGE)"
+	@echo "  $(GNN_COMPARE_VIZ_USAGE)"
 	@echo ""
 	@echo "Command Entry Files:"
 	@echo "  train                -> $(TRAIN_FILE)"
@@ -138,7 +217,7 @@ train:
 	$(PY) -m $(TRAIN_MODULE) --config $(CONFIG)
 
 eval:
-	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),make eval RUN=outputs/runs/<run_name>)
+	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),$(EVAL_REQUIRE_USAGE))
 	$(PY) -m $(EVAL_CHECKPOINT_MODULE) --run $(RUN) --save-viz --log-wandb-viz --log-wandb-metrics $(EVAL_ARGS)
 
 smoke:
@@ -191,15 +270,15 @@ audit-background-ignore:
 	$(PY) -m $(AUDIT_BACKGROUND_IGNORE_MODULE)
 
 gnn-build:
-	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>)
-	$(call require_non_empty,SPLIT,make gnn-build RUN=outputs/runs/<run_name> SPLIT=<train|val|test|all>)
-	$(PY) -m $(BUILD_SUPERPIXEL_GRAPHS_MODULE) --run $(RUN) --split $(SPLIT) $(GNN_BUILD_COMMON_ARGS) $(GNN_BUILD_OPTIONAL_ARGS)
+	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),$(GNN_BUILD_USAGE))
+	$(call require_non_empty,SPLIT,$(GNN_BUILD_USAGE))
+	$(call gnn_build_command,$(RUN),$(SPLIT))
 
 gnn-build-all:
-	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),make gnn-build-all RUN=outputs/runs/<run_name> [GNN_BUILD_SPLITS='train val test'])
+	$(call require_non_placeholder,RUN,$(RUN_PLACEHOLDER),$(GNN_BUILD_ALL_USAGE))
 	@for SPLIT in $(GNN_BUILD_SPLITS); do \
 	echo "Building graph split: $$SPLIT"; \
-	$(PY) -m $(BUILD_SUPERPIXEL_GRAPHS_MODULE) --run $(RUN) --split $$SPLIT $(GNN_BUILD_COMMON_ARGS) $(GNN_BUILD_OPTIONAL_ARGS) || exit 1; \
+	$(call gnn_build_command,$(RUN),$$SPLIT) || exit 1; \
 	done
 
 gnn-eval:
@@ -207,56 +286,30 @@ gnn-eval:
 
 gnn-train:
 	$(PY) -m $(TRAIN_GNN_MODULE) \
-	--graphs-root $(GNN_GRAPHS_ROOT) \
 	--model $(GNN_MODEL) \
-	--profile $(GNN_PROFILE) \
-	--normalize-features \
-	--loss $(GNN_LOSS) \
-	--focal-gamma $(GNN_FOCAL_GAMMA) \
-	--feature-dropout $(GNN_FEATURE_DROPOUT) \
-	--edge-dropout $(GNN_EDGE_DROPOUT) \
+	$(GNN_TRAIN_PREFIX_ARGS) \
+	$(GNN_TRAIN_LOSS_ARGS) \
 	--seed $(GNN_SEED) \
 	--selection-metric $(GNN_SELECTION_METRIC) \
-	$(if $(GNN_HIDDEN_DIM),--hidden-dim $(GNN_HIDDEN_DIM),) \
-	$(if $(GNN_DROPOUT),--dropout $(GNN_DROPOUT),) \
-	$(if $(GNN_LR),--lr $(GNN_LR),) \
-	$(if $(GNN_WEIGHT_DECAY),--weight-decay $(GNN_WEIGHT_DECAY),) \
-	$(if $(GNN_EPOCHS),--epochs $(GNN_EPOCHS),) \
-	$(if $(GNN_PATIENCE),--patience $(GNN_PATIENCE),) \
+	$(GNN_TRAIN_OPTIONAL_ARGS) \
 	--name $(GNN_TRAIN_NAME)
 
 gnn-train-all:
 	@for MODEL in $(GNN_MODELS); do \
 	echo "Training $$MODEL"; \
 	$(PY) -m $(TRAIN_GNN_MODULE) \
-	--graphs-root $(GNN_GRAPHS_ROOT) \
 	--model $$MODEL \
-	--profile $(GNN_PROFILE) \
-	--normalize-features \
-	--residual-head \
-	--residual-alpha 0.2 \
-	--mask-unsupported-classes \
-	--loss $(GNN_LOSS) \
-	--focal-gamma $(GNN_FOCAL_GAMMA) \
-	--feature-dropout $(GNN_FEATURE_DROPOUT) \
-	--edge-dropout $(GNN_EDGE_DROPOUT) \
-	--grad-clip-norm 1.0 \
-	--scheduler \
-	--selection-metric $(GNN_SELECTION_METRIC) \
-	--seed $(GNN_SEED) \
-	--seeds $(GNN_TRAIN_SEEDS) \
-	$(if $(GNN_HIDDEN_DIM),--hidden-dim $(GNN_HIDDEN_DIM),) \
-	$(if $(GNN_DROPOUT),--dropout $(GNN_DROPOUT),) \
-	$(if $(GNN_LR),--lr $(GNN_LR),) \
-	$(if $(GNN_WEIGHT_DECAY),--weight-decay $(GNN_WEIGHT_DECAY),) \
-	$(if $(GNN_EPOCHS),--epochs $(GNN_EPOCHS),) \
-	$(if $(GNN_PATIENCE),--patience $(GNN_PATIENCE),) \
+	$(GNN_TRAIN_PREFIX_ARGS) \
+	$(GNN_TRAIN_ALL_PREFIX_ARGS) \
+	$(GNN_TRAIN_LOSS_ARGS) \
+	$(GNN_TRAIN_ALL_SUFFIX_ARGS) \
+	$(GNN_TRAIN_OPTIONAL_ARGS) \
 	--name "$(GNN_TRAIN_NAME)_$$MODEL" || exit 1; \
 	done
 
 gnn-viz:
-	$(call require_non_placeholder,GNN_RUN_DIR,$(GNN_RUN_DIR_PLACEHOLDER),make gnn-viz GNN_RUN_DIR=outputs/gnn_runs/<run_dir> [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>])
-	$(PY) -m $(VIZ_GNN_MODULE) --graphs-root $(GNN_GRAPHS_ROOT) --run-dir $(GNN_RUN_DIR) --split $(GNN_VIZ_SPLIT) --seed $(GNN_SEED)
+	$(call require_non_placeholder,GNN_RUN_DIR,$(GNN_RUN_DIR_PLACEHOLDER),$(GNN_VIZ_USAGE))
+	$(call gnn_viz_command,$(GNN_RUN_DIR),)
 
 gnn-viz-best:
 	@for MODEL in $(GNN_MODELS); do \
@@ -266,11 +319,11 @@ gnn-viz-best:
 	continue; \
 	fi; \
 	echo "Best $$MODEL run: $$BEST_RUN"; \
-	$(PY) -m $(VIZ_GNN_MODULE) --graphs-root $(GNN_GRAPHS_ROOT) --run-dir "$$BEST_RUN" --split $(GNN_VIZ_SPLIT) --seed $(GNN_SEED) --parity-check $(GNN_PARITY_CHECK) --max-cases -1 || exit 1; \
+	$(call gnn_viz_command,"$$BEST_RUN",--parity-check $(GNN_PARITY_CHECK) --max-cases -1) || exit 1; \
 	done
 
 gnn-compare-viz:
-	$(call require_non_placeholder,GNN_COMPARISON_DIR,$(GNN_COMPARISON_DIR_PLACEHOLDER),make gnn-compare-viz GNN_COMPARISON_DIR=outputs/gnn_runs/<comparison_dir> [GNN_GRAPHS_ROOT=outputs/graphs/<graph_run>])
+	$(call require_non_placeholder,GNN_COMPARISON_DIR,$(GNN_COMPARISON_DIR_PLACEHOLDER),$(GNN_COMPARE_VIZ_USAGE))
 	$(PY) -m $(VIZ_GNN_COMPARISON_MODULE) \
 	--comparison-dir $(GNN_COMPARISON_DIR) \
 	--graphs-root $(GNN_GRAPHS_ROOT) \
@@ -278,7 +331,7 @@ gnn-compare-viz:
 	--split $(GNN_VIZ_SPLIT) \
 	--max-cases $(GNN_MAX_CASES) \
 	--seed $(GNN_SEED) \
-	$(if $(filter 1 true on yes,$(GNN_LOG_WANDB)),--log-wandb,--no-log-wandb) \
+	$(GNN_COMPARE_WANDB_BOOL_ARG) \
 	--wandb-project "$(GNN_WANDB_PROJECT)" \
 	--wandb-log-max-case-images $(GNN_WANDB_LOG_MAX_CASE_IMAGES) \
 	$(if $(GNN_WANDB_ENTITY),--wandb-entity "$(GNN_WANDB_ENTITY)",) \
